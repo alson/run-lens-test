@@ -1,0 +1,37 @@
+[project]
+name = "macro-lens-test"
+version = "0.1.0"
+description = "Automated macro lens sharpness testing on Nikon Z7 + StackShot rig"
+requires-python = ">=3.12"
+dependencies = [
+    "pyserial>=3.5",
+    "gphoto2>=2.6.0",
+    "pillow>=11.0",
+    "numpy>=2.0",
+    "requests>=2.32",
+]
+
+[project.scripts]
+macro-lens-test = "session.runner:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["camera", "exposure", "notify", "session", "stackshot", "ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
