@@ -21,14 +21,52 @@ work through that first.
 - DTR / RTS toggle has no effect.
 - No unsolicited bytes on the wire when we just listen.
 - No CTS / DSR / RI / CD signals from the device.
+- Serial BREAK (250 ms) before the frame: no effect.
+- Replacing the cable with a plain USB-A → mini-USB (no adapters): no effect.
+- `ModemManager` confirmed inactive.
+- `lpvo_usb_gpib` (an FTDI-based GPIB driver in the Linux staging tree)
+  was being autoloaded for any FT232R via the alias
+  `usb:v0403p6001…` in `/lib/modules/$(uname -r)/modules.alias`. The
+  staging warning made it suspect, so we blacklisted it:
+  ```
+  sudo sh -c 'echo "blacklist lpvo_usb_gpib" > /etc/modprobe.d/blacklist-lpvo-gpib.conf'
+  sudo rmmod lpvo_usb_gpib gpib_common
+  ```
+  Confirmed gone (`lsmod | grep gpib` returns nothing) but the
+  StackShot still does not respond. Driver was a red herring on
+  this rig.
+
+### Step 1.0 — Factory reset on the StackShot
+
+Per manual page 45. Likely fix if the firmware reflash last year left
+PC-mode in an unusable state.
+
+1. Power off the StackShot.
+2. Hold **DOWN** button.
+3. Apply power.
+4. When the splash screen appears, release DOWN.
+
+This loads factory defaults but does **not** erase saved settings.
+After the splash screen clears, plug USB back in (front panel should
+still show `PC` in the corner) and re-run:
+
+```bash
+.venv/bin/python -m stackshot.controller --info --port /dev/ttyUSB0
+```
 
 ### Step 1.1 — Confirm the device works at all (Windows)
 
-Boot Windows, then download the Cognisys reference app linked from PDF §1:
+**Important — get the right ZIP.** There are two separate downloads:
 
-```
-https://www.cognisys-inc.com/downloads/stackshot/StackshotUSB_app.zip
-```
+* `Reflash.zip` — bootloader-mode reflasher only. Useless for sniffing
+  protocol traffic; needs `config + power-on` to enter bootloader. This
+  is what you'll find first if you Google "StackShot Windows utility".
+* `StackshotUSB_app.zip` — the actual C++ protocol example referenced
+  in the protocol PDF §1. Issues real `Get Software ID` / `Move`
+  commands over the documented wire format. **This** is what you want:
+  ```
+  http://www.cognisys-inc.com/downloads/stackshot/StackshotUSB_app.zip
+  ```
 
 Plug the StackShot in (front panel still showing `PC`). Run the app.
 
