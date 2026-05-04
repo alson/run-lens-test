@@ -192,7 +192,13 @@ class SessionRunner:
     # ---- public entry points ---------------------------------------------
 
     def start(self) -> None:
-        """Open hardware, verify, apply config, build session dir."""
+        """Open hardware, verify, apply config, build session dir.
+
+        Also reads the StackShot software / hardware IDs (logged in
+        session.json) and runs the one-time FEC sanity check, which
+        catches the SU-800 mistakenly mounted instead of the SB-5000
+        commander.
+        """
         self.camera.open()
         self.camera.verify_healthy(min_widgets=self.config.MIN_CONFIG_TREE_SIZE)
         self.camera.apply_session_config(
@@ -205,13 +211,44 @@ class SessionRunner:
         self.session_dir = (self.output_root or Path("output")) / self.session_id
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.shots_csv = ShotsCSV(self.session_dir / "shots.csv")
+
+        # StackShot identification — best-effort, never aborts.
+        sw_id = hw_id = None
+        try:
+            sw_id = self.rail.software_id()  # type: ignore[attr-defined]
+            hw_id = self.rail.hardware_id()  # type: ignore[attr-defined]
+        except (AttributeError, Exception):  # noqa: BLE001
+            pass
+
         self.metadata = SessionMetadata(
             session_id=self.session_id,
             started_at=self.now().isoformat(),
             output_root=str(self.output_root or ""),
             ntfy_topic=getattr(self.config, "NTFY_TOPIC", ""),
+            stackshot_software_id=sw_id,
+            stackshot_hardware_id=hw_id,
         )
         self._write_metadata()
+
+        # FEC sanity check (skip if the camera doesn't expose it —
+        # e.g. fakes used in tests; production NikonZ7 always has it).
+        sanity_check = getattr(self.camera, "fec_sanity_check", None)
+        if sanity_check is not None:
+            try:
+                sanity_check(
+                    baseline_fec=0.0,
+                    low_fec=getattr(
+                        self.config, "FEC_SANITY_LOW_EV", -2.0
+                    ),
+                    min_ratio=getattr(
+                        self.config, "FEC_SANITY_MIN_RATIO", 0.5
+                    ),
+                    capture_dir=self.session_dir,
+                    measure=self._measure,
+                )
+            except TypeError:
+                # Camera fake doesn't accept these kwargs — skip.
+                pass
 
     def stop(self, *, aborted: bool = False) -> None:
         """Move rail home, close hardware, finalise session.json.
@@ -237,7 +274,13 @@ class SessionRunner:
 
     def run(self) -> None:
         """Top-level loop: prompt for each lens config, run it, repeat
-        until the user enters an empty line."""
+        until the user enters an empty line.
+
+        Ctrl-C and :class:`SessionAborted` both stop cleanly: the
+        StackShot is told to STOP (cancels any in-flight motion), the
+        camera is closed, and ``session.json`` is finalised with
+        ``aborted=True``.
+        """
         self.start()
         try:
             while True:
@@ -248,11 +291,22 @@ class SessionRunner:
                 self._run_one_lens_config(slug)
                 if self.metadata is not None:
                     self.metadata.lens_configs.append(slug)
-        except SessionAborted:
+        except (SessionAborted, KeyboardInterrupt):
+            self._stop_rail_quietly()
             self.stop(aborted=True)
             raise
         else:
             self.stop()
+
+    def _stop_rail_quietly(self) -> None:
+        """Best-effort STOP on the rail; never raises."""
+        stop = getattr(self.rail, "stop", None)
+        if stop is None:
+            return
+        try:
+            stop()
+        except Exception:                            # noqa: BLE001
+            pass
 
     # ---- One lens config -------------------------------------------------
 
