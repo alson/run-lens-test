@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Local session output
+/output/
+*.jpg
+*.JPG
+*.nef
+*.NEF
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local user data
+data/readline_history
