@@ -220,11 +220,26 @@ wheels = [
 ]
 
 [[package]]
+name = "lens-test-detect-core"
+version = "0.1.0"
+source = { editable = "../lens-test-detect-core" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy", specifier = ">=2.0" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
+
+[[package]]
 name = "macro-lens-test"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "gphoto2" },
+    { name = "lens-test-detect-core" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pyserial" },
@@ -240,6 +255,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gphoto2", specifier = ">=2.6.0" },
+    { name = "lens-test-detect-core", editable = "../lens-test-detect-core" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=11.0" },
     { name = "pyserial", specifier = ">=3.5" },

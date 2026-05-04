@@ -9,7 +9,11 @@ dependencies = [
     "pillow>=11.0",
     "numpy>=2.0",
     "requests>=2.32",
+    "lens-test-detect-core",
 ]
+
+[tool.uv.sources]
+lens-test-detect-core = { path = "../lens-test-detect-core", editable = true }
 
 [project.scripts]
 macro-lens-test = "session.runner:main"

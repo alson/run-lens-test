@@ -12,38 +12,73 @@ pair we get an N-point series of JPEG sizes; we want to know:
    sit? — used to suggest "extend the rail by N more steps in
    direction X".
 
-The heuristics mirror ``analyse-lens-test/rail-coverage`` but with a
-parabola-fit estimator added for (3) — the offline tool deliberately
-omits direction information because subject-distance ranges can't be
-reproduced between runs, but the live tool runs *while* the user is at
-the rig and *can* extend the range, so direction is useful here.
+The five numerical primitives (smooth / peak_index / truncation_status
+/ is_flat / off_target_by_cross_compare) plus ``CropStatus`` come from
+``lens-test-detect-core``, which the offline ``rail-coverage`` package
+also depends on. Live-only logic — the parabola-fit extension
+estimator and the ``CropAnalysis`` aggregate — stays in this module
+because rail-coverage deliberately doesn't recommend a reshoot
+direction (subject-distance ranges aren't reproducible offline).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 
+from lens_test_detect_core import (
+    CropStatus,
+    is_flat,
+    off_target_by_cross_compare,
+    peak_index,
+    smooth,
+)
+from lens_test_detect_core import truncation_status as _truncation_status_core
 
-# Match analyse-lens-test/rail-coverage defaults; see that package's
-# detect.py for the empirical tuning notes.
+__all__ = [
+    "CropAnalysis",
+    "CropStatus",
+    "DEFAULT_EDGE_STEPS",
+    "DEFAULT_FLAT_RATIO",
+    "DEFAULT_OFF_TARGET_FACTOR",
+    "analyze_crop",
+    "analyze_crops_for_aperture",
+    "estimate_peak_vertex",
+    "extra_steps_needed",
+    "is_flat",
+    "off_target_by_cross_compare",
+    "peak_index",
+    "smooth",
+    "truncation_status",
+]
+
+# Live-collector defaults: one shot per rail step (rail-step-outside,
+# aperture-inside architecture from DESIGN_NOTES §2.6), so an "edge
+# zone" of 2 rail steps is one rail position of buffer.
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_FLAT_RATIO = 1.15
 DEFAULT_OFF_TARGET_FACTOR = 0.65
 
 
-class CropStatus(str, Enum):
-    OK = "OK"
-    TRUNCATED_START = "TRUNCATED_START"
-    TRUNCATED_END = "TRUNCATED_END"
-    OFF_TARGET = "OFF_TARGET"
-    EMPTY = "EMPTY"
+# Backwards-compatible alias — the live module historically called this
+# ``peak_step`` to emphasise the rail-step granularity. Keep the alias
+# so existing call sites (and tests) keep working.
+peak_step = peak_index
 
-    @property
-    def is_truncated(self) -> bool:
-        return self in (CropStatus.TRUNCATED_START, CropStatus.TRUNCATED_END)
+
+def truncation_status(
+    peak_idx: int, n: int, *, edge_steps: int = DEFAULT_EDGE_STEPS
+) -> CropStatus:
+    """Live-collector wrapper around the shared primitive.
+
+    The shared primitive is unopinionated about the edge-zone size
+    because the two consumers see different input granularities. This
+    wrapper supplies the live-collector default (one shot per rail
+    step ⇒ edge of 2 rail steps) so existing call sites and tests
+    don't need to thread the threshold through.
+    """
+    return _truncation_status_core(peak_idx, n, edge_steps=edge_steps)
 
 
 @dataclass(frozen=True)
@@ -57,75 +92,6 @@ class CropAnalysis:
     extra_steps_needed: int | None  # rail steps to extend in the truncation direction
     max_size: int | None
     min_size: int | None
-
-
-# --- pure helpers ---------------------------------------------------------
-
-
-def smooth(sizes: np.ndarray | list[int], window: int = 3) -> np.ndarray:
-    """Centred moving average. Returns an array of length ``len(sizes) - window + 1``."""
-    arr = np.asarray(sizes, dtype=float)
-    if arr.size < window:
-        return arr.copy()
-    kernel = np.ones(window, dtype=float) / window
-    return np.convolve(arr, kernel, mode="valid")
-
-
-def peak_step(sizes: np.ndarray | list[int], window: int = 3) -> int:
-    """Rail-step index of the smoothed peak."""
-    smoothed = smooth(sizes, window=window)
-    if smoothed.size == 0:
-        return 0
-    offset = (window - 1) // 2
-    return int(np.argmax(smoothed)) + offset
-
-
-def truncation_status(
-    peak_idx: int, n: int, *, edge_steps: int = DEFAULT_EDGE_STEPS
-) -> CropStatus:
-    """``edge_steps`` is in rail-step units (not raw shots).
-
-    The live collector is one shot per rail step (one aperture per step,
-    given the inverted shot-order architecture in DESIGN_NOTES §2.6),
-    so peak inside the first/last ``edge_steps`` rail steps means we
-    didn't sweep far enough past focus on that side.
-    """
-    if n == 0:
-        return CropStatus.EMPTY
-    if peak_idx < edge_steps:
-        return CropStatus.TRUNCATED_START
-    if peak_idx > n - 1 - edge_steps:
-        return CropStatus.TRUNCATED_END
-    return CropStatus.OK
-
-
-def is_flat(
-    sizes: np.ndarray | list[int], *, ratio_threshold: float = DEFAULT_FLAT_RATIO
-) -> bool:
-    """``max/min`` below threshold ⇒ no real focus modulation in this crop."""
-    arr = np.asarray(sizes, dtype=float)
-    if arr.size == 0 or arr.min() <= 0:
-        return False
-    return float(arr.max() / arr.min()) < ratio_threshold
-
-
-def off_target_by_cross_compare(
-    crop_maxes: dict[str, int],
-    *,
-    factor: float = DEFAULT_OFF_TARGET_FACTOR,
-) -> set[str]:
-    """Crops whose peak file size is below ``factor × best``.
-
-    Reference is the *maximum* peak across the scenario (not the median):
-    when more than half the 17 crops miss the wafer (common at low
-    magnifications), a median-based cutoff sits inside the off-target
-    cluster and flags nothing. See rail-coverage/detect.py for the
-    empirical justification (Nikon 70-180 + 5T sample).
-    """
-    if len(crop_maxes) < 2:
-        return set()
-    cutoff = max(crop_maxes.values()) * factor
-    return {name for name, m in crop_maxes.items() if m < cutoff}
 
 
 def estimate_peak_vertex(sizes: np.ndarray | list[int]) -> float | None:
@@ -148,7 +114,7 @@ def estimate_peak_vertex(sizes: np.ndarray | list[int]) -> float | None:
     # vertex we return aligns with the input series.
     offset = 1  # centred 3-window
     xs = np.arange(smoothed.size, dtype=float) + offset
-    a, b, c = np.polyfit(xs, smoothed, deg=2)
+    a, b, _c = np.polyfit(xs, smoothed, deg=2)
     if a >= 0:
         return None
     return float(-b / (2 * a))
@@ -187,9 +153,6 @@ def extra_steps_needed(
     return min(raw, n)
 
 
-# --- top-level ------------------------------------------------------------
-
-
 def analyze_crop(
     crop_name: str,
     sizes: list[int],
@@ -224,7 +187,7 @@ def analyze_crop(
             min_size=min(sizes),
         )
 
-    pk = peak_step(sizes)
+    pk = peak_index(sizes)
     pct = pk / max(1, n - 1)
     status = truncation_status(pk, n, edge_steps=edge_steps)
     vertex = estimate_peak_vertex(sizes) if status.is_truncated else None
