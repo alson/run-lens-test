@@ -607,8 +607,10 @@ class SessionRunner:
             step_size_mm=step_size_mm,
             apertures=apertures,
         )
-        if result.ok or not result.needs_extension or result.peak_side not in (
-            "near", "far"
+        if (
+            result.ok
+            or not result.needs_extension
+            or result.peak_side not in ("near", "far", "both")
         ):
             write_json(lens_dir / "range_check.json", {
                 "ok": result.ok,
@@ -621,39 +623,71 @@ class SessionRunner:
         extension_mm = end_mm * float(
             getattr(self.config, "RANGE_EXTENSION_FRACTION", 0.5)
         )
-        probe_count = int(getattr(self.config, "RANGE_CHECK_PROBE_STEPS", 2))
-        probe_positions = self._probe_positions(
-            extension_mm=extension_mm,
-            probe_count=probe_count,
-            peak_side=result.peak_side,
-            end_mm=end_mm,
+        # Per-side extension capacity in whole grid steps.
+        extension_steps = int(extension_mm // step_size_mm)
+        configured_probe_count = int(
+            getattr(self.config, "RANGE_CHECK_PROBE_STEPS", 2)
         )
+        if extension_steps < 1:
+            # Extension wouldn't fit a single grid step — nothing to
+            # probe, nothing to extend. Trust the first-call decision
+            # and bail out so the user can re-jog if needed.
+            write_json(lens_dir / "range_check.json", {
+                "ok": False,
+                "peak_side": result.peak_side,
+                "extension_applied": False,
+                "extension_mm": extension_mm,
+                "notes": (result.notes or "")
+                + " (extension shorter than one grid step; skipped)",
+            })
+            return steps - 1
 
-        # Shoot the probe at each position. Tracks current rail
-        # position relative to START (== position 0).
-        current_pos = (steps - 1) * step_size_mm
-        probe_data = []
-        for i, target in enumerate(probe_positions):
-            self._move_to(current_pos, target)
-            current_pos = target
-            self._shoot_at_position(
-                lens_dir=lens_dir,
-                slug=slug,
-                step_index=-(i + 1),       # negative = probe identifier
-                position_mm=target,
-                apertures=apertures,
-                calibration=calibration,
-                phase=Phase.PROBE,
-                file_factory=lambda ap, _i=i: lens_dir / "probe"
-                / f"{ap.replace('/', '_').replace('.', '_')}_p{_i:02d}.jpg",
+        # Per-side probe count — split for BOTH so we shoot ~half on
+        # each side; cap at the available extension slots so we never
+        # try to shoot more probes than the extension has room for.
+        if result.peak_side == "both":
+            probe_per_side = min(
+                max(1, configured_probe_count // 2 + 1), extension_steps
             )
+            sides = [("far", probe_per_side), ("near", probe_per_side)]
+        else:
+            probe_per_side = min(configured_probe_count, extension_steps)
+            sides = [(result.peak_side, probe_per_side)]
+
+        # Walk through each requested side, shooting probes at
+        # grid-aligned step indices. Probes use the same filename
+        # convention as the rest of the sweep — sweep, probe, and
+        # (if it follows) extension are distinguished only by the
+        # phase column in shots.csv.
+        current_pos = (steps - 1) * step_size_mm  # rail at end_mm
+        probe_data: list = []
+        probe_positions_per_side: dict[str, list[float]] = {"far": [], "near": []}
+        for side, count in sides:
+            for i in range(count):
+                step_index = self._extension_step_index(
+                    side=side, original_steps=steps, offset_in_extension=i
+                )
+                target = step_index * step_size_mm
+                self._move_to(current_pos, target)
+                current_pos = target
+                self._shoot_at_position(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    step_index=step_index,
+                    position_mm=target,
+                    apertures=apertures,
+                    calibration=calibration,
+                    phase=Phase.PROBE,
+                    file_factory=lambda ap, idx=step_index:
+                        self._sweep_destination(lens_dir, ap, idx),
+                )
+                probe_positions_per_side[side].append(target)
 
         # Drain pending sharpness crops so the second evaluate() sees
         # the main sweep + every probe shot just taken.
         if self._sharpness_collector is not None:
             self._sharpness_collector.wait_for_pending()
 
-        # Re-evaluate with probe data.
         result2 = self.range_checker.evaluate(
             lens_dir=lens_dir,
             end_mm=end_mm,
@@ -661,8 +695,14 @@ class SessionRunner:
             apertures=apertures,
             probe_data=probe_data,
         )
+
+        record_base = {
+            "peak_side": result.peak_side,
+            "extension_mm": extension_mm,
+            "probe_positions_mm": probe_positions_per_side,
+        }
+
         if not result2.peak_in_range_after_probe:
-            # Probe says peak is still outside — bail to user.
             if self.ntfy is not None:
                 self.ntfy.with_body(
                     Notification(
@@ -680,92 +720,62 @@ class SessionRunner:
             )
             write_json(lens_dir / "range_check.json", {
                 "ok": False,
-                "peak_side": result.peak_side,
                 "extension_applied": False,
-                "extension_mm": extension_mm,
-                "probe_positions_mm": probe_positions,
+                **record_base,
                 "notes": "probe did not bracket peak",
             })
             return self._steps_from_zero_at(current_pos, step_size_mm)
 
-        # Probe brackets the peak — run a full extension sweep at the
-        # original step size, walking from the probe position outward.
-        extension_steps = int(round(extension_mm / step_size_mm))
-        extension_positions = self._extension_positions(
-            current_pos=current_pos,
-            extension_steps=extension_steps,
-            step_size_mm=step_size_mm,
-            peak_side=result.peak_side,
-        )
-        for i, target in enumerate(extension_positions):
-            self._move_to(current_pos, target)
-            current_pos = target
-            self._shoot_at_position(
-                lens_dir=lens_dir,
-                slug=slug,
-                step_index=steps + i,
-                position_mm=target,
-                apertures=apertures,
-                calibration=calibration,
-                phase=Phase.EXTENSION,
-                file_factory=lambda ap, idx=steps + i: self._sweep_destination(
-                    lens_dir, ap, idx
-                ),
-            )
+        # Probe brackets the peak — fill in the remaining grid slots
+        # in the extension, on each requested side. Probes already
+        # cover ``count`` slots per side; we shoot the additional
+        # ``extension_steps - count`` slots.
+        extension_step_count_per_side: dict[str, int] = {"far": 0, "near": 0}
+        for side, probe_count_used in sides:
+            for i in range(probe_count_used, extension_steps):
+                step_index = self._extension_step_index(
+                    side=side, original_steps=steps, offset_in_extension=i
+                )
+                target = step_index * step_size_mm
+                self._move_to(current_pos, target)
+                current_pos = target
+                self._shoot_at_position(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    step_index=step_index,
+                    position_mm=target,
+                    apertures=apertures,
+                    calibration=calibration,
+                    phase=Phase.EXTENSION,
+                    file_factory=lambda ap, idx=step_index:
+                        self._sweep_destination(lens_dir, ap, idx),
+                )
+                extension_step_count_per_side[side] += 1
 
         write_json(lens_dir / "range_check.json", {
             "ok": False,
-            "peak_side": result.peak_side,
             "extension_applied": True,
-            "extension_mm": extension_mm,
-            "extension_step_count": extension_steps,
-            "probe_positions_mm": probe_positions,
+            **record_base,
+            "extension_step_count": extension_step_count_per_side,
+            "probe_step_count": {
+                "far": dict(sides).get("far", 0),
+                "near": dict(sides).get("near", 0),
+            },
             "notes": result2.notes,
         })
         return self._steps_from_zero_at(current_pos, step_size_mm)
 
-    def _probe_positions(
-        self,
-        *,
-        extension_mm: float,
-        probe_count: int,
-        peak_side: str,
-        end_mm: float,
-    ) -> list[float]:
-        """Even spacing across the extension on the given side."""
-        if probe_count < 1:
-            return []
-        # Probe positions are at i/(probe_count+1) of the extension,
-        # for i in 1..probe_count. Result is monotonic in the desired
-        # direction.
-        fractions = [
-            (i + 1) / (probe_count + 1) for i in range(probe_count)
-        ]
-        if peak_side == "far":
-            return [end_mm + extension_mm * f for f in fractions]
-        # peak_side == "near"
-        return [-extension_mm * f for f in fractions]
-
-    def _extension_positions(
-        self,
-        *,
-        current_pos: float,
-        extension_steps: int,
-        step_size_mm: float,
-        peak_side: str,
-    ) -> list[float]:
-        """Equally-spaced positions filling the extension at the
-        original step_size_mm. Walks monotonically from current_pos
-        toward the further edge of the extension."""
-        if peak_side == "far":
-            # We're somewhere past END; step further forward to
-            # extension end.
-            return [current_pos + step_size_mm * (i + 1)
-                    for i in range(extension_steps)]
-        # peak_side == "near"; we're somewhere negative, step further
-        # backward.
-        return [current_pos - step_size_mm * (i + 1)
-                for i in range(extension_steps)]
+    @staticmethod
+    def _extension_step_index(
+        *, side: str, original_steps: int, offset_in_extension: int
+    ) -> int:
+        """Map (side, position-within-extension) to a signed step
+        index. Far side continues past the main sweep; near side
+        descends below zero."""
+        if side == "far":
+            return original_steps + offset_in_extension
+        # side == "near"
+        return -1 - offset_in_extension
 
     def _shoot_at_position(
         self,

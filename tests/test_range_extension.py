@@ -4,14 +4,16 @@ Uses a scripted FakeRangeChecker (separate from the production stub)
 to drive the runner through:
   * stub-style ok=True: no extra captures, range_check.json has
     extension_applied=False
-  * needs_extension=True, peak_side='far', then peak_in_range=True:
-    probe shots and a full extension sweep happen, files land in
-    <lens>/probe and <lens>/f_*/step_NNN.jpg with NNN past the
-    original sweep range
-  * needs_extension=True, peak_side='near': probe + extension shoot
-    on the negative side
-  * peak_in_range_after_probe=False: user is prompted, no extension
-    sweep, range_check.json reflects it
+  * needs_extension=True, peak_side='far' -> grid-aligned probe,
+    optional extension follow-up; phases marked PROBE / EXTENSION
+  * peak_side='near' -> probe + extension at negative step indices
+    (filenames stay positive thanks to STEP_NUMBER_OFFSET)
+  * peak_side='both' -> bilateral probes + bilateral extensions
+  * peak_in_range_after_probe=False -> user prompted; no extension
+
+The grid-aligned design means probes and extension shots share the
+same per-aperture directory and the same step_NNNN.jpg filename
+convention; only shots.csv's ``phase`` column distinguishes them.
 """
 
 from __future__ import annotations
@@ -108,20 +110,24 @@ class TestRangeOk:
         assert rc["extension_applied"] is False
 
 
-# ---- Far-side extension --------------------------------------------------
+# ---- Far-side extension ---------------------------------------------------
 
 
 class TestFarExtension:
-    def test_probe_then_full_extension(self, cfg, tmp_path) -> None:
-        # end_mm=10 with 3 steps → step_size_mm = 5.
-        # extension = end_mm × 0.5 = 5 → 1 extension step.
-        # Captures: 1 cal + 3 sweep + 2 probe + 1 extension = 7.
+    """end_mm=20, steps=3 -> step_size_mm=10. Default 0.5 fraction
+    -> extension_mm=10 -> extension_steps=1. Default RANGE_CHECK_PROBE_STEPS=2
+    is clamped to 1 (one grid slot in the extension). So we get exactly
+    1 probe shot at step_index=3 and zero extension follow-up."""
+
+    def test_one_grid_probe_when_extension_is_one_step(
+        self, cfg, tmp_path
+    ) -> None:
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
             medians=[100.0] * 20,
-            inputs={"steps": 3, "end_mm": 10.0},
+            inputs={"steps": 3, "end_mm": 20.0},
         )
         runner.range_checker = ScriptedRangeChecker([
             RangeResult(ok=False, peak_side="far",
@@ -134,23 +140,75 @@ class TestFarExtension:
         ])
         _run_one_lens_config(runner)
 
+        # 1 calibration + 3 sweep + 1 probe + 0 extension = 5 captures.
         capture_count = sum(
             1 for k, _ in camera.history if k == "capture"
         )
-        assert capture_count == 7
+        assert capture_count == 5
 
-        probe_dir = runner.session_dir / "L" / "probe"
-        probe_files = list(probe_dir.glob("*.jpg"))
-        assert len(probe_files) == 2
+        # Probes share the per-aperture directory with the sweep —
+        # they are simply step indices past the end of the original
+        # sweep, with the source filename derived from the step
+        # index plus STEP_NUMBER_OFFSET.
+        sweep_dir = runner.session_dir / "L" / "f_4"
+        sweep_files = sorted(sweep_dir.glob("step_*.jpg"))
+        assert [p.name for p in sweep_files] == [
+            "step_0100.jpg",  # main sweep step 0
+            "step_0101.jpg",  # main sweep step 1
+            "step_0102.jpg",  # main sweep step 2 (= end_mm)
+            "step_0103.jpg",  # probe at step_index=3 (= end_mm + step_size)
+        ]
+        # No /probe/ subdir: phase distinction lives in the CSV.
+        assert not (runner.session_dir / "L" / "probe").exists()
+
+        rows = runner.shots_csv.read_rows()
+        phases = [r["phase"] for r in rows]
+        assert phases.count(Phase.PROBE.value) == 1
+        assert phases.count(Phase.EXTENSION.value) == 0
+
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["ok"] is False
+        assert rc["peak_side"] == "far"
+        assert rc["extension_applied"] is True
+        # Per-side counters: 0 extension follow-up shots on far side
+        # (the lone slot was already covered by the probe).
+        assert rc["extension_step_count"] == {"far": 0, "near": 0}
+
+    def test_probe_then_extension_follow_up(self, cfg, tmp_path) -> None:
+        """Bigger range so the extension fits the probe count plus an
+        extra step. end_mm=60, steps=7 -> step_size=10, ext_mm=30,
+        ext_steps=3, probe=2, ext follow-up=1."""
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"steps": 7, "end_mm": 60.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True, notes="far"),
+            RangeResult(ok=True, peak_side="far",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket"),
+        ])
+        _run_one_lens_config(runner)
+
+        # 1 cal + 7 sweep + 2 probe + 1 extension = 11 captures.
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 11
 
         sweep_dir = runner.session_dir / "L" / "f_4"
         sweep_files = sorted(sweep_dir.glob("step_*.jpg"))
-        # Original sweep created step_0100..step_0102 (offset = 100);
-        # the 1-step extension adds step_0103.
-        assert [p.name for p in sweep_files] == [
-            "step_0100.jpg", "step_0101.jpg", "step_0102.jpg",
-            "step_0103.jpg",
-        ]
+        # 7 sweep + 3 extension grid positions.
+        assert len(sweep_files) == 10
+        # Filenames: 0100..0109 (steps 0..9 with offset 100).
+        assert sweep_files[-1].name == "step_0109.jpg"
 
         rows = runner.shots_csv.read_rows()
         phases = [r["phase"] for r in rows]
@@ -160,29 +218,26 @@ class TestFarExtension:
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
-        assert rc["ok"] is False
-        assert rc["peak_side"] == "far"
-        assert rc["extension_applied"] is True
-        assert rc["extension_step_count"] == 1
+        assert rc["extension_step_count"] == {"far": 1, "near": 0}
 
 
 # ---- Near-side extension --------------------------------------------------
 
 
 class TestNearExtension:
-    def test_probe_and_extension_on_negative_side(self, cfg, tmp_path) -> None:
-        # Same step / extension math as the far case: 3 sweep + 1
-        # extension = 4 step_*.jpg files in the per-aperture dir.
+    def test_negative_step_indices_have_positive_filenames(
+        self, cfg, tmp_path
+    ) -> None:
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
             medians=[100.0] * 20,
-            inputs={"steps": 3, "end_mm": 10.0},
+            inputs={"steps": 3, "end_mm": 20.0},
         )
         runner.range_checker = ScriptedRangeChecker([
             RangeResult(ok=False, peak_side="near",
-                        needs_extension=True, notes="peak before start"),
+                        needs_extension=True, notes="near"),
             RangeResult(ok=True, peak_side="near",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
@@ -190,17 +245,76 @@ class TestNearExtension:
         ])
         _run_one_lens_config(runner)
 
-        probe_dir = runner.session_dir / "L" / "probe"
-        assert len(list(probe_dir.glob("*.jpg"))) == 2
-
         sweep_dir = runner.session_dir / "L" / "f_4"
-        assert len(list(sweep_dir.glob("step_*.jpg"))) == 4
-
+        sweep_files = sorted(sweep_dir.glob("step_*.jpg"))
+        # Probe at step_index = -1 -> filename step_0099.jpg, sorts
+        # *before* the main sweep's step_0100..step_0102 in any
+        # standard listing tool.
+        assert [p.name for p in sweep_files] == [
+            "step_0099.jpg",
+            "step_0100.jpg",
+            "step_0101.jpg",
+            "step_0102.jpg",
+        ]
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
         assert rc["peak_side"] == "near"
         assert rc["extension_applied"] is True
+
+
+# ---- Both-side extension --------------------------------------------------
+
+
+class TestBothExtension:
+    def test_bilateral_probes_and_filenames_sort_by_rail_position(
+        self, cfg, tmp_path
+    ) -> None:
+        """peak_side='both' shoots up to (probe_count // 2 + 1) probes
+        on each side, capped by extension_steps."""
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 20,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="both",
+                        needs_extension=True,
+                        notes="focus shift across apertures"),
+            RangeResult(ok=True, peak_side="both",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket on both sides"),
+        ])
+        _run_one_lens_config(runner)
+
+        # 1 cal + 3 sweep + 1 far probe + 1 near probe = 6.
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 6
+
+        sweep_dir = runner.session_dir / "L" / "f_4"
+        sweep_files = sorted(sweep_dir.glob("step_*.jpg"))
+        assert [p.name for p in sweep_files] == [
+            "step_0099.jpg",  # near probe (step_index = -1)
+            "step_0100.jpg",  # main sweep step 0
+            "step_0101.jpg",  # main sweep step 1
+            "step_0102.jpg",  # main sweep step 2 (= end_mm)
+            "step_0103.jpg",  # far probe (step_index = +3)
+        ]
+
+        rows = runner.shots_csv.read_rows()
+        phases = [r["phase"] for r in rows]
+        assert phases.count(Phase.PROBE.value) == 2
+
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["peak_side"] == "both"
+        assert rc["probe_step_count"] == {"far": 1, "near": 1}
 
 
 # ---- Probe says peak still outside ----------------------------------------
@@ -215,7 +329,7 @@ class TestProbeFails:
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
             medians=[100.0] * 20,
-            inputs={"steps": 3, "end_mm": 4.0},
+            inputs={"steps": 3, "end_mm": 20.0},
         )
         runner.confirm = lambda msg: (confirms.append(msg), True)[1]
         runner.range_checker = ScriptedRangeChecker([
@@ -228,15 +342,11 @@ class TestProbeFails:
         ])
         _run_one_lens_config(runner)
 
-        # No extension files in f_4 (only the original 3).
         sweep_dir = runner.session_dir / "L" / "f_4"
-        assert len(list(sweep_dir.glob("step_*.jpg"))) == 3
-        # Probe files are still present.
-        probe_dir = runner.session_dir / "L" / "probe"
-        assert len(list(probe_dir.glob("*.jpg"))) == 2
+        # 3 sweep + 1 probe = 4 files; no extension follow-up.
+        assert len(list(sweep_dir.glob("step_*.jpg"))) == 4
 
-        # User got a "Range still inadequate" prompt before lens
-        # change.
+        # Range-still-inadequate prompt was shown.
         assert any("Range still inadequate" in c for c in confirms)
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
@@ -245,34 +355,24 @@ class TestProbeFails:
         assert "did not bracket peak" in rc["notes"]
 
 
-# ---- Probe positions math --------------------------------------------------
+# ---- Step-index helper math -----------------------------------------------
 
 
-class TestProbePositions:
-    """Direct unit test of the probe-position helper (no runner state)."""
+class TestExtensionStepIndex:
+    def test_far_side_continues_past_main_sweep(self) -> None:
+        # 3-step main sweep (indices 0..2). Far probe i=0 is index 3.
+        assert SessionRunner._extension_step_index(
+            side="far", original_steps=3, offset_in_extension=0
+        ) == 3
+        assert SessionRunner._extension_step_index(
+            side="far", original_steps=3, offset_in_extension=2
+        ) == 5
 
-    def test_far_side_two_probes_evenly_spaced(self, cfg, tmp_path) -> None:
-        camera = FakeCamera(apertures=["f/4"])
-        rail = FakeRail()
-        runner = make_runner(
-            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
-            medians=[],
-        )
-        positions = runner._probe_positions(
-            extension_mm=6.0, probe_count=2, peak_side="far", end_mm=10.0
-        )
-        # Fractions 1/3 and 2/3 of 6 mm past 10 mm: 12, 14.
-        assert positions == pytest.approx([12.0, 14.0])
-
-    def test_near_side_two_probes_negative(self, cfg, tmp_path) -> None:
-        camera = FakeCamera(apertures=["f/4"])
-        rail = FakeRail()
-        runner = make_runner(
-            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
-            medians=[],
-        )
-        positions = runner._probe_positions(
-            extension_mm=6.0, probe_count=2, peak_side="near", end_mm=10.0
-        )
-        # Negative fractions of extension before 0: -2, -4.
-        assert positions == pytest.approx([-2.0, -4.0])
+    def test_near_side_descends_below_zero(self) -> None:
+        # Near probe i=0 is index -1 (one step *before* main sweep).
+        assert SessionRunner._extension_step_index(
+            side="near", original_steps=3, offset_in_extension=0
+        ) == -1
+        assert SessionRunner._extension_step_index(
+            side="near", original_steps=3, offset_in_extension=2
+        ) == -3
