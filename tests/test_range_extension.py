@@ -145,11 +145,11 @@ class TestFarExtension:
 
         sweep_dir = runner.session_dir / "L" / "f_4"
         sweep_files = sorted(sweep_dir.glob("step_*.jpg"))
-        # Original sweep created step_000..step_002; the 1-step
-        # extension adds step_003.
+        # Original sweep created step_0100..step_0102 (offset = 100);
+        # the 1-step extension adds step_0103.
         assert [p.name for p in sweep_files] == [
-            "step_000.jpg", "step_001.jpg", "step_002.jpg",
-            "step_003.jpg",
+            "step_0100.jpg", "step_0101.jpg", "step_0102.jpg",
+            "step_0103.jpg",
         ]
 
         rows = runner.shots_csv.read_rows()

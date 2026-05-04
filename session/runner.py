@@ -38,6 +38,7 @@ from session.calibrate import (
     Calibrator,
     next_iso,
 )
+from session.filenames import step_filename
 from session.log import (
     Phase,
     SessionMetadata,
@@ -159,6 +160,58 @@ class JogResult:
 JogStartEnd = Callable[[RailLike], JogResult]
 
 
+# ---- Sharpness collector contract ----------------------------------------
+
+
+class SharpnessCollectorLike(Protocol):
+    """Subset of :class:`sharpness.collector.LiveCollector` the runner
+    depends on. Tests can inject a no-op fake; production wires the
+    real one in."""
+
+    def record_shot(self, rail_step: int, aperture: float, jpg_path) -> object: ...
+
+    def wait_for_pending(self) -> None: ...
+
+    def shutdown(self, *, wait: bool = True) -> None: ...
+
+
+SharpnessCollectorFactory = Callable[[Path], SharpnessCollectorLike]
+"""Build a per-lens-config sharpness collector. Receives the
+``cropped/`` output directory; returns an opened collector. The
+default factory in :class:`SessionRunner` produces a real
+:class:`LiveCollector`; tests pass a factory that returns a no-op
+fake.
+"""
+
+
+def _real_sharpness_collector_factory(out_dir: Path) -> SharpnessCollectorLike:
+    """Default factory — imports lazily so the runner module stays
+    importable in environments without the sharpness package's heavier
+    deps (Pillow already required, but PIL might be unavailable in a
+    pure-unit-test environment)."""
+    from sharpness.collector import LiveCollector
+    return LiveCollector(out_dir, max_workers=4)
+
+
+class _NullSharpnessCollector:
+    """No-op collector used when sharpness is disabled. Methods are
+    valid no-ops so the runner code never special-cases the absence
+    of a collector."""
+
+    def record_shot(self, rail_step: int, aperture: float, jpg_path) -> None:
+        return None
+
+    def wait_for_pending(self) -> None:
+        return None
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        return None
+
+
+def _null_sharpness_collector_factory(out_dir: Path) -> SharpnessCollectorLike:
+    return _NullSharpnessCollector()
+
+
 # ---- Runner ---------------------------------------------------------------
 
 
@@ -181,6 +234,15 @@ class SessionRunner:
     jog: JogStartEnd | None = None
     droop_detector: DroopDetector | None = None
     crop_box: CropBox | None = None
+    sharpness_collector_factory: SharpnessCollectorFactory = field(
+        default=_null_sharpness_collector_factory
+    )
+    """Per-lens-config sharpness collector factory.
+
+    Default is a no-op so existing tests stay opaque to sharpness; the
+    production entry point swaps in
+    :func:`_real_sharpness_collector_factory` (or constructs a
+    :class:`LiveCollector` directly)."""
 
     # ---- internal state filled at start ----------------------------------
     session_id: str = ""
@@ -188,6 +250,7 @@ class SessionRunner:
     shots_csv: ShotsCSV | None = None
     metadata: SessionMetadata | None = None
     baseline_median: float | None = None
+    _sharpness_collector: SharpnessCollectorLike | None = None
 
     # ---- public entry points ---------------------------------------------
 
@@ -330,6 +393,41 @@ class SessionRunner:
             max_fstop=self.config.MAX_FSTOP,
         )
 
+        # One sharpness collector per lens config. Crops land under
+        # <lens>/<aperture>/cropped/<crop-name>/<source-filename>.jpg
+        # — see config.SHARPNESS_CROPPED_DIRNAME and §8.3.5 of the
+        # plan. The collector lives for the entire lens config so
+        # probe / extension shots feed the same dataset.
+        self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
+        try:
+            self._run_one_lens_config_inner(
+                slug=slug,
+                lens_dir=lens_dir,
+                end_mm=end_mm,
+                steps=steps,
+                step_size_mm=step_size_mm,
+                apertures=apertures,
+            )
+        finally:
+            try:
+                self._sharpness_collector.shutdown(wait=True)
+            except Exception:                        # noqa: BLE001
+                # Cropping errors must not mask a session error or
+                # block lens-change recovery.
+                log.exception("sharpness collector shutdown failed")
+            self._sharpness_collector = None
+
+    def _run_one_lens_config_inner(
+        self,
+        *,
+        slug: str,
+        lens_dir: Path,
+        end_mm: float,
+        steps: int,
+        step_size_mm: float,
+        apertures: list[str],
+    ) -> None:
+
         # Calibration at rail step 0.
         calibrator = Calibrator(
             camera=self.camera,
@@ -453,6 +551,9 @@ class SessionRunner:
             dest = self._sweep_destination(lens_dir, aperture, step_index)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.camera.capture_to(dest)
+            self._record_sharpness(
+                step_index=step_index, aperture=aperture, dest=dest
+            )
             median = self._measure(dest)
             ev = ev_delta(median, self.baseline_median or median)
             self._log_shot(
@@ -496,6 +597,10 @@ class SessionRunner:
         from session.log import write_json
 
         assert self.range_checker is not None
+        # Drain pending sharpness crops so the first evaluate() sees
+        # the complete main-sweep dataset.
+        if self._sharpness_collector is not None:
+            self._sharpness_collector.wait_for_pending()
         result = self.range_checker.evaluate(
             lens_dir=lens_dir,
             end_mm=end_mm,
@@ -542,6 +647,11 @@ class SessionRunner:
                 file_factory=lambda ap, _i=i: lens_dir / "probe"
                 / f"{ap.replace('/', '_').replace('.', '_')}_p{_i:02d}.jpg",
             )
+
+        # Drain pending sharpness crops so the second evaluate() sees
+        # the main sweep + every probe shot just taken.
+        if self._sharpness_collector is not None:
+            self._sharpness_collector.wait_for_pending()
 
         # Re-evaluate with probe data.
         result2 = self.range_checker.evaluate(
@@ -677,6 +787,9 @@ class SessionRunner:
             dest = file_factory(aperture)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.camera.capture_to(dest)
+            self._record_sharpness(
+                step_index=step_index, aperture=aperture, dest=dest
+            )
             median = self._measure(dest)
             ev = ev_delta(median, self.baseline_median or median)
             self._log_shot(
@@ -829,8 +942,35 @@ class SessionRunner:
     def _sweep_destination(
         self, lens_dir: Path, aperture: str, step_index: int
     ) -> Path:
-        slug = aperture.replace("/", "_").replace(".", "_")
-        return lens_dir / slug / f"step_{step_index:03d}.jpg"
+        slug = self._aperture_subdir(aperture)
+        offset = getattr(self.config, "STEP_NUMBER_OFFSET", 100)
+        width = getattr(self.config, "STEP_NUMBER_WIDTH", 4)
+        return lens_dir / slug / step_filename(
+            step_index, offset=offset, width=width
+        )
+
+    @staticmethod
+    def _aperture_subdir(aperture: str) -> str:
+        return aperture.replace("/", "_").replace(".", "_")
+
+    def _record_sharpness(
+        self, *, step_index: int, aperture: str, dest: Path
+    ) -> None:
+        """Hand a captured JPEG to the sharpness collector. Defensive —
+        cropping errors are surfaced at the next ``wait_for_pending``
+        call, never inline."""
+        if self._sharpness_collector is None:
+            return
+        try:
+            self._sharpness_collector.record_shot(
+                rail_step=step_index,
+                aperture=_parse_fnum(aperture),
+                jpg_path=dest,
+            )
+        except RuntimeError:
+            # Collector already shut down (e.g. abort path). The
+            # session is winding down; skip silently.
+            log.debug("sharpness record_shot rejected (collector down)")
 
     def _recycle_for(self, aperture: str) -> float:
         ap_float = _parse_fnum(aperture)
