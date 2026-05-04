@@ -158,6 +158,37 @@ class TestStreamingPipeline:
         assert collectors[0].out_dir.name == "lensA"
         assert collectors[1].out_dir.name == "lensB"
 
+    def test_runner_calls_set_collector_on_range_checker(
+        self, cfg, tmp_path: Path
+    ) -> None:
+        """The runner must call range_checker.set_collector(collector)
+        before each lens config and set_collector(None) after, so the
+        sharpness adapter has a live collector to read from."""
+
+        class _Recording(RangeChecker):
+            def __init__(self) -> None:
+                super().__init__(config=None)
+                self.collectors: list = []
+
+            def set_collector(self, collector) -> None:
+                self.collectors.append(collector)
+
+            def evaluate(self, *args, **kwargs) -> RangeResult:        # type: ignore[override]
+                return RangeResult(
+                    ok=True, peak_side="centered",
+                    needs_extension=False,
+                )
+
+        runner, camera, collectors = _build_runner(cfg, tmp_path)
+        recording = _Recording()
+        runner.range_checker = recording
+        runner.run()
+
+        # Two calls per lens config: set + clear.
+        assert len(recording.collectors) == 2
+        assert recording.collectors[0] is collectors[0]
+        assert recording.collectors[1] is None
+
     def test_capture_and_record_are_paired_in_order(
         self, cfg, tmp_path: Path
     ) -> None:

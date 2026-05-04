@@ -74,6 +74,9 @@ class SharpnessRangeChecker(RangeChecker):
         super().__init__(config=config)
         self.collector = collector
 
+    def set_collector(self, collector) -> None:  # type: ignore[override]
+        self.collector = collector
+
     # ---- RangeChecker contract ------------------------------------------
 
     def evaluate(  # type: ignore[override]

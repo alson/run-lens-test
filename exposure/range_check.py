@@ -95,6 +95,15 @@ class RangeChecker:
     def __init__(self, config) -> None:
         self.config = config
 
+    def set_collector(self, collector) -> None:  # noqa: ARG002
+        """Hook called by the session runner to hand over the per-
+        lens-config sharpness collector. The default implementation
+        ignores it (the stub doesn't need the cropped dataset);
+        :class:`sharpness.range_check.SharpnessRangeChecker` overrides
+        this to wire the collector through.
+        """
+        return None
+
     def evaluate(
         self,
         lens_dir: Path,

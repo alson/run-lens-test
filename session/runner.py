@@ -399,6 +399,8 @@ class SessionRunner:
         # plan. The collector lives for the entire lens config so
         # probe / extension shots feed the same dataset.
         self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
+        if self.range_checker is not None:
+            self.range_checker.set_collector(self._sharpness_collector)
         try:
             self._run_one_lens_config_inner(
                 slug=slug,
@@ -415,6 +417,8 @@ class SessionRunner:
                 # Cropping errors must not mask a session error or
                 # block lens-change recovery.
                 log.exception("sharpness collector shutdown failed")
+            if self.range_checker is not None:
+                self.range_checker.set_collector(None)
             self._sharpness_collector = None
 
     def _run_one_lens_config_inner(
@@ -1035,5 +1039,59 @@ class SessionRunner:
         if self.metadata is None:
             return
         write_json(self.session_dir / "session.json", self.metadata)
+
+
+# ---- Production main() ----------------------------------------------------
+
+
+def main() -> None:
+    """Bootstrap a real session: wires the production hardware drivers
+    to the runner, with the sharpness-backed RangeChecker.
+
+    All injectable collaborators come together here so tests can stay
+    on lightweight fakes without ever touching this function.
+    """
+    import config
+    from camera.nikon_z7 import NikonZ7
+    from notify.ntfy import NtfyClient
+    from sharpness.collector import LiveCollector
+    from sharpness.range_check import SharpnessRangeChecker
+    from stackshot.controller import open_serial as open_stackshot
+    from stackshot.jog import jog_start_and_end as _jog
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    rail = open_stackshot(
+        port=getattr(config, "STACKSHOT_PORT", "/dev/ttyUSB0"),
+        baud=config.STACKSHOT_BAUD,
+        poll_interval_s=config.STACKSHOT_POLL_INTERVAL_S,
+        move_timeout_s=config.STACKSHOT_MOVE_TIMEOUT_S,
+    )
+    camera = NikonZ7()
+    ntfy = NtfyClient(config.NTFY_BASE_URL, config.NTFY_TOPIC)
+    range_checker = SharpnessRangeChecker(config=config)
+
+    def _sharpness_factory(lens_dir: Path) -> SharpnessCollectorLike:
+        return LiveCollector(
+            lens_dir / config.SHARPNESS_CROPPED_DIRNAME,
+            max_workers=config.SHARPNESS_MAX_WORKERS,
+        )
+
+    runner = SessionRunner(
+        camera=camera,
+        rail=rail,
+        config=config,
+        ntfy=ntfy,
+        range_checker=range_checker,
+        output_root=config.OUTPUT_ROOT,
+        jog=lambda r: JogResult(end_mm=_jog(r).end_mm),
+        sharpness_collector_factory=_sharpness_factory,
+    )
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()
 
 
