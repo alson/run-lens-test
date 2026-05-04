@@ -9,4 +9,34 @@ user is still at the rig when this runs, the recommendation includes
 both a direction (extend rail forward / backward) and an estimated
 extension distance — unlike the offline tool, where subject-distance
 ranges can't be reproduced and direction information is useless.
+
+Public API::
+
+    from sharpness import LiveCollector, advise
+
+    with LiveCollector(out_dir) as c:
+        for step, ap, jpg in shooting_loop():
+            c.record_shot(step, ap, jpg)
+    for ap, rec in sorted(advise(c.dataset).items()):
+        print(rec.summary())
 """
+
+from sharpness.advisor import Direction, Recommendation, Verdict, advise
+from sharpness.collector import CollectedDataset, LiveCollector, ShotSample
+from sharpness.crops import CROP_NAMES, CropBox, all_crop_boxes
+from sharpness.detect import CropAnalysis, CropStatus
+
+__all__ = [
+    "CROP_NAMES",
+    "CollectedDataset",
+    "CropAnalysis",
+    "CropBox",
+    "CropStatus",
+    "Direction",
+    "LiveCollector",
+    "Recommendation",
+    "ShotSample",
+    "Verdict",
+    "advise",
+    "all_crop_boxes",
+]

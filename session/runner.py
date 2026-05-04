@@ -313,11 +313,27 @@ class SessionRunner:
             apertures=apertures,
         )
 
-        # Return rail to 0 for the next lens config (backlash on).
-        if steps > 1:
-            self.rail.move_and_wait(
-                Direction.BACKWARD, step_size_mm * (steps - 1), backlash=True
+        # Range check + optional probe + optional extension sweep.
+        # Returns the total number of forward steps the rail has moved
+        # (original sweep + any extension), so we know how far back to
+        # go to reach position 0.
+        forward_steps_done = steps - 1
+        if self.range_checker is not None:
+            forward_steps_done = self._run_range_check_and_extend(
+                lens_dir=lens_dir,
+                slug=slug,
+                end_mm=end_mm,
+                step_size_mm=step_size_mm,
+                steps=steps,
+                calibration=cal_result,
+                apertures=apertures,
             )
+
+        # Return rail to 0 for the next lens config (backlash on; we
+        # may have moved into negative territory if the extension was
+        # on the 'near' side).
+        if forward_steps_done != 0:
+            self._return_rail_to_zero(forward_steps_done * step_size_mm)
 
         # Lens-change prompt.
         self._lens_change_recovery(slug)
@@ -402,6 +418,249 @@ class SessionRunner:
                 aborted = True
                 continue
             self.sleep(self._recycle_for(aperture))
+
+    # ---- Range check + auto-extension ----------------------------------
+
+    def _run_range_check_and_extend(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        end_mm: float,
+        step_size_mm: float,
+        steps: int,
+        calibration: CalibrationResult,
+        apertures: list[str],
+    ) -> int:
+        """Evaluate range adequacy; probe + extend if peak is at an
+        edge. Returns the total forward step count from the START
+        position so the caller can drive the rail back to 0.
+
+        Stays a no-op if ``range_checker.evaluate`` returns ``ok=True``
+        (which is the stub's behaviour today).
+        """
+        from session.log import write_json
+
+        assert self.range_checker is not None
+        result = self.range_checker.evaluate(
+            lens_dir=lens_dir,
+            end_mm=end_mm,
+            step_size_mm=step_size_mm,
+            apertures=apertures,
+        )
+        if result.ok or not result.needs_extension or result.peak_side not in (
+            "near", "far"
+        ):
+            write_json(lens_dir / "range_check.json", {
+                "ok": result.ok,
+                "peak_side": result.peak_side,
+                "extension_applied": False,
+                "notes": result.notes,
+            })
+            return steps - 1
+
+        extension_mm = end_mm * float(
+            getattr(self.config, "RANGE_EXTENSION_FRACTION", 0.5)
+        )
+        probe_count = int(getattr(self.config, "RANGE_CHECK_PROBE_STEPS", 2))
+        probe_positions = self._probe_positions(
+            extension_mm=extension_mm,
+            probe_count=probe_count,
+            peak_side=result.peak_side,
+            end_mm=end_mm,
+        )
+
+        # Shoot the probe at each position. Tracks current rail
+        # position relative to START (== position 0).
+        current_pos = (steps - 1) * step_size_mm
+        probe_data = []
+        for i, target in enumerate(probe_positions):
+            self._move_to(current_pos, target)
+            current_pos = target
+            self._shoot_at_position(
+                lens_dir=lens_dir,
+                slug=slug,
+                step_index=-(i + 1),       # negative = probe identifier
+                position_mm=target,
+                apertures=apertures,
+                calibration=calibration,
+                phase=Phase.PROBE,
+                file_factory=lambda ap, _i=i: lens_dir / "probe"
+                / f"{ap.replace('/', '_').replace('.', '_')}_p{_i:02d}.jpg",
+            )
+
+        # Re-evaluate with probe data.
+        result2 = self.range_checker.evaluate(
+            lens_dir=lens_dir,
+            end_mm=end_mm,
+            step_size_mm=step_size_mm,
+            apertures=apertures,
+            probe_data=probe_data,
+        )
+        if not result2.peak_in_range_after_probe:
+            # Probe says peak is still outside — bail to user.
+            if self.ntfy is not None:
+                self.ntfy.with_body(
+                    Notification(
+                        title="Range still inadequate",
+                        body="",
+                        priority="high",
+                        tags=("warning",),
+                    ),
+                    f"{slug}: probe on {result.peak_side} side did not "
+                    "bracket peak; please re-jog and retry.",
+                )
+            self.confirm(
+                f"\nRange still inadequate on {slug}. Press ENTER to "
+                "continue to lens change anyway, q to abort: "
+            )
+            write_json(lens_dir / "range_check.json", {
+                "ok": False,
+                "peak_side": result.peak_side,
+                "extension_applied": False,
+                "extension_mm": extension_mm,
+                "probe_positions_mm": probe_positions,
+                "notes": "probe did not bracket peak",
+            })
+            return self._steps_from_zero_at(current_pos, step_size_mm)
+
+        # Probe brackets the peak — run a full extension sweep at the
+        # original step size, walking from the probe position outward.
+        extension_steps = int(round(extension_mm / step_size_mm))
+        extension_positions = self._extension_positions(
+            current_pos=current_pos,
+            extension_steps=extension_steps,
+            step_size_mm=step_size_mm,
+            peak_side=result.peak_side,
+        )
+        for i, target in enumerate(extension_positions):
+            self._move_to(current_pos, target)
+            current_pos = target
+            self._shoot_at_position(
+                lens_dir=lens_dir,
+                slug=slug,
+                step_index=steps + i,
+                position_mm=target,
+                apertures=apertures,
+                calibration=calibration,
+                phase=Phase.EXTENSION,
+                file_factory=lambda ap, idx=steps + i: self._sweep_destination(
+                    lens_dir, ap, idx
+                ),
+            )
+
+        write_json(lens_dir / "range_check.json", {
+            "ok": False,
+            "peak_side": result.peak_side,
+            "extension_applied": True,
+            "extension_mm": extension_mm,
+            "extension_step_count": extension_steps,
+            "probe_positions_mm": probe_positions,
+            "notes": result2.notes,
+        })
+        return self._steps_from_zero_at(current_pos, step_size_mm)
+
+    def _probe_positions(
+        self,
+        *,
+        extension_mm: float,
+        probe_count: int,
+        peak_side: str,
+        end_mm: float,
+    ) -> list[float]:
+        """Even spacing across the extension on the given side."""
+        if probe_count < 1:
+            return []
+        # Probe positions are at i/(probe_count+1) of the extension,
+        # for i in 1..probe_count. Result is monotonic in the desired
+        # direction.
+        fractions = [
+            (i + 1) / (probe_count + 1) for i in range(probe_count)
+        ]
+        if peak_side == "far":
+            return [end_mm + extension_mm * f for f in fractions]
+        # peak_side == "near"
+        return [-extension_mm * f for f in fractions]
+
+    def _extension_positions(
+        self,
+        *,
+        current_pos: float,
+        extension_steps: int,
+        step_size_mm: float,
+        peak_side: str,
+    ) -> list[float]:
+        """Equally-spaced positions filling the extension at the
+        original step_size_mm. Walks monotonically from current_pos
+        toward the further edge of the extension."""
+        if peak_side == "far":
+            # We're somewhere past END; step further forward to
+            # extension end.
+            return [current_pos + step_size_mm * (i + 1)
+                    for i in range(extension_steps)]
+        # peak_side == "near"; we're somewhere negative, step further
+        # backward.
+        return [current_pos - step_size_mm * (i + 1)
+                for i in range(extension_steps)]
+
+    def _shoot_at_position(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        step_index: int,
+        position_mm: float,
+        apertures: list[str],
+        calibration: CalibrationResult,
+        phase: Phase,
+        file_factory: Callable[[str], Path],
+    ) -> None:
+        for aperture in apertures:
+            cal = calibration.per_aperture[aperture]
+            self.camera.set_aperture(aperture)
+            self.camera.set_iso(cal.iso)
+            self.camera.set_fec(cal.fec_ev)
+            dest = file_factory(aperture)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self.camera.capture_to(dest)
+            median = self._measure(dest)
+            ev = ev_delta(median, self.baseline_median or median)
+            self._log_shot(
+                slug=slug,
+                step_index=step_index,
+                position_mm=position_mm,
+                aperture=aperture,
+                cal=cal,
+                median=median,
+                ev=ev,
+                filename=str(dest.relative_to(lens_dir)),
+                phase=phase,
+            )
+            self.sleep(self._recycle_for(aperture))
+
+    def _move_to(self, current_pos: float, target_pos: float) -> None:
+        delta = target_pos - current_pos
+        if delta == 0:
+            return
+        direction = Direction.FORWARD if delta > 0 else Direction.BACKWARD
+        # Backlash on whenever we change direction; we don't track
+        # the previous direction here, so default to True (safe but
+        # slightly slower).
+        self.rail.move_and_wait(direction, abs(delta), backlash=True)
+
+    def _return_rail_to_zero(self, current_pos: float) -> None:
+        if current_pos == 0:
+            return
+        direction = Direction.BACKWARD if current_pos > 0 else Direction.FORWARD
+        self.rail.move_and_wait(direction, abs(current_pos), backlash=True)
+
+    def _steps_from_zero_at(
+        self, position_mm: float, step_size_mm: float
+    ) -> int:
+        """Forward steps from 0 to ``position_mm`` (signed)."""
+        if step_size_mm == 0:
+            return 0
+        return int(round(position_mm / step_size_mm))
 
     def _handle_droop(self, event: DroopEvent, droop: DroopDetector) -> None:
         if self.ntfy is not None:
