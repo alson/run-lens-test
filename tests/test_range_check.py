@@ -81,3 +81,25 @@ class TestApertureCurve:
         )
         assert curve.aperture == "f/8"
         assert len(curve.sharpness_values) == 3
+
+
+class TestPeakSideAccepts:
+    """The contract permits four peak_side values; ensure the dataclass
+    holds each unchanged. No semantic checks — the runner is responsible
+    for reacting to each value (§8.3.3 in the plan)."""
+
+    def test_near(self) -> None:
+        result = RangeResult(ok=False, peak_side="near", needs_extension=True)
+        assert result.peak_side == "near"
+
+    def test_far(self) -> None:
+        result = RangeResult(ok=False, peak_side="far", needs_extension=True)
+        assert result.peak_side == "far"
+
+    def test_both(self) -> None:
+        result = RangeResult(ok=False, peak_side="both", needs_extension=True)
+        assert result.peak_side == "both"
+
+    def test_centered(self) -> None:
+        result = RangeResult(ok=True, peak_side="centered", needs_extension=False)
+        assert result.peak_side == "centered"

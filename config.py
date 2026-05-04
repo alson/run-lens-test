@@ -70,6 +70,30 @@ RANGE_CHECK_ENABLED = True
 RANGE_EXTENSION_FRACTION = 0.5
 RANGE_CHECK_PROBE_STEPS = 2
 
+# ---- Sharpness pipeline ----------------------------------------------------
+
+SHARPNESS_MAX_WORKERS = 4
+"""Concurrent crop workers per LiveCollector. Tune for the laptop's
+core count vs flash recycle: 4 keeps a single 45 MP JPEG cropping run
+just under typical 3 s recycle on the test rig."""
+
+SHARPNESS_CROPPED_DIRNAME = "cropped"
+"""Subdirectory name under each <lens>/<aperture>/ directory where the
+17 crops are persisted. Matches the user's offline-analysis layout."""
+
+# ---- Step-numbering for capture filenames ----------------------------------
+
+STEP_NUMBER_OFFSET = 100
+"""Numeric offset applied to the step index before formatting the
+filename. Reserves 100 slots below the main sweep so near-side
+extensions (negative step indices) become positive filenames like
+``step_0099.jpg``, ``step_0098.jpg``."""
+
+STEP_NUMBER_WIDTH = 4
+"""Zero-padded width for the step number in the filename. With offset
+100 and width 4 the maximum representable step index is 9899
+(filename ``step_9999.jpg``)."""
+
 # ---- StackShot motion -------------------------------------------------------
 
 STACKSHOT_BAUD = 38400

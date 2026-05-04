@@ -134,6 +134,47 @@ class LiveCollector:
         self._futures.append(fut)
         return fut
 
+    def wait_for_pending(self) -> None:
+        """Block until every ``record_shot()`` submitted so far has
+        finished cropping. Subsequent ``record_shot()`` calls continue
+        to use the same pool — this is a non-terminating barrier, used
+        by the session runner between phases (sweep / probe / extension)
+        so each phase's evaluator sees a complete dataset without
+        requiring a fresh thread pool per phase.
+
+        Errors from any of the awaited crops are surfaced the same way
+        :meth:`shutdown` surfaces them — :class:`RuntimeError` with a
+        chained cause from the first failure.
+        """
+        # Snapshot+clear under the lock so concurrent record_shot calls
+        # don't race the Future drain. Errors are surfaced after release
+        # of the lock to avoid holding it across Future.result().
+        with self._lock:
+            pending = list(self._futures)
+            self._futures.clear()
+        for fut in pending:
+            # Future.result() re-raises any exception from the worker.
+            # _process already records exceptions in self._errors before
+            # re-raising, so we surface them via the standard message.
+            try:
+                fut.result()
+            except BaseException:                    # noqa: BLE001
+                # Suppress here — the canonical surface is the
+                # self._errors list, which we re-raise below in shape
+                # consistent with shutdown().
+                pass
+        with self._lock:
+            errors = list(self._errors)
+        if errors:
+            # Clear errors so subsequent successful work after a
+            # wait_for_pending() doesn't keep re-raising the same one.
+            with self._lock:
+                self._errors.clear()
+            raise RuntimeError(
+                f"{len(errors)} cropping task(s) failed; "
+                f"first: {errors[0]!r}"
+            ) from errors[0]
+
     def shutdown(self, *, wait: bool = True) -> None:
         """Stop accepting work and (optionally) wait for in-flight crops."""
         if self._shutdown_called:

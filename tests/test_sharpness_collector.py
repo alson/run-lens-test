@@ -157,6 +157,70 @@ class TestLiveCollector:
         assert called_args[1] == tmp_path
 
 
+class TestWaitForPending:
+    def test_blocks_until_in_flight_crops_complete(self, tmp_path: Path) -> None:
+        # Slow crop function holds each call until we set the latch.
+        latch = threading.Event()
+
+        def slow_crop(source: Path, out_dir: Path) -> CropResult:
+            latch.wait(timeout=1.0)
+            return CropResult(source=source, sizes={"center": 1})
+
+        c = LiveCollector(tmp_path, crop_fn=slow_crop, max_workers=2)
+        try:
+            for i in range(4):
+                c.record_shot(i, 8.0, tmp_path / f"x_{i}.jpg")
+
+            # Before the latch fires, dataset is incomplete.
+            assert len(c.dataset.samples) < 4
+            latch.set()
+            c.wait_for_pending()
+            # After the barrier, every sample is in.
+            assert len(c.dataset.samples) == 4
+        finally:
+            c.shutdown()
+
+    def test_subsequent_record_shot_still_works(self, tmp_path: Path) -> None:
+        with LiveCollector(
+            tmp_path, crop_fn=_fake_crop({"center": 7}), max_workers=2
+        ) as c:
+            for i in range(3):
+                c.record_shot(i, 8.0, tmp_path / f"a_{i}.jpg")
+            c.wait_for_pending()
+            assert len(c.dataset.samples) == 3
+            # Pool is still alive; we can record more.
+            for i in range(3, 6):
+                c.record_shot(i, 8.0, tmp_path / f"b_{i}.jpg")
+            c.wait_for_pending()
+            assert len(c.dataset.samples) == 6
+
+    def test_errors_surface_at_barrier(self, tmp_path: Path) -> None:
+        def bad_crop(source: Path, out_dir: Path) -> CropResult:
+            raise IOError("boom")
+
+        c = LiveCollector(tmp_path, crop_fn=bad_crop, max_workers=1)
+        try:
+            c.record_shot(0, 8.0, tmp_path / "x.jpg")
+            with pytest.raises(RuntimeError, match="failed"):
+                c.wait_for_pending()
+            # After surfacing, the error list is cleared so a follow-up
+            # successful crop + wait works.
+            c._crop_fn = _fake_crop({"center": 1})  # type: ignore[attr-defined]
+            c.record_shot(1, 8.0, tmp_path / "y.jpg")
+            c.wait_for_pending()  # must not re-raise
+        finally:
+            c.shutdown()
+
+    def test_idempotent_when_no_pending_work(self, tmp_path: Path) -> None:
+        with LiveCollector(
+            tmp_path, crop_fn=_fake_crop({"center": 1}), max_workers=1
+        ) as c:
+            c.wait_for_pending()  # nothing in flight; must not block
+            c.record_shot(0, 8.0, tmp_path / "x.jpg")
+            c.wait_for_pending()
+            c.wait_for_pending()  # already drained
+
+
 class TestCollectFromDir:
     def test_drives_collector_synchronously(self, tmp_path: Path) -> None:
         items = [
