@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2.0",
     "requests>=2.32",
     "lens-test-detect-core",
+    "pyftdi>=0.57.1",
 ]
 
 [tool.uv.sources]

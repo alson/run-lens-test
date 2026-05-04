@@ -35,6 +35,11 @@ work through that first.
   Confirmed gone (`lsmod | grep gpib` returns nothing) but the
   StackShot still does not respond. Driver was a red herring on
   this rig.
+- **`pyftdi` / libusb-direct also returns 0 bytes** (`tools/pyftdi_probe.py`,
+  run via `sudo`). Bypasses ftdi_sio entirely; bytes reach the wire
+  (`write_data` confirms 6 bytes written) but the device emits nothing.
+  This excludes every host-side variable; the issue is on the device
+  side (firmware state, post-reflash protocol drift, or hardware).
 
 ### Step 1.0 — Factory reset on the StackShot
 
