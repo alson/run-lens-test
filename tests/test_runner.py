@@ -612,7 +612,11 @@ class TestDroopPause:
         rows = runner.shots_csv.read_rows()
         sweep_rows = [r for r in rows if r["phase"] == "sweep"]
         reshoot_rows = [r for r in rows if r["phase"] == "reshoot"]
-        assert len(sweep_rows) == 5
+        # Stale phase=sweep rows for steps 1,2,3 are dropped — those
+        # JPEGs were overwritten by the reshoot. Only the surviving
+        # sweep rows are step 0 (before the reshoot range) and step 4
+        # (after the reshoot, continuing the sweep).
+        assert sorted(int(r["rail_step"]) for r in sweep_rows) == [0, 4]
         # Reshoot covers steps 1..3 inclusive (the trigger step is 3).
         assert [int(r["rail_step"]) for r in reshoot_rows] == [1, 2, 3]
         for r in reshoot_rows:

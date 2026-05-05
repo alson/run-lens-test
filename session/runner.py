@@ -573,6 +573,7 @@ class SessionRunner:
                     end_mm, steps, step_size_mm = self._rejog_for_lens_config(
                         lens_dir=lens_dir,
                         current_position_mm=(steps - 1) * step_size_mm,
+                        slug=slug,
                     )
                     continue
             break
@@ -684,7 +685,7 @@ class SessionRunner:
             )
             event = droop.push(aperture, ev, step_index=step_index)
             if event is not None:
-                self._handle_droop(
+                current_step_reshot = self._handle_droop(
                     event,
                     droop,
                     lens_dir=lens_dir,
@@ -695,6 +696,11 @@ class SessionRunner:
                     apertures=apertures,
                     calibration=calibration,
                 )
+                if current_step_reshot:
+                    # Reshoot already captured every aperture of
+                    # the current step at fresh power; nothing more
+                    # to do here. Skip the aborted-remainder rows.
+                    return
                 aborted = True
                 continue
 
@@ -1137,7 +1143,14 @@ class SessionRunner:
         step_size_mm: float,
         apertures: list[str],
         calibration: CalibrationResult,
-    ) -> None:
+    ) -> bool:
+        """Returns ``True`` if the reshoot covered the current step
+        (every aperture, fresh frame); the caller can then skip
+        emitting redundant aborted-remainder rows for the rest of
+        the inner aperture loop. Returns ``False`` when no rewind was
+        needed (droop fired on the first sample at the current step)
+        — caller continues with ``aborted=True`` per the existing
+        skip-the-rest-of-this-step semantics."""
         if self.ntfy is not None:
             self.ntfy.with_body(
                 BATTERY_DROOP,
@@ -1169,7 +1182,10 @@ class SessionRunner:
         # capture. ``window_snapshot`` is the firing aperture's
         # window only; ``earliest_underexposed_step`` consults all.
         restart_step = droop.earliest_underexposed_step(event.threshold)
-        if restart_step is not None and restart_step < current_step_index:
+        reshot_current_step = (
+            restart_step is not None and restart_step < current_step_index
+        )
+        if reshot_current_step:
             self._reshoot_steps(
                 lens_dir=lens_dir,
                 slug=slug,
@@ -1181,6 +1197,7 @@ class SessionRunner:
                 calibration=calibration,
             )
         droop.reset_all()
+        return reshot_current_step
 
     def _handle_off_target(self, *, slug: str, result) -> str:
         """Notify + prompt when every aperture's curve is flat.
@@ -1226,6 +1243,7 @@ class SessionRunner:
         *,
         lens_dir: Path,
         current_position_mm: float,
+        slug: str | None = None,
     ) -> tuple[float, int, float]:
         """Run the jog UI again, return rail to step 0, and rebuild
         the per-lens-config sharpness collector so the next sweep's
@@ -1252,6 +1270,25 @@ class SessionRunner:
         self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
         if self.range_checker is not None:
             self.range_checker.set_collector(self._sharpness_collector)
+        # Drop the discarded sweep's shots.csv rows for this slug —
+        # JPEGs at those step indices are about to be overwritten by
+        # the new sweep, and any phase=sweep / probe / extension /
+        # reshoot / aborted entries are now stale. Calibration rows
+        # are preserved (no re-calibration on re-jog).
+        if slug is not None and self.shots_csv is not None:
+            stale_phases = {
+                Phase.SWEEP.value,
+                Phase.PROBE.value,
+                Phase.EXTENSION.value,
+                Phase.RESHOOT.value,
+                Phase.ABORTED.value,
+            }
+            self.shots_csv.drop_rows(
+                lambda r: (
+                    r.get("lens_config_slug") == slug
+                    and r.get("phase") in stale_phases
+                )
+            )
         return end_mm, steps, step_size_mm
 
     def _reshoot_steps(
@@ -1323,6 +1360,30 @@ class SessionRunner:
                     cal=cal,
                     phase=Phase.RESHOOT,
                 )
+        # Drop the now-stale shots.csv rows: the original
+        # phase=sweep rows for the reshot range described files that
+        # have been overwritten on disk, and any phase=aborted rows
+        # in the same range (from the inner aperture loop after the
+        # droop trip) refer to apertures the reshoot covered. Done
+        # *after* the reshoot loop so a crashed reshoot leaves an
+        # audit trail rather than blank rows.
+        if self.shots_csv is not None:
+            steps_set = set(range(from_step, through_step + 1))
+            stale_phases = {Phase.SWEEP.value, Phase.ABORTED.value}
+            self.shots_csv.drop_rows(
+                lambda r: (
+                    r.get("lens_config_slug") == slug
+                    and r.get("phase") in stale_phases
+                    and self._safe_int(r.get("rail_step")) in steps_set
+                )
+            )
+
+    @staticmethod
+    def _safe_int(value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _log_aborted_remainder(
         self,

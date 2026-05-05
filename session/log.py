@@ -144,6 +144,28 @@ class ShotsCSV:
         with self._path.open("r", encoding="utf-8", newline="") as f:
             return list(csv.DictReader(f))
 
+    def drop_rows(self, predicate) -> int:
+        """Atomically rewrite the file removing rows where
+        ``predicate(row_dict)`` returns truthy. Returns the number of
+        rows dropped.
+
+        Used to keep shots.csv clean of stale entries pointing at
+        files that have been overwritten on disk:
+        * after a droop reshoot, the original ``phase=sweep`` rows
+          (and any redundant ``phase=aborted`` rows) for the reshot
+          step range describe images that no longer exist.
+        * after an off-target re-jog, the discarded sweep's rows
+          point at JPEGs that the new sweep is about to overwrite.
+        """
+        rows = self.read_rows()
+        kept = [r for r in rows if not predicate(r)]
+        n_dropped = len(rows) - len(kept)
+        if n_dropped == 0:
+            return 0
+        payload = self._render(kept, header=True)
+        self._atomic_write(payload)
+        return n_dropped
+
 
 # ---- JSON writer ----------------------------------------------------------
 
