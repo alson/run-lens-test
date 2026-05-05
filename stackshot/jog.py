@@ -224,6 +224,16 @@ def _release_to_panel(
         write_status(cached_position, f"{label} (panel release not supported: {exc})")
         return cached_position, None
     if on_release is not None:
+        # Break the in-place \r status line *before* the on_release
+        # callback runs — the callback typically emits log records
+        # via the logging handler, which has no idea our cursor is
+        # parked at column 0 of the status line. Without this
+        # newline, the log message gets glued to the end of the
+        # status text:
+        #   [END] position = +0.000 mm2026-05-05 22:59:12 INFO ...
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         try:
             on_release()
         except Exception as exc:                     # noqa: BLE001
@@ -248,6 +258,12 @@ def _release_to_panel(
         f"{label} | reacquiring camera + rail…",
     )
     if on_reacquire is not None:
+        # Same newline trick as on_release above — the reacquire
+        # callback's log records would otherwise glue onto the
+        # "reacquiring camera + rail…" status line.
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         try:
             on_reacquire()
         except Exception as exc:                     # noqa: BLE001

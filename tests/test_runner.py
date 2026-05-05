@@ -919,3 +919,180 @@ class TestLensChange:
         assert "sample_plan" in meta["lens_configs"][0]
         assert meta["aborted"] is True
         assert meta["ended_at"] is not None
+
+
+class TestReshootPlanMenu:
+    """The runner's lens-config loop should route through the
+    reshoot-plan menu when ``config.RESHOOT_PLAN_PATH`` resolves to
+    plan entries, and skip the standalone magnification prompt for
+    presets (because the menu already supplies the magnification)."""
+
+    def test_preset_skips_magnification_prompt(
+        self, cfg, tmp_path
+    ) -> None:
+        from ui.reshoot_plan import PlanEntry
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 2, "end_mm": 2.0},
+        )
+
+        entry = PlanEntry(
+            group="Group 1 — bench",
+            number=1,
+            lens_config="Preset Lens",
+            magnification=1.6,
+            magnification_text="1.6:1",
+            status="reshoot",
+            estimated=False,
+        )
+        runner._plan_entries = [entry]
+
+        # First call returns the preset, second call returns None to
+        # quit the loop cleanly.
+        calls = {"n": 0}
+
+        def _menu(entries, completed):
+            calls["n"] += 1
+            return entry if calls["n"] == 1 else None
+
+        runner.prompt_lens_config_from_plan = _menu
+
+        # Should NEVER be asked: the preset supplied the mag.
+        mag_calls = {"n": 0}
+
+        def _mag() -> float:
+            mag_calls["n"] += 1
+            return 99.0   # poison value to assert against if used
+        runner.prompt_magnification = _mag
+
+        # Free-text prompt should also not be reached.
+        runner.prompt_lens_config = lambda: pytest.fail("free-text prompt called")
+
+        runner.run()
+
+        assert mag_calls["n"] == 0
+        # Slug = lens_config text (no `:` or `/` to slugify here).
+        slugs = [lc["slug"] for lc in runner.metadata.lens_configs]
+        assert slugs == ["Preset Lens"]
+        assert runner.metadata.lens_configs[0]["magnification"] == 1.6
+
+    def test_other_falls_back_to_free_text(self, cfg, tmp_path) -> None:
+        from ui.prompts import OTHER
+        from ui.reshoot_plan import PlanEntry
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 2, "end_mm": 2.0},
+        )
+        runner._plan_entries = [
+            PlanEntry(
+                group="g", number=1, lens_config="ignored",
+                magnification=1.0, magnification_text="1:1",
+                status="reshoot", estimated=False,
+            )
+        ]
+        menu_calls = {"n": 0}
+
+        def _menu(entries, completed):
+            menu_calls["n"] += 1
+            return OTHER if menu_calls["n"] == 1 else None
+        runner.prompt_lens_config_from_plan = _menu
+
+        ft_calls = {"n": 0}
+
+        def _ft() -> str | None:
+            ft_calls["n"] += 1
+            return "Hand-typed Lens"
+        runner.prompt_lens_config = _ft
+
+        mag_calls = {"n": 0}
+
+        def _mag() -> float:
+            mag_calls["n"] += 1
+            return 0.5
+        runner.prompt_magnification = _mag
+
+        runner.run()
+
+        assert ft_calls["n"] == 1
+        assert mag_calls["n"] == 1
+        slugs = [lc["slug"] for lc in runner.metadata.lens_configs]
+        assert slugs == ["Hand-typed Lens"]
+        assert runner.metadata.lens_configs[0]["magnification"] == 0.5
+
+    def test_completed_set_grows_after_success(
+        self, cfg, tmp_path
+    ) -> None:
+        from ui.reshoot_plan import PlanEntry
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 2, "end_mm": 2.0},
+        )
+        entry = PlanEntry(
+            group="g", number=1, lens_config="Done Lens",
+            magnification=1.0, magnification_text="1:1",
+            status="reshoot", estimated=False,
+        )
+        runner._plan_entries = [entry]
+
+        seen_completed: list[set[str]] = []
+
+        def _menu(entries, completed):
+            # Snapshot the set the runner passes in *before* the call
+            # mutates state.
+            seen_completed.append(set(completed))
+            if len(seen_completed) == 1:
+                return entry
+            return None
+        runner.prompt_lens_config_from_plan = _menu
+
+        runner.run()
+
+        # The first call saw an empty completed set (fresh tmp_path
+        # output_root). After the lens config was acquired, the
+        # second call sees the new slug.
+        assert seen_completed[0] == set()
+        assert seen_completed[1] == {"Done Lens"}
+
+    def test_no_plan_falls_through_to_free_text(self, cfg, tmp_path) -> None:
+        # When _plan_entries is None (e.g. RESHOOT_PLAN_PATH missing),
+        # the runner uses prompt_lens_config + prompt_magnification
+        # exactly as before.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 2, "end_mm": 2.0},
+        )
+        # Belt-and-braces: no plan entries available.
+        runner._plan_entries = None
+
+        # Menu must not be called.
+        runner.prompt_lens_config_from_plan = (
+            lambda *_: pytest.fail("menu called when plan is None")
+        )
+
+        ft_calls = {"n": 0}
+
+        def _ft() -> str | None:
+            ft_calls["n"] += 1
+            return "Free Lens" if ft_calls["n"] == 1 else None
+        runner.prompt_lens_config = _ft
+        runner.prompt_magnification = lambda: 1.0
+        runner.run()
+
+        assert ft_calls["n"] == 2  # one for the run, one for quit
+        slugs = [lc["slug"] for lc in runner.metadata.lens_configs]
+        assert slugs == ["Free Lens"]
