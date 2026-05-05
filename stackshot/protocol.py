@@ -189,12 +189,12 @@ class Frame:
                 f"frame is {len(raw)}"
             )
         data = raw[5:5 + length]
-        body = raw[:5 + length]
-        cs = raw[-1]
-        if cs != checksum(body):
-            raise StackShotProtocolError(
-                f"bad checksum: got {cs:#04x}, expected {checksum(body):#04x}"
-            )
+        # Per PDF §2: "Checksum (sent but not currently verified)".
+        # Empirical confirmation from usbmon traces of working Cognisys
+        # software: outgoing frames carry a constant 0x69 sentinel,
+        # responses a constant 0x23 — neither matches the sum-of-bytes
+        # mod-256 algorithm we still compute for outgoing frames. We
+        # therefore accept whatever checksum byte the slave sends.
         return cls(sync=sync, cmd=cmd, action=action, data=bytes(data))
 
 

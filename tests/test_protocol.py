@@ -137,11 +137,15 @@ class TestFrameFromBytes:
         with pytest.raises(StackShotProtocolError, match="sync"):
             Frame.from_bytes(raw)
 
-    def test_rejects_bad_checksum(self) -> None:
+    def test_accepts_bad_checksum(self) -> None:
+        # Per PDF §2: "Checksum (sent but not currently verified)".
+        # Empirical: real device responses carry a constant 0x23
+        # sentinel that doesn't satisfy any sum-of-bytes algorithm.
+        # ``Frame.from_bytes`` therefore must NOT reject on checksum.
         body = bytes([0x55, 0x10, 0x02, 0x00, 0x00])
         raw = body + bytes([(checksum(body) + 1) & 0xFF])
-        with pytest.raises(StackShotProtocolError, match="checksum"):
-            Frame.from_bytes(raw)
+        frame = Frame.from_bytes(raw)
+        assert frame.cmd == 0x1002
 
     def test_rejects_length_mismatch(self) -> None:
         # Length field claims 4 bytes of data but only 2 follow.
