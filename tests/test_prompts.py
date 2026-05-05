@@ -43,6 +43,23 @@ class TestPromptLensConfig:
     def test_returns_trimmed_text(self) -> None:
         assert prompt_lens_config(input_func=lambda _: "  Sigma 105  ") == "Sigma 105"
 
+    def test_short_input_quits(self) -> None:
+        # Inputs shorter than min_length (default 5) act as quit so a
+        # stray ``q`` / ``quit`` / typo doesn't slugify to a junk
+        # lens-config dir before aborting at the jog.
+        for s in ("q", "quit", "abc", "abcd"):
+            assert prompt_lens_config(input_func=lambda _, s=s: s) is None
+
+    def test_five_char_input_accepted(self) -> None:
+        # Boundary: exactly min_length characters is valid.
+        assert prompt_lens_config(input_func=lambda _: "abcde") == "abcde"
+
+    def test_min_length_override(self) -> None:
+        # Caller can lower / raise the gate as needed.
+        assert prompt_lens_config(
+            input_func=lambda _: "abc", min_length=2
+        ) == "abc"
+
 
 class TestPromptStepCount:
     def test_accepts_valid_int(self) -> None:

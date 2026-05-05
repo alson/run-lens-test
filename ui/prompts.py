@@ -67,11 +67,18 @@ def prompt_lens_config(
     *,
     history_path: Path | str | None = None,
     input_func: InputFunc = input,
+    min_length: int = 5,
 ) -> str | None:
     """Prompt for the next lens-config line.
 
-    Returns ``None`` when the user enters an empty line (signalling
-    "quit") and the trimmed text otherwise.
+    Returns ``None`` (signalling "quit") when:
+    * the user enters an empty line, or EOF;
+    * the trimmed input is shorter than ``min_length`` characters
+      (catches stray ``q`` / ``quit`` / typos that would otherwise
+      slugify to a junk lens-config name and `mkdir` it before
+      aborting at the jog).
+
+    Otherwise returns the trimmed text.
     """
     with readline_history(history_path):
         try:
@@ -79,7 +86,7 @@ def prompt_lens_config(
         except EOFError:
             return None
     text = text.strip()
-    if not text:
+    if len(text) < min_length:
         return None
     return text
 
