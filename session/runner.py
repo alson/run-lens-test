@@ -228,6 +228,7 @@ class SessionRunner:
     output_root: Path | None = None
     measure_path: Callable[[Path], float] | None = None
     sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic
     now: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
     prompt_lens_config: Callable[[], str | None] = field(default_factory=lambda: lambda: prompt_lens_config())
     prompt_step_count: Callable[[], int] = field(default_factory=lambda: lambda: prompt_step_count())
@@ -252,6 +253,14 @@ class SessionRunner:
     metadata: SessionMetadata | None = None
     baseline_median: float | None = None
     _sharpness_collector: SharpnessCollectorLike | None = None
+    _last_capture_started_at: float | None = None
+    """monotonic() reading taken just before each ``camera.capture_to``.
+
+    Used by :meth:`_wait_for_recycle` to subtract whatever wall-clock
+    time has already passed (set_config, capture, sharpness queueing,
+    measurement) from the configured per-aperture flash recycle. The
+    user is shooting thousands of frames; sleeping ``RECYCLE_S`` on
+    top of work that already exceeds it adds hours."""
 
     # ---- public entry points ---------------------------------------------
 
@@ -609,8 +618,10 @@ class SessionRunner:
                 aperture_count=len(apertures),
             )
             self._set_capture_settings(aperture, cal)
+            self._wait_for_recycle(aperture)
             dest = self._sweep_destination(lens_dir, aperture, step_index)
             dest.parent.mkdir(parents=True, exist_ok=True)
+            self._last_capture_started_at = self.monotonic()
             self.camera.capture_to(dest)
             self._record_sharpness(
                 step_index=step_index, aperture=aperture, dest=dest
@@ -633,7 +644,6 @@ class SessionRunner:
                 self._handle_droop(event, droop)
                 aborted = True
                 continue
-            self.sleep(self._recycle_for(aperture))
 
     # ---- Range check + auto-extension ----------------------------------
 
@@ -853,8 +863,10 @@ class SessionRunner:
         for aperture in apertures:
             cal = calibration.per_aperture[aperture]
             self._set_capture_settings(aperture, cal)
+            self._wait_for_recycle(aperture)
             dest = file_factory(aperture)
             dest.parent.mkdir(parents=True, exist_ok=True)
+            self._last_capture_started_at = self.monotonic()
             self.camera.capture_to(dest)
             self._record_sharpness(
                 step_index=step_index, aperture=aperture, dest=dest
@@ -872,7 +884,6 @@ class SessionRunner:
                 filename=str(dest.relative_to(lens_dir)),
                 phase=phase,
             )
-            self.sleep(self._recycle_for(aperture))
 
     def _move_to(self, current_pos: float, target_pos: float) -> None:
         delta = target_pos - current_pos
@@ -1068,6 +1079,25 @@ class SessionRunner:
             if k <= ap_float:
                 candidate = k
         return float(table[candidate][1])
+
+    def _wait_for_recycle(self, aperture: str) -> None:
+        """Sleep just long enough so the configured recycle delay has
+        elapsed since the previous shutter fire.
+
+        Called *before* the next ``capture_to`` so the time spent in
+        ``_set_capture_settings`` (~2.5 s on the Z7) is counted
+        against the recycle budget. If the prior shot's downstream
+        work (measure / sharpness / range-check pause / rail move)
+        already exceeded the recycle, we don't wait at all. First
+        shot of the session is a no-op (no prior capture timestamp).
+        """
+        if self._last_capture_started_at is None:
+            return
+        recycle = self._recycle_for(aperture)
+        elapsed = self.monotonic() - self._last_capture_started_at
+        remaining = recycle - elapsed
+        if remaining > 0:
+            self.sleep(remaining)
 
     def _log_shot(
         self,

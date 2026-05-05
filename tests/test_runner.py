@@ -354,6 +354,97 @@ class TestSweep:
         assert directions_distances.count((Direction.FORWARD, 3.0)) == 2
 
 
+# ---- Recycle wait subtracts elapsed time -----------------------------------
+
+
+class TestRecycleWait:
+    """The configured per-aperture flash recycle (RANGE_EXTENSION[ap][1])
+    is the minimum delay between consecutive shutter fires. Time spent
+    on set_capture_settings, capture_to, measurement, sharpness queueing,
+    and any pauses (range check, rail moves) all count against the
+    budget. Across thousands of shots a naive sleep(RECYCLE) on top of
+    work that already exceeds it adds hours."""
+
+    def _drive_one_step_one_aperture(
+        self, cfg, tmp_path, *, monotonic_seq: list[float],
+    ) -> list[float]:
+        """Drive a single-aperture, two-step sweep and return the list
+        of seconds passed to ``sleep``. ``monotonic_seq`` is consumed
+        in call order so each test can inject its own clock advance."""
+        # The default test cfg has recycle=0.0 across all apertures
+        # (calibration tests don't care). Override f/4 to a real
+        # 3.0s recycle so the wait-time math has something to chew on.
+        cfg.RANGE_EXTENSION = {**cfg.RANGE_EXTENSION, 4.0: (100, 3.0)}
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # 1 calibration + 2 sweep shots
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 4,
+            inputs={"lens": "L", "steps": 2, "end_mm": 4.0},
+        )
+
+        sleeps: list[float] = []
+        runner.sleep = lambda s: sleeps.append(s)
+        clock = iter(monotonic_seq)
+        runner.monotonic = lambda: next(clock)
+
+        def _prompt() -> str | None:
+            if not hasattr(_prompt, "called"):
+                _prompt.called = True
+                return "L"
+            return None
+
+        runner.prompt_lens_config = _prompt
+        runner.run()
+        return sleeps
+
+    def test_first_shot_does_not_wait(self, cfg, tmp_path) -> None:
+        # First sweep shot has no prior capture timestamp -> _wait_for_recycle
+        # returns immediately. Each shot consumes 1 monotonic() call (to
+        # stamp _last_capture_started_at) plus 1 for _wait_for_recycle from
+        # the second shot onward. With recycle=3.0s for f/4 in cfg and a
+        # 100-second gap, no sleep should happen at all.
+        sleeps = self._drive_one_step_one_aperture(
+            cfg, tmp_path,
+            # _wait_for_recycle reads monotonic on the 2nd sweep shot;
+            # _last_capture_started_at was stamped at t=0 on shot 1.
+            # With t=100 on the wait, elapsed=100 >> recycle=3.
+            monotonic_seq=[
+                0.0,    # shot 1 stamp
+                100.0,  # shot 2 wait read
+                100.0,  # shot 2 stamp
+            ],
+        )
+        # No sleep should have been issued by _wait_for_recycle.
+        assert sleeps == []
+
+    def test_waits_only_remaining_recycle(self, cfg, tmp_path) -> None:
+        # Recycle for f/4 is 3.0s in the test cfg. If 1.0s elapsed
+        # between captures already, we should sleep 2.0s, not 3.0s.
+        sleeps = self._drive_one_step_one_aperture(
+            cfg, tmp_path,
+            monotonic_seq=[
+                0.0,   # shot 1 stamp
+                1.0,   # shot 2 wait read -> remaining = 3 - 1 = 2
+                1.0,   # shot 2 stamp
+            ],
+        )
+        assert sleeps == [pytest.approx(2.0)]
+
+    def test_no_wait_when_elapsed_exceeds_recycle(self, cfg, tmp_path) -> None:
+        # 5.0s elapsed since prior shutter -> 0 remaining; no sleep.
+        sleeps = self._drive_one_step_one_aperture(
+            cfg, tmp_path,
+            monotonic_seq=[
+                0.0,
+                5.0,
+                5.0,
+            ],
+        )
+        assert sleeps == []
+
+
 # ---- Droop pause + resume --------------------------------------------------
 
 
