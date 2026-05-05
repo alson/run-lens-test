@@ -13,6 +13,7 @@ from session.log import (
     SessionMetadata,
     ShotRow,
     ShotsCSV,
+    completed_slugs,
     write_json,
 )
 
@@ -136,3 +137,72 @@ class TestWriteJson:
         path = tmp_path / "out.json"
         write_json(path, {"a": 1})
         assert not (tmp_path / "out.json.tmp").exists()
+
+
+class TestCompletedSlugs:
+    @staticmethod
+    def _write_session(root: Path, sid: str, lens_configs, *, aborted=False):
+        (root / sid).mkdir(parents=True, exist_ok=True)
+        write_json(
+            root / sid / "session.json",
+            {
+                "session_id": sid,
+                "started_at": "2026-05-04T18:35:00Z",
+                "lens_configs": lens_configs,
+                "aborted": aborted,
+            },
+        )
+
+    def test_missing_root_returns_empty(self, tmp_path: Path) -> None:
+        assert completed_slugs(tmp_path / "nope") == set()
+
+    def test_unions_across_sessions(self, tmp_path: Path) -> None:
+        self._write_session(
+            tmp_path, "s1",
+            [{"slug": "Lens A", "magnification": 1.0}],
+        )
+        self._write_session(
+            tmp_path, "s2",
+            [{"slug": "Lens B", "magnification": 2.0},
+             {"slug": "Lens A", "magnification": 1.0}],
+        )
+        assert completed_slugs(tmp_path) == {"Lens A", "Lens B"}
+
+    def test_aborted_session_with_completed_configs_counts(self, tmp_path: Path) -> None:
+        # Slugs in lens_configs are written *before* the lens-change
+        # prompt (see SessionRunner._run_one_lens_config), so they
+        # represent successfully-finished work — even if the session
+        # is later aborted.
+        self._write_session(
+            tmp_path, "s1",
+            [{"slug": "Lens A", "magnification": 1.0}],
+            aborted=True,
+        )
+        assert completed_slugs(tmp_path) == {"Lens A"}
+
+    def test_session_without_completed_configs(self, tmp_path: Path) -> None:
+        self._write_session(tmp_path, "s1", [], aborted=True)
+        assert completed_slugs(tmp_path) == set()
+
+    def test_malformed_json_skipped(self, tmp_path: Path) -> None:
+        (tmp_path / "broken").mkdir()
+        (tmp_path / "broken" / "session.json").write_text("not json")
+        self._write_session(
+            tmp_path, "good", [{"slug": "Lens A", "magnification": 1.0}],
+        )
+        assert completed_slugs(tmp_path) == {"Lens A"}
+
+    def test_dir_without_session_json_skipped(self, tmp_path: Path) -> None:
+        (tmp_path / "stray").mkdir()
+        self._write_session(
+            tmp_path, "good", [{"slug": "Lens A", "magnification": 1.0}],
+        )
+        assert completed_slugs(tmp_path) == {"Lens A"}
+
+    def test_lens_configs_missing_slug_field_skipped(self, tmp_path: Path) -> None:
+        self._write_session(
+            tmp_path, "s1",
+            [{"magnification": 1.0}, {"slug": "", "magnification": 2.0},
+             {"slug": "Real", "magnification": 3.0}],
+        )
+        assert completed_slugs(tmp_path) == {"Real"}

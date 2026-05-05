@@ -47,19 +47,23 @@ from session.log import (
     SessionMetadata,
     ShotRow,
     ShotsCSV,
+    completed_slugs,
     write_json,
 )
 from stackshot.controller import StackShotController
 from stackshot.protocol import Direction
 from sharpness.planner import SamplePlan, plan_sweep
 from ui.prompts import (
+    OTHER,
     confirm,
     prompt_lens_config,
+    prompt_lens_config_from_plan,
     prompt_magnification,
     prompt_off_target,
     prompt_range_inadequate,
     slugify_lens_config,
 )
+from ui.reshoot_plan import PlanEntry, load_plan
 
 
 class _RejogRequested(Exception):
@@ -247,6 +251,11 @@ class SessionRunner:
     prompt_magnification: Callable[[], float] = field(
         default_factory=lambda: lambda: prompt_magnification()
     )
+    prompt_lens_config_from_plan: Callable[[list, set[str]], object] = field(
+        default_factory=lambda: lambda entries, completed: prompt_lens_config_from_plan(
+            entries, completed
+        )
+    )
     plan_sweep: Callable[..., SamplePlan] = field(default_factory=lambda: plan_sweep)
     confirm: Callable[[str], bool] = field(default_factory=lambda: confirm)
     prompt_range_inadequate: Callable[[str], str] = field(
@@ -287,6 +296,15 @@ class SessionRunner:
     """Aperture of the previous capture. The flash recycle is keyed on
     the *prior* shot's aperture (small apertures = more flash power
     discharged = longer recycle), not the upcoming one."""
+    _plan_entries: list[PlanEntry] | None = None
+    """Curated reshoot/new-shoot presets parsed from
+    ``config.RESHOOT_PLAN_PATH`` at session start. ``None`` when the
+    plan file is missing or disabled — the runner then falls through
+    to the free-text prompt only."""
+    _completed_slugs: set[str] = field(default_factory=set)
+    """Slugs already successfully acquired in past sessions, plus any
+    completed in the current session. Drives the ``[done]`` marker in
+    the menu."""
 
     # ---- public entry points ---------------------------------------------
 
@@ -328,6 +346,20 @@ class SessionRunner:
             stackshot_hardware_id=hw_id,
         )
         self._write_metadata()
+
+        # Load the curated lens-config menu and the set of slugs that
+        # past sessions have already acquired successfully. Both are
+        # best-effort: a missing reshoot plan disables the menu (the
+        # runner still works via the free-text prompt), and any
+        # session.json that fails to parse is silently skipped.
+        plan_path = getattr(self.config, "RESHOOT_PLAN_PATH", None)
+        if plan_path is not None:
+            try:
+                self._plan_entries = load_plan(plan_path)
+            except FileNotFoundError:
+                self._plan_entries = None
+        if self.output_root is not None:
+            self._completed_slugs = completed_slugs(self.output_root)
 
         # FEC sanity check (skip if the camera doesn't expose it —
         # e.g. fakes used in tests; production NikonZ7 always has it).
@@ -416,15 +448,31 @@ class SessionRunner:
         self.start()
         try:
             while True:
-                lens_text = self.prompt_lens_config()
-                if lens_text is None:
-                    return
+                if self._plan_entries:
+                    picked = self.prompt_lens_config_from_plan(
+                        self._plan_entries, self._completed_slugs
+                    )
+                    if picked is None:
+                        return
+                    if picked is OTHER or picked == OTHER:
+                        lens_text = self.prompt_lens_config()
+                        if lens_text is None:
+                            return
+                        magnification: float | None = None
+                    else:
+                        lens_text = picked.lens_config
+                        magnification = picked.magnification
+                else:
+                    lens_text = self.prompt_lens_config()
+                    if lens_text is None:
+                        return
+                    magnification = None
                 slug = slugify_lens_config(lens_text)
                 # _run_one_lens_config records the slug into
                 # metadata itself (right before the lens-change
                 # prompt) so that aborting at the prompt still
                 # captures the completed work.
-                self._run_one_lens_config(slug)
+                self._run_one_lens_config(slug, magnification=magnification)
         except (SessionAborted, KeyboardInterrupt):
             self._stop_rail_quietly()
             self.stop(aborted=True)
@@ -444,7 +492,9 @@ class SessionRunner:
 
     # ---- One lens config -------------------------------------------------
 
-    def _run_one_lens_config(self, slug: str) -> None:
+    def _run_one_lens_config(
+        self, slug: str, *, magnification: float | None = None
+    ) -> None:
         if self.jog is None:
             raise RuntimeError("SessionRunner.jog not configured")
         lens_dir = self.session_dir / slug
@@ -452,8 +502,11 @@ class SessionRunner:
 
         # Magnification is asked once per lens config; the sweep
         # plan is a function of M, the lens's widest aperture, and
-        # the jogged range.
-        magnification = self.prompt_magnification()
+        # the jogged range. When the caller picked a preset from the
+        # reshoot-plan menu, the value is supplied directly; otherwise
+        # we prompt as before.
+        if magnification is None:
+            magnification = self.prompt_magnification()
 
         apertures = aperture_sequence(
             self.camera.list_apertures(),
@@ -606,6 +659,7 @@ class SessionRunner:
             if self.metadata is not None:
                 self.metadata.baseline_median_luminance = self.baseline_median
                 self._write_metadata()
+            self._announce_calibration(cal_result)
             non_converged = [
                 ap for ap, c in cal_result.per_aperture.items()
                 if not c.hit_tolerance
@@ -695,6 +749,7 @@ class SessionRunner:
                 "sample_plan": _asdict(plan),
             })
             self._write_metadata()
+            self._completed_slugs.add(slug)
 
         # Lens-change prompt.
         self._lens_change_recovery(slug)
@@ -1846,6 +1901,28 @@ class SessionRunner:
         newline so it doesn't fight with the in-place progress bar.
         """
         print(message, flush=True)
+
+    def _announce_calibration(self, cal_result) -> None:
+        """One-line per-aperture summary printed after every
+        calibration pass — succeeded or not. The user wants to see
+        where each aperture landed (FEC, EC, ISO, EV deficit, and
+        whether the post-convergence flash-headroom swap was applied)
+        without having to wait for a failure prompt."""
+        print(
+            f"Calibration result (baseline median {cal_result.baseline_median:.0f}):",
+            flush=True,
+        )
+        for ap, c in cal_result.per_aperture.items():
+            status = "ok" if c.hit_tolerance else "MISS"
+            headroom = " +headroom" if c.iso_headroom_applied else ""
+            ec_used = f" EC={c.ec_ev:+.2f}" if c.ec_used else ""
+            iso_bumped = "*" if c.iso_bumped else ""
+            print(
+                f"  {ap:5s} [{status}]  ev={c.final_ev_delta:+.2f}  "
+                f"FEC={c.fec_ev:+.2f}{ec_used}  "
+                f"ISO={c.iso}{iso_bumped}{headroom}",
+                flush=True,
+            )
 
     def _progress(
         self,

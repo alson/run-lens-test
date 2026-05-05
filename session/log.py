@@ -194,6 +194,39 @@ def _json_default(obj: Any) -> Any:
 # ---- session.json metadata ------------------------------------------------
 
 
+def completed_slugs(output_root: Path | str) -> set[str]:
+    """Return the union of `lens_configs[*].slug` across every
+    ``<output_root>/*/session.json``. Used by the lens-config menu to
+    show a `[done]` marker against presets that were already
+    successfully acquired in a past session.
+
+    A slug only lands in `lens_configs` after the sweep + range-check
+    succeed (see :meth:`SessionRunner._run_one_lens_config`), so this
+    is interruption-safe — an aborted session contributes only the
+    configs it managed to finish before aborting.
+
+    Best-effort: a missing or malformed `session.json` is skipped
+    silently, never raised.
+    """
+    root = Path(output_root)
+    if not root.exists():
+        return set()
+    out: set[str] = set()
+    for child in root.iterdir():
+        meta_path = child / "session.json"
+        if not meta_path.is_file():
+            continue
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for lc in payload.get("lens_configs", []) or []:
+            slug = lc.get("slug") if isinstance(lc, dict) else None
+            if isinstance(slug, str) and slug:
+                out.add(slug)
+    return out
+
+
 @dataclass
 class SessionMetadata:
     session_id: str

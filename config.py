@@ -60,6 +60,17 @@ EC_STEP_EV = 1.0 / 3.0
 PLATEAU_DETECT_THRESHOLD = 0.5  # ratio
 PLATEAU_DETECT_MIN_EV = 1.0     # don't fire on a single ⅓-stop bump
 
+# Flash-headroom swap. After calibration converges *and* ISO was
+# bumped (a positive plateau detection — the flash was at its
+# mechanical maximum during cascade), the calibrator does a final
+# bias-↔-ISO swap: trade ``ISO_HEADROOM_EV`` of FEC/EC bias for the
+# same EV in ISO. The image stays at the same brightness, but the
+# flash now fires below its mechanical max during the sweep, which
+# leaves margin for battery droop and reduces stress on the units.
+# A verification capture confirms the swap landed within tolerance;
+# otherwise the calibrator reverts.
+ISO_HEADROOM_EV = 1.0
+
 # ---- Sample planner --------------------------------------------------------
 # Minimum rail positions for a usable sweep. The advisor's bell-curve
 # detector needs at least ~10 points across the captured range to land
@@ -111,8 +122,18 @@ CROP_X_FRAC = 0.00
 CROP_Y_FRAC = 0.15  # positive = below image centre
 GAMMA = 2.2
 
-TEST_SHOT_TOLERANCE_EV = 1.0 / 3.0
-TEST_SHOT_MAX_RETRIES = 6
+TEST_SHOT_TOLERANCE_EV = 0.5
+"""Per-shot tolerance for FEC/EC closed-loop calibration. The
+sharpness analysis depends on inter-aperture exposure parity, not
+absolute baseline match, so ½-stop is a comfortable floor —
+tighter than this just consumes retries on diminishing-returns
+cascade steps."""
+
+TEST_SHOT_MAX_RETRIES = 10
+"""Each retry advances the cascade by one nudge (FEC up, EC up,
+ISO up on plateau, or any combination). With a 3 EV initial
+deficit the cascade easily consumes 6+ steps; 10 leaves room for
+a plateau-driven ISO bump to settle."""
 
 # ---- Droop detector ---------------------------------------------------------
 
@@ -175,6 +196,17 @@ POSITION_TOLERANCE_MM = 0.02
 OUTPUT_ROOT = Path.home() / "macro-lens-test-output"
 READLINE_HISTORY = Path("data/readline_history")
 ALERT_WAV = Path("data/alert.wav")
+
+RESHOOT_PLAN_PATH: "Path | None" = (
+    Path(__file__).resolve().parent.parent / "analyse-lens-test"
+    / "reshoot-plan-2026-05.md"
+)
+"""Path to the curated lens-config menu source. The runner offers
+each row as a preset at the lens-config prompt, with a ``[done]``
+marker for slugs that were successfully acquired in a past session.
+Set to ``None`` (or rename / move the file) to disable the menu —
+the runner falls through to the existing free-text + magnification
+prompts."""
 
 # ---- Notification -----------------------------------------------------------
 

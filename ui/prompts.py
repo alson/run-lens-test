@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 # Lazy-imported readline so non-Linux test runs don't trip on it.
 try:
@@ -181,6 +181,81 @@ def prompt_range_inadequate(
     if t in ("s", "skip", "n", "no"):
         return "skip"
     return "extend"
+
+
+OTHER = "OTHER"
+"""Sentinel returned by :func:`prompt_lens_config_from_plan` when the
+user chooses "Other (free text)" — signals the caller to fall back to
+:func:`prompt_lens_config` + :func:`prompt_magnification`."""
+
+
+def _format_choice_title(entry: Any, completed: set[str], slugify: Callable[[str], str]) -> str:
+    marker = "[done]" if slugify(entry.lens_config) in completed else "      "
+    return f"{marker}  {entry.lens_config}  —  {entry.magnification_text}"
+
+
+def prompt_lens_config_from_plan(
+    entries: list,
+    completed: set[str],
+    *,
+    ask: Callable[[list], Any] | None = None,
+    slugify: Callable[[str], str] = slugify_lens_config,
+):
+    """Show an arrow-key menu of preset lens configs.
+
+    Parameters
+    ----------
+    entries:
+        ``list[ui.reshoot_plan.PlanEntry]`` — the curated presets.
+    completed:
+        Slugs already successfully acquired in past sessions; rendered
+        with a ``[done]`` marker. Re-acquiring a completed preset is a
+        normal pick, not blocked.
+    ask:
+        Injectable hook for tests. Takes the choice list and returns
+        the chosen value. Default constructs a ``questionary.select``
+        and calls ``.ask()`` on it.
+    slugify:
+        Slugifier used to compare entry names against ``completed``.
+
+    Returns
+    -------
+    The picked :class:`PlanEntry`, the sentinel :data:`OTHER` for the
+    free-text path, or ``None`` to quit (Quit choice / Ctrl-C / EOF).
+    """
+    import questionary
+
+    choices: list = []
+    last_group: str | None = None
+    for entry in entries:
+        if entry.group != last_group:
+            choices.append(questionary.Separator(f"── {entry.group} ──"))
+            last_group = entry.group
+        choices.append(
+            questionary.Choice(
+                title=_format_choice_title(entry, completed, slugify),
+                value=entry,
+            )
+        )
+    choices.append(questionary.Separator(" "))
+    choices.append(questionary.Choice(title="Other (free text)…", value=OTHER))
+    choices.append(questionary.Choice(title="Quit", value=None))
+
+    if ask is None:
+        def _default_ask(cs):
+            return questionary.select(
+                "Pick a lens config:",
+                choices=cs,
+                use_arrow_keys=True,
+                use_shortcuts=False,
+            ).ask()
+        ask = _default_ask
+
+    try:
+        result = ask(choices)
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return result
 
 
 def prompt_off_target(

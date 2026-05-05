@@ -64,6 +64,13 @@ class ApertureCalibration:
     saturated_at_ceiling: bool = False
     ec_ev: float = 0.0
     ec_used: bool = False
+    iso_headroom_applied: bool = False
+    """``True`` when the post-convergence FEC/EC ↔ ISO swap landed
+    within tolerance. The flash bias was reduced by
+    ``ISO_HEADROOM_EV`` and ISO bumped equivalently — image stays
+    at the same brightness, but the flash now fires below its
+    mechanical max during the sweep, reducing heating, recycle
+    times, and battery drain."""
 
 
 @dataclass
@@ -209,6 +216,8 @@ class Calibrator:
         # ``plateau_min_ev`` of cumulative bump is taken as plateau.
         push_start_median: float | None = None
         push_total_ev = 0.0
+        converged = False
+        converged_shot_index = -1
         for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
             dest = capture_dir / _calibration_filename(aperture, shot_index)
             self._camera.capture_to(dest)
@@ -279,18 +288,9 @@ class Calibrator:
                     continue
 
             if abs(delta) <= cfg.TEST_SHOT_TOLERANCE_EV:
-                return ApertureCalibration(
-                    aperture=aperture,
-                    fec_ev=fec,
-                    iso=iso,
-                    final_median=median,
-                    final_ev_delta=delta,
-                    hit_tolerance=True,
-                    iso_bumped=iso_bumped,
-                    test_shots_taken=shot_index + 1,
-                    ec_ev=ec,
-                    ec_used=ec_used,
-                ), baseline
+                converged = True
+                converged_shot_index = shot_index
+                break
 
             # Lever priority is FEC → EC. ISO is *not* in the
             # cascade: in AA flash mode raising ISO without a
@@ -347,19 +347,137 @@ class Calibrator:
                     push_start_median = last_median
                 push_total_ev += bump_ev
 
+        # Post-loop: optional flash-headroom swap. When the cascade
+        # converged *and* required an ISO bump (positive plateau —
+        # the flash was at its mechanical maximum), trade
+        # ``ISO_HEADROOM_EV`` of FEC/EC bias for the same EV in
+        # ISO. Image brightness stays the same; the flash now fires
+        # below its mechanical max during the sweep, reducing
+        # heating, recycle times, and battery drain.
+        shots_taken = (
+            converged_shot_index + 1
+            if converged
+            else cfg.TEST_SHOT_MAX_RETRIES + 1
+        )
+        iso_headroom_applied = False
+        if converged and iso_bumped:
+            applied = self._try_iso_headroom_swap(
+                aperture=aperture,
+                fec=fec,
+                ec=ec,
+                iso=iso,
+                baseline=baseline,
+                lens_slug=lens_slug,
+                session_id=session_id,
+                capture_dir=capture_dir,
+                shot_index=shots_taken,
+                ec_min=ec_min,
+                ec_step=ec_step,
+            )
+            if applied is not None:
+                fec, ec, iso, last_median, last_delta = applied
+                iso_headroom_applied = True
+                shots_taken += 1
+
         return ApertureCalibration(
             aperture=aperture,
             fec_ev=fec,
             iso=iso,
             final_median=last_median,
             final_ev_delta=last_delta,
-            hit_tolerance=False,
+            hit_tolerance=converged,
             iso_bumped=iso_bumped,
-            test_shots_taken=cfg.TEST_SHOT_MAX_RETRIES + 1,
+            test_shots_taken=shots_taken,
             saturated_at_ceiling=saturated,
             ec_ev=ec,
             ec_used=ec_used,
+            iso_headroom_applied=iso_headroom_applied,
         ), baseline
+
+    def _try_iso_headroom_swap(
+        self,
+        *,
+        aperture: str,
+        fec: float,
+        ec: float,
+        iso: int,
+        baseline: float,
+        lens_slug: str,
+        session_id: str,
+        capture_dir: Path,
+        shot_index: int,
+        ec_min: float,
+        ec_step: float,
+    ) -> tuple[float, float, int, float, float] | None:
+        """Trade ``ISO_HEADROOM_EV`` of flash bias for ISO and verify.
+
+        Returns ``(fec, ec, iso, median, delta)`` on success, or
+        ``None`` if the swap landed outside tolerance (camera state
+        is then reverted by the caller's wrapper). The caller
+        assumes the flash was at mechanical max during cascade.
+        """
+        cfg = self._config
+        headroom_ev = float(getattr(cfg, "ISO_HEADROOM_EV", 1.0))
+        if headroom_ev <= 0:
+            return None
+        # Reduce FEC down to FEC_MIN, then EC down to its min, by a
+        # combined ``headroom_ev``. The flash bias goes down by
+        # exactly that much; ISO compensates by the same amount.
+        fec_room = fec - cfg.FEC_MIN_EV
+        ec_room = ec - ec_min
+        total_room = fec_room + ec_room
+        applicable_ev = min(headroom_ev, total_room)
+        if applicable_ev <= 0:
+            return None
+        fec_reduce = min(applicable_ev, fec_room)
+        ec_reduce = applicable_ev - fec_reduce
+        new_fec = _snap(fec - fec_reduce, cfg.FEC_STEP_EV)
+        new_ec = _snap(ec - ec_reduce, ec_step)
+        # Bump ISO in ⅓-stop steps until ev_added ≈ applicable_ev or
+        # ISO ceiling is reached.
+        new_iso = iso
+        ev_added = 0.0
+        while ev_added + 1e-6 < applicable_ev:
+            stepped = next_iso(new_iso, ceiling=cfg.ISO_CEIL)
+            if stepped == new_iso:
+                break  # at ceiling
+            new_iso = stepped
+            ev_added += cfg.FEC_STEP_EV
+        if abs(ev_added) <= 1e-6:
+            return None  # no ISO room to add; skip the swap entirely
+        # Apply, capture, measure.
+        self._camera.set_fec(new_fec)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(new_ec)
+        self._camera.set_iso(new_iso)
+        dest = capture_dir / _calibration_filename(aperture, shot_index)
+        self._camera.capture_to(dest)
+        median = self._measure(dest)
+        delta = ev_delta(median, baseline)
+        self._log_shot(
+            aperture=aperture,
+            iso=new_iso,
+            fec=new_fec,
+            median=median,
+            ev=delta,
+            filename=str(dest.name),
+            lens_slug=lens_slug,
+            session_id=session_id,
+            notes=(
+                f"iso headroom swap (FEC {fec:+.2f}→{new_fec:+.2f}, "
+                f"EC {ec:+.2f}→{new_ec:+.2f}, ISO {iso}→{new_iso})"
+            ),
+        )
+        if abs(delta) <= cfg.TEST_SHOT_TOLERANCE_EV:
+            return new_fec, new_ec, new_iso, median, delta
+        # Revert: the verification shot landed outside tolerance,
+        # so the swap assumption (flash at mechanical max →
+        # ISO compensates 1:1 for flash reduction) didn't hold.
+        self._camera.set_fec(fec)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(ec)
+        self._camera.set_iso(iso)
+        return None
 
     # ---- Helpers ----------------------------------------------------------
 

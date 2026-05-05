@@ -7,11 +7,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from ui.prompts import (
+    OTHER,
+    _format_choice_title,
     confirm,
     prompt_lens_config,
+    prompt_lens_config_from_plan,
     prompt_step_count,
     slugify_lens_config,
 )
+from ui.reshoot_plan import PlanEntry
 
 
 class TestSlug:
@@ -112,6 +116,133 @@ class TestPromptStepCount:
             raise EOFError
         with pytest.raises(ValueError, match="EOF"):
             prompt_step_count(input_func=_eof)
+
+
+class TestPromptLensConfigFromPlan:
+    @staticmethod
+    def _entries() -> list[PlanEntry]:
+        return [
+            PlanEntry(
+                group="Group 1 — bench",
+                number=1,
+                lens_config="Lens A",
+                magnification=1.0,
+                magnification_text="1:1",
+                status="reshoot",
+                estimated=False,
+            ),
+            PlanEntry(
+                group="Group 1 — bench",
+                number=2,
+                lens_config="Lens B",
+                magnification=2.0,
+                magnification_text="2:1 (est.)",
+                status="NEW",
+                estimated=True,
+            ),
+            PlanEntry(
+                group="Group 2 — field",
+                number=3,
+                lens_config="Lens C",
+                magnification=0.5,
+                magnification_text="1:2",
+                status="reshoot",
+                estimated=False,
+            ),
+        ]
+
+    def test_pick_preset_returns_entry(self) -> None:
+        entries = self._entries()
+        # Fake `ask`: pick the second entry.
+        result = prompt_lens_config_from_plan(
+            entries, completed=set(),
+            ask=lambda choices: entries[1],
+        )
+        assert isinstance(result, PlanEntry)
+        assert result.lens_config == "Lens B"
+        assert result.magnification == 2.0
+
+    def test_other_sentinel_returned(self) -> None:
+        entries = self._entries()
+        result = prompt_lens_config_from_plan(
+            entries, completed=set(),
+            ask=lambda choices: OTHER,
+        )
+        assert result == OTHER
+
+    def test_quit_returns_none(self) -> None:
+        entries = self._entries()
+        result = prompt_lens_config_from_plan(
+            entries, completed=set(),
+            ask=lambda choices: None,
+        )
+        assert result is None
+
+    def test_keyboard_interrupt_returns_none(self) -> None:
+        entries = self._entries()
+
+        def _raise(_choices):
+            raise KeyboardInterrupt
+        assert prompt_lens_config_from_plan(
+            entries, completed=set(), ask=_raise,
+        ) is None
+
+    def test_eof_returns_none(self) -> None:
+        entries = self._entries()
+
+        def _raise(_choices):
+            raise EOFError
+        assert prompt_lens_config_from_plan(
+            entries, completed=set(), ask=_raise,
+        ) is None
+
+    def test_done_marker_present_for_completed_slug(self) -> None:
+        entries = self._entries()
+        completed = {slugify_lens_config("Lens A")}
+        captured: list = []
+        prompt_lens_config_from_plan(
+            entries, completed=completed,
+            ask=lambda choices: captured.extend(choices) or None,
+        )
+        # Choices list contains separators + Choice objects + tail
+        # Choice/Separator entries; titles for entries are formatted by
+        # _format_choice_title. We assert the marker shows up exactly
+        # for the completed entry.
+        titles = [getattr(c, "title", "") for c in captured]
+        marked = [t for t in titles if "[done]" in str(t)]
+        unmarked = [
+            t for t in titles
+            if isinstance(t, str)
+            and ("Lens" in t)
+            and "[done]" not in t
+        ]
+        assert len(marked) == 1
+        assert "Lens A" in str(marked[0])
+        assert any("Lens B" in u for u in unmarked)
+        assert any("Lens C" in u for u in unmarked)
+
+    def test_groups_render_separators(self) -> None:
+        import questionary
+        entries = self._entries()
+        captured: list = []
+        prompt_lens_config_from_plan(
+            entries, completed=set(),
+            ask=lambda choices: captured.extend(choices) or None,
+        )
+        sep_titles = [
+            c.title for c in captured if isinstance(c, questionary.Separator)
+        ]
+        assert any("Group 1" in str(t) for t in sep_titles)
+        assert any("Group 2" in str(t) for t in sep_titles)
+
+    def test_format_choice_title_marker(self) -> None:
+        e = self._entries()[0]
+        marked = _format_choice_title(e, {"Lens A"}, slugify_lens_config)
+        unmarked = _format_choice_title(e, set(), slugify_lens_config)
+        assert "[done]" in marked
+        assert "[done]" not in unmarked
+        assert "Lens A" in marked
+        assert "1:1" in marked
 
 
 class TestConfirm:
