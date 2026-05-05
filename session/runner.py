@@ -1056,15 +1056,16 @@ def main() -> None:
     from notify.ntfy import NtfyClient
     from sharpness.collector import LiveCollector
     from sharpness.range_check import SharpnessRangeChecker
-    from stackshot.controller import open_serial as open_stackshot
+    from stackshot.controller import open_ftdi as open_stackshot
     from stackshot.jog import jog_start_and_end as _jog
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # libusb-direct via pyusb (FtdiTransport). Bypasses ftdi_sio's
+    # default DTR pulse; runs the Cognisys SET_BITMODE 0x20FF + 500ms
+    # init recipe so the StackShot MCU enters USB-control mode.
     rail = open_stackshot(
-        port=getattr(config, "STACKSHOT_PORT", "/dev/ttyUSB0"),
-        baud=config.STACKSHOT_BAUD,
         poll_interval_s=config.STACKSHOT_POLL_INTERVAL_S,
         move_timeout_s=config.STACKSHOT_MOVE_TIMEOUT_S,
     )

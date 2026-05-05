@@ -29,7 +29,7 @@ from stackshot.protocol import (
     encode_move,
     encode_units_only,
 )
-from stackshot.transport import SerialTransport, Transport
+from stackshot.transport import FtdiTransport, SerialTransport, Transport
 
 DEFAULT_BAUD = 38400
 
@@ -201,7 +201,37 @@ def open_serial(
     poll_interval_s: float = 0.10,
     move_timeout_s: float = 30.0,
 ) -> StackShotController:
+    """Open over pyserial / /dev/ttyUSB0.
+
+    NOTE: not the production path. The Linux ``ftdi_sio`` kernel
+    driver pulses DTR by default on tty open, which on this rig
+    wedges the StackShot's MCU until power-cycle. Kept for tests and
+    for use on rigs / firmware versions where DTR isn't asserted.
+    Use :func:`open_ftdi` in production.
+    """
     transport = SerialTransport(port, baud=baud)
+    transport.open()
+    return StackShotController(
+        transport,
+        poll_interval_s=poll_interval_s,
+        move_timeout_s=move_timeout_s,
+    )
+
+
+def open_ftdi(
+    *,
+    poll_interval_s: float = 0.10,
+    move_timeout_s: float = 30.0,
+) -> StackShotController:
+    """Open via libusb-direct (pyusb), running the Cognisys-reference
+    init recipe (SET_BITMODE 0x20FF + 500 ms settle, then RESET /
+    BAUDRATE / LINE_PROPERTY / FLOW_CTRL). This is the production
+    path. See :class:`stackshot.transport.FtdiTransport` for details.
+
+    Requires libusb permissions on VID 0x0403, PID 0x6001 — either
+    ``sudo`` or a udev rule (see ``INTEGRATION_TESTING.md``).
+    """
+    transport = FtdiTransport()
     transport.open()
     return StackShotController(
         transport,
@@ -213,11 +243,17 @@ def open_serial(
 # ---- CLI for rig smoke-tests ---------------------------------------------
 
 def _cli() -> None:
-    """Tiny CLI: ``python -m stackshot.controller --info`` etc."""
+    """Tiny CLI: ``python -m stackshot.controller --info`` etc.
+
+    Default transport is libusb-direct via :func:`open_ftdi`. Pass
+    ``--serial /dev/ttyUSB0`` to fall back to the legacy pyserial
+    path on rigs where it works.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(description="StackShot controller CLI")
-    parser.add_argument("--port", default="/dev/ttyUSB0")
+    parser.add_argument("--serial", default=None, metavar="PORT",
+                        help="legacy: open via pyserial at this device path")
     parser.add_argument("--info", action="store_true",
                         help="print software/hardware ID + current position")
     parser.add_argument("--move", type=float, default=None,
@@ -228,7 +264,10 @@ def _cli() -> None:
                         help="zero the current position")
     args = parser.parse_args()
 
-    controller = open_serial(args.port)
+    if args.serial:
+        controller = open_serial(args.serial)
+    else:
+        controller = open_ftdi()
     try:
         if args.info or args.move is None and not args.zero:
             info = controller.info()
