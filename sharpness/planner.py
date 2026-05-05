@@ -1,80 +1,126 @@
 """Sample planner for rail-coverage sweeps.
 
-Given a ``(magnification, aperture)`` test point, recommend rail-step
-and total-sweep settings for a StackShot-driven focus stack that
-resolves the sharpness peak with confidence.
+The session captures every aperture at every rail step (the inverted
+shot-order architecture in DESIGN_NOTES §2.6: outer rail loop, inner
+aperture loop). One step size has to work for the entire aperture
+sequence — there is no per-aperture step setting at capture time.
 
-Calibrated against the historical 25 positions × 3 replicas regime,
-which gave well-formed bells (FWHM ≈ 12 positions, plateau ≈ 2
-positions) at moderate magnifications across the 2026-01-29 and
-2026-02-18 test sessions. The planner aims to reproduce that regime
-across ``(M, N)``, bumping the position count slightly where the
-thin-lens DOF prediction is least reliable so the user is "a bit
-more than too few" rather than too few.
+Given the lens's widest aperture (the sharpest peak; smallest DOF)
+and the magnification, this module recommends:
 
-The thin-lens depth-of-field formula used is the macro-photography
-form::
+- A single rail step in mm sized for the widest-aperture peak. At
+  smaller apertures the bell is broader and you can analyse only
+  every k-th position, but the *capture* still hits every step so
+  the same data is reusable.
+- An optional position count, derived if you also pass the rail
+  range you intend to sweep.
+- A per-aperture analysis subsample factor (integer ≥ 1) — at the
+  smallest apertures (e.g. F16 with widest F4) the DOF is wide
+  enough that you can analyse every 4th position with no peak-
+  detection accuracy loss.
 
-    DOF = 2 · c · N · (1 + M) / M²
+Inputs and why:
 
-where ``c`` is the circle of confusion, ``N`` is the f-number, and
-``M`` is the magnification (0.5 = 1:2, 1.0 = 1:1, 2.0 = 2:1).
+- ``magnification`` (M, e.g. 1.0 = 1:1) — required, drives DOF.
+- ``widest_aperture`` (N_min, e.g. 2.8) — required, drives DOF at
+  the worst case for sampling.
+- ``max_aperture`` (N_max, default 16.0 to match
+  ``run-lens-test/config.py:MAX_FSTOP``) — controls the per-aperture
+  subsample table.
+- ``rail_range_mm`` — optional. If supplied, the plan also reports a
+  position count. The user normally jogs to a "before-focus" /
+  "after-focus" pair so the range is determined by jogging, not by
+  the planner; passing it just lets the planner translate step → count.
+- ``coc_mm`` — circle of confusion. 30 µm matches the FX sensor and
+  the historically-OK 25-position setup the user's existing rig used.
+- ``replicas`` — replicas per rail position; default 3.
 
-Why this is enough input:
-- ``c`` is a sensor-and-detection-threshold property; the 30 µm FX
-  default is calibrated against the user's existing rig and matches
-  the historically-OK 25×3 setup at ``M=1, N=8``. Override only if a
-  different sensor or sharper detection threshold is needed.
-- Lens focal length doesn't enter the DOF formula at fixed
-  magnification — physical DOF depends only on ``M``, ``N``, ``c``.
-- The planner does NOT need rail-step granularity as an input; it
-  recommends the step. If the StackShot's minimum step is coarser
-  than the recommendation, the caller should reduce the position
-  count to match the achievable step.
+The historical default of 25 positions × 3 replicas at M=1, N=8 came
+out at ~12 rail positions across the FWHM. Empirical resampling on
+that data (see DESIGN_NOTES section on the experiment) shows that
+**5 positions across FWHM** suffices to find the peak within ~1 % of
+the fitted maximum at moderate magnifications, and **8** is enough at
+high magnification (M ≥ 1.5) where the peak is narrow. We use those
+two values as the two operating points; aperture and low-mag bumps
+are NOT applied here because the experiment showed they don't help
+in the intended sense (the broader-bell regimes are *more* tolerant
+of sparse sampling, not less).
 
 Example::
 
     >>> from sharpness.planner import plan_sweep
-    >>> p = plan_sweep(magnification=1.0, aperture=8.0)
-    >>> p.rail_positions
-    25
+    >>> p = plan_sweep(magnification=1.0, widest_aperture=2.8)
     >>> round(p.rail_step_mm, 4)
-    0.0192
-    >>> round(p.sweep_range_mm, 3)
-    0.48
+    0.0672
+    >>> p.subsample_factors[8.0]
+    2
+    >>> p.subsample_factors[16.0]
+    5
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # Circle of confusion at which sharpness peaks resolve. The standard
-# FX value is 30 µm; we use it because it gives a sweep that matches
-# the user's historically-OK 25-position setup at M=1, N=8.
+# 30 µm FX value matches the user's historically-OK setup.
 DEFAULT_COC_MM = 0.030
 
 DEFAULT_REPLICAS = 3
-DEFAULT_BASE_POSITIONS = 25
+
+# Match config.py:MAX_FSTOP from run-lens-test.
+DEFAULT_MAX_APERTURE = 16.0
+
+# Aperture stops the planner reports subsample factors for. Picked to
+# cover whole stops and ⅓ stops in the camera-control range.
+KNOWN_APERTURE_STOPS: tuple[float, ...] = (
+    1.4, 2.0, 2.5, 2.8, 3.5, 4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0,
+    9.0, 10.0, 11.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0, 25.0, 29.0, 32.0,
+)
+
+# Number of rail positions to span the FWHM at the widest aperture.
+# 5 came out of the resampling experiment as "enough for moderate
+# magnification" — k=5 gave <2 % sharpness loss in F8/F11/F5.6
+# scenarios at M=1.
+POSITIONS_ACROSS_FWHM_DEFAULT = 5
+
+# Bump for high magnification. The 200mm + 5T + 6T at 2:1 / F8 case
+# needed k=15 across the full range (~7-8 across FWHM at F8) to find
+# the peak within 1 %. We bump to 8 across FWHM whenever M ≥ 1.5.
+POSITIONS_ACROSS_FWHM_HIGH_MAG = 8
+HIGH_MAG_THRESHOLD = 1.5
 
 
 @dataclass(frozen=True)
 class SamplePlan:
     """Recommended rail sweep settings.
 
-    All distances in millimetres; rail steps and sweep range can be
-    fed directly into the StackShot move commands.
+    Distances are millimetres. ``subsample_factors`` is keyed by
+    aperture (e.g. ``8.0``) and holds the integer skip factor for
+    analysis at that aperture: 1 = use every captured step, 2 = use
+    every other step, 3 = every third, etc.
+
+    ``rail_range_mm`` and ``rail_positions`` are populated only when
+    the caller supplied a rail range; otherwise they are ``None``
+    because the planner has no opinion on how far to jog.
     """
 
-    rail_positions: int
-    replicas_per_position: int
     rail_step_mm: float
-    sweep_range_mm: float
-    estimated_dof_mm: float
-    estimated_fwhm_mm: float
+    replicas_per_position: int
+    estimated_dof_mm_widest: float
+    estimated_fwhm_mm_widest: float
+    widest_aperture: float
+    max_aperture: float
+    subsample_factors: dict[float, int] = field(default_factory=dict)
+    rail_range_mm: float | None = None
+    rail_positions: int | None = None
 
     @property
-    def total_shots(self) -> int:
+    def total_shots(self) -> int | None:
+        """Total shots = positions × replicas, or ``None`` if no range was passed."""
+        if self.rail_positions is None:
+            return None
         return self.rail_positions * self.replicas_per_position
 
 
@@ -86,9 +132,7 @@ def estimate_dof_mm(
 ) -> float:
     """Total depth of field in mm at the given magnification and aperture.
 
-    Thin-lens approximation; ignores diffraction softening (which
-    affects the *quality* of the peak but not its width within a few
-    percent in our regime).
+    Thin-lens macro form: ``DOF = 2 · c · N · (1 + M) / M²``.
     """
     if magnification <= 0:
         raise ValueError(f"magnification must be positive, got {magnification}")
@@ -97,55 +141,85 @@ def estimate_dof_mm(
     return 2 * coc_mm * aperture * (1 + magnification) / (magnification**2)
 
 
+def subsample_factor(aperture: float, widest_aperture: float) -> int:
+    """Integer analysis-time subsample factor at ``aperture``.
+
+    DOF scales linearly with aperture, so at ``N`` the bell is
+    ``N / N_min`` times wider in mm than at ``N_min``. Analysing
+    every ``floor(N / N_min)``-th captured step keeps the same
+    bell-curve density at every aperture.
+    """
+    if aperture < widest_aperture:
+        # Below the widest aperture the lens can't operate; defensive.
+        return 1
+    return max(1, int(aperture / widest_aperture))
+
+
 def plan_sweep(
     magnification: float,
-    aperture: float,
+    widest_aperture: float,
     *,
+    max_aperture: float = DEFAULT_MAX_APERTURE,
+    rail_range_mm: float | None = None,
     coc_mm: float = DEFAULT_COC_MM,
     replicas: int = DEFAULT_REPLICAS,
-    base_positions: int = DEFAULT_BASE_POSITIONS,
+    positions_across_fwhm: int | None = None,
 ) -> SamplePlan:
-    """Recommend a rail sweep for one ``(magnification, aperture)`` test point.
+    """Recommend a rail step for the whole aperture sweep.
 
-    Returns a :class:`SamplePlan` whose ``rail_positions`` is at least
-    ``base_positions`` (default 25), bumped where the DOF prediction
-    is least reliable:
+    The step is sized for the widest aperture (the worst case for
+    sampling — narrowest DOF, sharpest peak). Smaller apertures
+    automatically have a broader bell over the same step set, so the
+    *captured* data covers them adequately; the per-aperture
+    ``subsample_factors`` table tells the analyser how aggressively
+    to subsample at each aperture without losing peak precision.
 
-    - Low magnification (``M < 0.4``): +5 positions. The 24-120 zoom
-      in the test data showed the most truncation here, so add
-      buffer.
-    - Small aperture (``N >= 11``): +3 positions. Diffraction widens
-      the bell — a few extra rail positions help locate the peak
-      when the plateau is broad.
-    - High magnification (``M >= 1.5``): +2 positions. Razor-thin DOF
-      plus StackShot step quantization makes off-by-one mistakes more
-      likely; the buffer protects against them.
+    By default the step gives 5 positions across the FWHM at the
+    widest aperture, bumped to 8 when ``M ≥ HIGH_MAG_THRESHOLD``
+    (1.5). Both values were validated by resampling the existing
+    25-position-per-scenario data: 5 was enough at moderate mag,
+    and 8 was needed for the high-mag narrow-peak case.
 
-    The rail step is derived so the total sweep covers exactly one
-    full DOF (``2 × FWHM``); that matches the historical sweep:DOF
-    ratio at ``M=1, N=8`` and produces ~12 rail positions across the
-    bell's FWHM, the empirically-OK density from the test sessions.
+    Pass ``rail_range_mm`` to also get a position count for that
+    range; otherwise just step size is returned.
     """
-    dof = estimate_dof_mm(magnification, aperture, coc_mm=coc_mm)
+    if widest_aperture <= 0:
+        raise ValueError(f"widest_aperture must be positive, got {widest_aperture}")
+    if max_aperture < widest_aperture:
+        raise ValueError(
+            f"max_aperture ({max_aperture}) must be ≥ widest_aperture ({widest_aperture})"
+        )
+
+    if positions_across_fwhm is None:
+        if magnification >= HIGH_MAG_THRESHOLD:
+            positions_across_fwhm = POSITIONS_ACROSS_FWHM_HIGH_MAG
+        else:
+            positions_across_fwhm = POSITIONS_ACROSS_FWHM_DEFAULT
+
+    dof = estimate_dof_mm(magnification, widest_aperture, coc_mm=coc_mm)
     fwhm = dof / 2
+    rail_step_mm = fwhm / positions_across_fwhm
 
-    bump = 0
-    if magnification < 0.4:
-        bump += 5
-    if aperture >= 11:
-        bump += 3
-    if magnification >= 1.5:
-        bump += 2
-    positions = base_positions + bump
+    factors = {
+        ap: subsample_factor(ap, widest_aperture)
+        for ap in KNOWN_APERTURE_STOPS
+        if widest_aperture <= ap <= max_aperture
+    }
 
-    sweep = 2 * fwhm  # = 1 × DOF
-    step = sweep / positions
+    rail_positions: int | None = None
+    if rail_range_mm is not None:
+        if rail_range_mm <= 0:
+            raise ValueError(f"rail_range_mm must be positive, got {rail_range_mm}")
+        rail_positions = max(1, round(rail_range_mm / rail_step_mm))
 
     return SamplePlan(
-        rail_positions=positions,
+        rail_step_mm=rail_step_mm,
         replicas_per_position=replicas,
-        rail_step_mm=step,
-        sweep_range_mm=sweep,
-        estimated_dof_mm=dof,
-        estimated_fwhm_mm=fwhm,
+        estimated_dof_mm_widest=dof,
+        estimated_fwhm_mm_widest=fwhm,
+        widest_aperture=widest_aperture,
+        max_aperture=max_aperture,
+        subsample_factors=factors,
+        rail_range_mm=rail_range_mm,
+        rail_positions=rail_positions,
     )

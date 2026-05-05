@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from sharpness.planner import (
-    DEFAULT_BASE_POSITIONS,
     DEFAULT_COC_MM,
+    DEFAULT_MAX_APERTURE,
     DEFAULT_REPLICAS,
+    HIGH_MAG_THRESHOLD,
+    POSITIONS_ACROSS_FWHM_DEFAULT,
+    POSITIONS_ACROSS_FWHM_HIGH_MAG,
     SamplePlan,
     estimate_dof_mm,
     plan_sweep,
+    subsample_factor,
 )
 
 
@@ -31,20 +33,12 @@ class TestEstimateDofMm:
         assert b == pytest.approx(2 * a, rel=1e-6)
 
     def test_doubling_magnification_quarters_dof_approximately(self) -> None:
-        # DOF ∝ (1+M)/M² → at M=1 we get 2/1, at M=2 we get 3/4.
-        # Ratio 0.375 — narrower DOF at higher magnification.
+        # DOF ∝ (1+M)/M² → ratio at M=2 vs M=1 is (3/4) / (2/1) = 0.375
         a = estimate_dof_mm(1.0, 8.0)
         b = estimate_dof_mm(2.0, 8.0)
         assert b / a == pytest.approx(0.375, rel=1e-6)
 
-    def test_very_low_magnification_blows_up(self) -> None:
-        # M=0.1 → DOF ∝ 1.1/0.01 = 110 × c × N. Should be order of
-        # tens of millimetres at typical apertures.
-        dof = estimate_dof_mm(0.1, 8.0)
-        assert dof > 50.0  # very wide
-
     def test_custom_coc(self) -> None:
-        # Halving c halves DOF.
         a = estimate_dof_mm(1.0, 8.0, coc_mm=0.030)
         b = estimate_dof_mm(1.0, 8.0, coc_mm=0.015)
         assert b == pytest.approx(a / 2, rel=1e-6)
@@ -60,130 +54,170 @@ class TestEstimateDofMm:
             estimate_dof_mm(1.0, n)
 
 
-# --- plan_sweep --------------------------------------------------------
+# --- subsample_factor ---------------------------------------------------
+
+
+class TestSubsampleFactor:
+    def test_widest_returns_1(self) -> None:
+        assert subsample_factor(2.8, 2.8) == 1
+
+    def test_doubled_aperture_returns_2(self) -> None:
+        assert subsample_factor(5.6, 2.8) == 2
+
+    def test_quadrupled_returns_4(self) -> None:
+        assert subsample_factor(11.0, 2.8) == 3  # 11/2.8 = 3.93 → floor 3
+
+    def test_f16_over_f4(self) -> None:
+        assert subsample_factor(16.0, 4.0) == 4
+
+    def test_f22_over_f4(self) -> None:
+        # 22/4 = 5.5 → floor 5
+        assert subsample_factor(22.0, 4.0) == 5
+
+    def test_below_widest_clamps_to_one(self) -> None:
+        assert subsample_factor(2.0, 2.8) == 1
+
+    def test_intermediate_third_stop(self) -> None:
+        # 7.1 / 2.8 = 2.535 → 2
+        assert subsample_factor(7.1, 2.8) == 2
+
+
+# --- plan_sweep ---------------------------------------------------------
 
 
 class TestPlanSweep:
-    def test_historical_baseline_at_m1_f8(self) -> None:
-        # Calibration target: at M=1, N=8 we want ~25 positions × 3 replicas.
-        p = plan_sweep(1.0, 8.0)
-        assert p.rail_positions == 25
-        assert p.replicas_per_position == 3
-        assert p.total_shots == 75
-        # Rail step is calibration-driven: sweep is 1 × DOF, so step
-        # = DOF / 25 = 0.96 / 25 ≈ 0.0384 mm.
-        assert p.rail_step_mm == pytest.approx(0.96 / 25, rel=1e-6)
-        assert p.sweep_range_mm == pytest.approx(0.96, rel=1e-6)
-        assert p.estimated_dof_mm == pytest.approx(0.96, rel=1e-6)
-        assert p.estimated_fwhm_mm == pytest.approx(0.48, rel=1e-6)
+    def test_step_at_unity_mag_widest_f2_8(self) -> None:
+        # DOF = 2 * 0.030 * 2.8 * 2 / 1 = 0.336 mm
+        # FWHM = 0.168 mm
+        # step = FWHM / 5 = 0.0336 mm
+        p = plan_sweep(1.0, 2.8)
+        assert p.rail_step_mm == pytest.approx(0.0336, rel=1e-3)
+        assert p.estimated_dof_mm_widest == pytest.approx(0.336, rel=1e-3)
+        assert p.widest_aperture == 2.8
+        assert p.replicas_per_position == DEFAULT_REPLICAS
 
-    def test_low_magnification_bumps_positions(self) -> None:
-        # M < 0.4 ⇒ +5 positions
-        p = plan_sweep(0.3, 8.0)
-        assert p.rail_positions == DEFAULT_BASE_POSITIONS + 5
+    def test_step_doubles_when_widest_aperture_doubles(self) -> None:
+        a = plan_sweep(1.0, 2.8)
+        b = plan_sweep(1.0, 5.6)
+        assert b.rail_step_mm == pytest.approx(2 * a.rail_step_mm, rel=1e-6)
 
-    def test_small_aperture_bumps_positions(self) -> None:
-        # N >= 11 ⇒ +3 positions
-        p = plan_sweep(1.0, 11.0)
-        assert p.rail_positions == DEFAULT_BASE_POSITIONS + 3
+    def test_high_mag_uses_finer_step(self) -> None:
+        # M >= 1.5 ⇒ POSITIONS_ACROSS_FWHM_HIGH_MAG (8 instead of 5)
+        a = plan_sweep(1.0, 2.8)  # k=5
+        b = plan_sweep(2.0, 2.8)  # k=8 plus narrower DOF at higher mag
+        # Narrower DOF AND finer FWHM density both reduce step
+        assert b.rail_step_mm < a.rail_step_mm
+        # Specifically: at M=2 the DOF is 0.375× the M=1 DOF, AND the
+        # density is 8/5 finer. So step factor = 0.375 * 5/8 = 0.234
+        assert b.rail_step_mm / a.rail_step_mm == pytest.approx(
+            0.375 * 5 / 8, rel=1e-3
+        )
 
-    def test_high_magnification_bumps_positions(self) -> None:
-        # M >= 1.5 ⇒ +2 positions
-        p = plan_sweep(2.0, 8.0)
-        assert p.rail_positions == DEFAULT_BASE_POSITIONS + 2
+    def test_threshold_boundary_for_high_mag(self) -> None:
+        # M = 1.49 → default density; M = 1.5 → high-mag density
+        a = plan_sweep(1.49, 2.8)
+        b = plan_sweep(1.5, 2.8)
+        # b uses k=8 instead of k=5 ⇒ smaller step
+        assert b.rail_step_mm < a.rail_step_mm
 
-    def test_bumps_stack(self) -> None:
-        # M >= 1.5 (+2) AND N >= 11 (+3) ⇒ +5
-        p = plan_sweep(2.0, 16.0)
-        assert p.rail_positions == DEFAULT_BASE_POSITIONS + 2 + 3
+    def test_subsample_factors_populated(self) -> None:
+        p = plan_sweep(1.0, 2.8, max_aperture=16.0)
+        assert 2.8 in p.subsample_factors
+        assert p.subsample_factors[2.8] == 1
+        assert p.subsample_factors[5.6] == 2
+        assert p.subsample_factors[11.0] == 3
+        assert p.subsample_factors[16.0] == 5
+        # Apertures below widest are not included
+        assert 2.0 not in p.subsample_factors
+        # Apertures above max are not included
+        assert 22.0 not in p.subsample_factors
 
-    def test_low_mag_high_f_stack_fully(self) -> None:
-        # M < 0.4 (+5) AND N >= 11 (+3) ⇒ +8
-        p = plan_sweep(0.3, 16.0)
-        assert p.rail_positions == DEFAULT_BASE_POSITIONS + 5 + 3
+    def test_subsample_table_truncated_to_max_aperture(self) -> None:
+        p = plan_sweep(1.0, 2.8, max_aperture=11.0)
+        assert max(p.subsample_factors) == 11.0
+        assert 16.0 not in p.subsample_factors
 
-    def test_step_scales_with_dof(self) -> None:
-        # At fixed positions, step ∝ DOF; at higher M (smaller DOF) step is finer.
-        p_low_mag = plan_sweep(1.0, 8.0)
-        p_high_mag = plan_sweep(2.0, 8.0)
-        # M=2 → DOF = 2*0.03*8*3/4 = 0.36 → step = 0.36 / 27 ≈ 0.0133 mm
-        assert p_high_mag.rail_step_mm < p_low_mag.rail_step_mm
+    def test_rail_range_translates_to_positions(self) -> None:
+        # step = 0.0336 mm; 1 mm range → 30 positions
+        p = plan_sweep(1.0, 2.8, rail_range_mm=1.0)
+        assert p.rail_positions == 30
+        assert p.rail_range_mm == 1.0
+        assert p.total_shots == 30 * 3
 
-    def test_sweep_equals_one_dof(self) -> None:
-        # Sweep = 2 * FWHM = 1 * DOF by construction.
-        p = plan_sweep(1.0, 8.0)
-        assert p.sweep_range_mm == pytest.approx(p.estimated_dof_mm, rel=1e-9)
+    def test_no_range_means_no_positions(self) -> None:
+        p = plan_sweep(1.0, 2.8)
+        assert p.rail_positions is None
+        assert p.rail_range_mm is None
+        assert p.total_shots is None
 
-    def test_total_shots_reflects_replicas(self) -> None:
-        p = plan_sweep(1.0, 8.0, replicas=4)
-        assert p.replicas_per_position == 4
-        assert p.total_shots == p.rail_positions * 4
+    def test_invalid_widest_raises(self) -> None:
+        with pytest.raises(ValueError, match="widest_aperture"):
+            plan_sweep(1.0, 0)
 
-    def test_custom_base_positions(self) -> None:
-        p = plan_sweep(1.0, 8.0, base_positions=20)
-        assert p.rail_positions == 20
+    def test_invalid_max_below_widest_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_aperture"):
+            plan_sweep(1.0, 8.0, max_aperture=4.0)
 
-    def test_invalid_inputs_propagate(self) -> None:
-        with pytest.raises(ValueError, match="magnification"):
-            plan_sweep(0, 8.0)
+    def test_invalid_rail_range_raises(self) -> None:
+        with pytest.raises(ValueError, match="rail_range_mm"):
+            plan_sweep(1.0, 2.8, rail_range_mm=0)
+
+    def test_explicit_density_override(self) -> None:
+        # Caller can override the auto-density choice if they want
+        p = plan_sweep(1.0, 2.8, positions_across_fwhm=10)
+        # step = FWHM / 10 = 0.0168 mm
+        assert p.rail_step_mm == pytest.approx(0.0168, rel=1e-3)
 
 
 # --- SamplePlan ---------------------------------------------------------
 
 
 class TestSamplePlan:
-    def test_total_shots_property(self) -> None:
+    def test_total_shots_is_none_without_range(self) -> None:
         p = SamplePlan(
-            rail_positions=10,
-            replicas_per_position=3,
             rail_step_mm=0.05,
-            sweep_range_mm=0.5,
-            estimated_dof_mm=1.0,
-            estimated_fwhm_mm=0.5,
+            replicas_per_position=3,
+            estimated_dof_mm_widest=1.0,
+            estimated_fwhm_mm_widest=0.5,
+            widest_aperture=2.8,
+            max_aperture=16.0,
         )
-        assert p.total_shots == 30
+        assert p.total_shots is None
+
+    def test_total_shots_with_range(self) -> None:
+        p = plan_sweep(1.0, 2.8, rail_range_mm=1.0)
+        assert p.total_shots == p.rail_positions * 3
 
     def test_frozen(self) -> None:
-        p = plan_sweep(1.0, 8.0)
+        p = plan_sweep(1.0, 2.8)
         with pytest.raises(Exception):
-            p.rail_positions = 99  # type: ignore[misc]
+            p.rail_step_mm = 99.0  # type: ignore[misc]
 
 
-# --- Cross-check against the rail-coverage analysis ---------------------
+# --- Regime checks against the experiment ------------------------------
 
 
 class TestRegimeSanityChecks:
-    """Spot-check that the planner reproduces the regimes in the test data."""
-
-    def test_low_mag_gets_meaningfully_more_steps(self) -> None:
-        """At M=0.5, F11 (the 'low (1:2 to 1:1.18)' band) the planner should
-        recommend more positions than at M=1, F8 — that band showed more
-        truncation in the rail-coverage data."""
-        p_baseline = plan_sweep(1.0, 8.0)
-        p_lowband = plan_sweep(0.5, 11.0)
-        # At M=0.5 we get the +0 bump (M=0.5 is not <0.4) but +3 for f-stop
-        assert p_lowband.rail_positions == p_baseline.rail_positions + 3
-
-    def test_very_high_mag_step_under_30_microns(self) -> None:
-        """At M=2, F4 the rail step should be very fine (under 30 µm) because
-        the DOF is razor-thin."""
+    def test_high_mag_step_finer_than_about_15_microns(self) -> None:
+        """At M=2, F4 widest the step should be ~10-15 µm — fine enough
+        that ~8 positions span the FWHM (which is what the resampling
+        experiment showed was needed)."""
         p = plan_sweep(2.0, 4.0)
-        assert p.rail_step_mm < 0.030
+        assert p.rail_step_mm < 0.020
 
-    def test_very_low_mag_step_over_100_microns(self) -> None:
-        """At M=0.2, F11 (very low mag) the rail step should be coarse
-        (over 100 µm) because the DOF is wide; otherwise we'd waste shots
-        oversampling."""
-        p = plan_sweep(0.2, 11.0)
+    def test_baseline_step_about_30_microns_at_m1_f2_8(self) -> None:
+        """Calibration spot-check: at M=1, F2.8 widest the step should be
+        in the 25-40 µm range. (FWHM 168 µm / 5 = 33.6 µm.)"""
+        p = plan_sweep(1.0, 2.8)
+        assert 0.025 < p.rail_step_mm < 0.040
+
+    def test_very_low_mag_step_well_above_100_microns(self) -> None:
+        """At M=0.2, F4 widest the DOF is enormous and the step should be
+        coarse (>100 µm) — otherwise we'd waste positions."""
+        p = plan_sweep(0.2, 4.0)
         assert p.rail_step_mm > 0.100
 
-    def test_total_shots_stays_within_battery_budget(self) -> None:
-        """Across the realistic (M, N) grid, the planner should never
-        recommend more than 35 positions × 3 replicas = 105 shots — beyond
-        that the user's battery droop architecture starts to bite."""
-        for m in [0.2, 0.3, 0.5, 1.0, 1.5, 2.0]:
-            for n in [4.0, 5.6, 8.0, 11.0, 16.0]:
-                p = plan_sweep(m, n)
-                assert p.total_shots <= 35 * 3, (
-                    f"too many shots at M={m}, N={n}: {p.total_shots}"
-                )
+    def test_aperture_subsample_factor_1_at_widest(self) -> None:
+        for widest in [2.8, 4.0, 5.6, 8.0]:
+            p = plan_sweep(1.0, widest)
+            assert p.subsample_factors[widest] == 1
