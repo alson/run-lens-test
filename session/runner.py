@@ -1378,11 +1378,19 @@ def main() -> None:
     try:
         runner.run()
     except SessionAborted as e:
-        # User-initiated abort (e.g. `q` at the lens-change prompt).
-        # session.json and shots.csv have already been finalised by
+        # User-initiated abort (e.g. `q` at the lens-change prompt
+        # or at the range-inadequate prompt). session.json and
+        # shots.csv have already been finalised by
         # SessionRunner.stop(aborted=True); a stack trace at this
         # point is noise.
         log.info("session aborted: %s", e)
+    except KeyboardInterrupt:
+        # Ctrl-C mid-sweep. The runner's own except clause already
+        # issued CC_RAIL_STOP, closed the camera, and wrote
+        # session.json with aborted=true. Just print a friendly
+        # newline + status and exit cleanly.
+        print()
+        log.info("session aborted via Ctrl-C")
 
 
 if __name__ == "__main__":
