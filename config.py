@@ -47,6 +47,28 @@ SHUTTER_SPEED_CANDIDATES = ("1/200", "0.0050s", "0.005s")
 FEC_SANITY_LOW_EV = -2.0
 FEC_SANITY_MIN_RATIO = 0.5  # FEC=-2 median must be ≤ 50% of FEC=0 median
 
+# ---- Calibration baseline ----------------------------------------------------
+
+BASELINE_REFERENCE_IMAGE: "Path | None" = None
+"""Path to a reference JPEG used as the absolute calibration target.
+The runner measures its central-crop median (using the same
+CROP_*_FRAC values below) at session start and uses that value as
+the baseline for the FEC closed-loop calibration on every lens
+config.
+
+Without this, each session falls back to "first shot at the widest
+aperture of the first lens config of the session" as the baseline —
+which is fine for within-session comparability but makes inter-
+session comparability lens-config-dependent (e.g. a session that
+opens with a 105 mm macro at 1:1 + extension tubes will land at a
+different baseline than one that opens with no extension, even
+though the wafer reflectance is the same).
+
+Pick a representative shot from a previous successful session that
+captures the wafer brightness you want all future sessions to
+target. The runner will read its central-crop median once and that
+becomes the absolute reference."""
+
 # ---- Exposure analysis (central crop on the wafer) --------------------------
 
 CROP_W_FRAC = 0.20

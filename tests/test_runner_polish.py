@@ -1,11 +1,14 @@
-"""Tests for the session.runner polish (Ctrl-C, FEC sanity, IDs)."""
+"""Tests for the session.runner polish (Ctrl-C, FEC sanity, IDs,
+baseline reference image)."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from errors import FECSanityError
 from session.runner import SessionRunner
@@ -122,3 +125,66 @@ class TestStackShotIDs:
         meta = json.loads((runner.session_dir / "session.json").read_text())
         assert meta["stackshot_software_id"] is None
         assert meta["stackshot_hardware_id"] is None
+
+
+# ---- Baseline reference image ------------------------------------------
+
+
+class TestBaselineFromReference:
+    """If config.BASELINE_REFERENCE_IMAGE points at a JPEG, the
+    runner reads its central-crop median once at session start and
+    uses that as the absolute calibration target — instead of the
+    per-session "first shot at widest aperture" baseline."""
+
+    def _write_uniform_jpeg(self, path: Path, value: int) -> None:
+        arr = np.full((600, 800), value, dtype=np.uint8)
+        Image.fromarray(arr, mode="L").save(path, format="JPEG", quality=95)
+
+    def test_baseline_set_from_reference(self, cfg, tmp_path) -> None:
+        ref = tmp_path / "ref.jpg"
+        self._write_uniform_jpeg(ref, 137)
+        cfg.BASELINE_REFERENCE_IMAGE = ref
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0],
+        )
+        runner.start()
+        # Median of a uniform 137 image is 137 (JPEG quantisation can
+        # nudge it a little — allow ±2).
+        assert runner.baseline_median == pytest.approx(137.0, abs=2.0)
+
+    def test_no_reference_falls_back_to_first_shot(self, cfg, tmp_path) -> None:
+        # Default config has no BASELINE_REFERENCE_IMAGE attribute,
+        # OR it's None. Either way, runner.baseline_median stays None
+        # at session start; the calibrator picks it up from the first
+        # widest-aperture shot of the first lens config (validated
+        # in test_calibrate.TestBaseline).
+        cfg.BASELINE_REFERENCE_IMAGE = None
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0],
+        )
+        runner.start()
+        assert runner.baseline_median is None
+
+    def test_session_json_records_reference_path(self, cfg, tmp_path) -> None:
+        ref = tmp_path / "ref.jpg"
+        self._write_uniform_jpeg(ref, 100)
+        cfg.BASELINE_REFERENCE_IMAGE = ref
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0],
+        )
+        runner.start()
+        meta = json.loads((runner.session_dir / "session.json").read_text())
+        assert meta["baseline_median_luminance"] == pytest.approx(100.0, abs=2.0)
+        assert "baseline from reference" in meta["notes"]
+        assert str(ref) in meta["notes"]

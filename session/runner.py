@@ -15,6 +15,7 @@ straight-line: each phase reads as one method on
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -313,6 +314,39 @@ class SessionRunner:
                 # Camera fake doesn't accept these kwargs — skip.
                 pass
 
+        # Calibration baseline. If the user pointed config at a
+        # reference JPEG we measure its central crop median and use
+        # that as an absolute target — every lens config in every
+        # session calibrates to the same number, so two sessions
+        # with different first-lens-configs are still comparable.
+        # Without a reference, fall back to first-shot-at-widest-
+        # aperture-of-first-lens-config (the calibrator handles the
+        # baseline_median=None path).
+        ref_image = getattr(self.config, "BASELINE_REFERENCE_IMAGE", None)
+        if ref_image is not None:
+            from exposure.analyse import crop_box, measure_crop
+            from PIL import Image
+            with Image.open(str(ref_image)) as im:
+                w, h = im.size
+            box = crop_box(
+                w, h,
+                self.config.CROP_W_FRAC, self.config.CROP_H_FRAC,
+                self.config.CROP_X_FRAC, self.config.CROP_Y_FRAC,
+            )
+            stats = measure_crop(ref_image, box)
+            self.baseline_median = stats.p50
+            log.info(
+                "baseline median %.1f from reference image %s",
+                self.baseline_median, ref_image,
+            )
+            if self.metadata is not None:
+                self.metadata.baseline_median_luminance = self.baseline_median
+                self.metadata.notes = (
+                    self.metadata.notes
+                    + f"\nbaseline from reference: {ref_image}"
+                ).strip()
+                self._write_metadata()
+
     def stop(self, *, aborted: bool = False) -> None:
         """Move rail home, close hardware, finalise session.json.
 
@@ -532,11 +566,15 @@ class SessionRunner:
                 lens_dir=lens_dir,
                 slug=slug,
                 step_index=step_index,
+                step_count=steps,
                 position_mm=position_mm,
                 apertures=apertures,
                 calibration=calibration,
                 droop=droop,
             )
+        # Newline so the next print() output doesn't overwrite the
+        # final progress line.
+        self._progress_done()
 
     def _run_one_step(
         self,
@@ -544,13 +582,14 @@ class SessionRunner:
         lens_dir: Path,
         slug: str,
         step_index: int,
+        step_count: int,
         position_mm: float,
         apertures: list[str],
         calibration: CalibrationResult,
         droop: DroopDetector,
     ) -> None:
         aborted = False
-        for aperture in apertures:
+        for ap_index, aperture in enumerate(apertures):
             if aborted:
                 self._log_aborted_remainder(
                     lens_dir=lens_dir,
@@ -561,6 +600,14 @@ class SessionRunner:
                 )
                 continue
             cal = calibration.per_aperture[aperture]
+            self._progress(
+                step_index=step_index,
+                step_count=step_count,
+                position_mm=position_mm,
+                aperture=aperture,
+                aperture_index=ap_index,
+                aperture_count=len(apertures),
+            )
             self.camera.set_aperture(aperture)
             self.camera.set_iso(cal.iso)
             self.camera.set_fec(cal.fec_ev)
@@ -1043,6 +1090,46 @@ class SessionRunner:
                 notes="",
             )
         )
+
+    def _progress(
+        self,
+        *,
+        step_index: int,
+        step_count: int,
+        position_mm: float,
+        aperture: str,
+        aperture_index: int,
+        aperture_count: int,
+    ) -> None:
+        """Single-line progress display, updated in place via \\r.
+
+        Format: ``[████░░░░] step 3/10  pos +1.20mm  ap f/8 (3/5)``.
+        Cleared by :meth:`_progress_done` (which writes a newline) at
+        the end of the sweep so subsequent print() calls don't
+        overwrite it. No-op if stdout isn't a TTY (lets pipe-to-file
+        users still get the per-shot CSV without garbled output)."""
+        if not sys.stdout.isatty():
+            return
+        bar_width = 20
+        # +1 because step_index is 0-based and we want progress to
+        # increment AS the step starts, not just after.
+        fraction = (step_index + (aperture_index + 1) / aperture_count) / step_count
+        filled = int(round(fraction * bar_width))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        sys.stdout.write(
+            f"\r[{bar}] step {step_index + 1}/{step_count}  "
+            f"pos {position_mm:+7.2f} mm  "
+            f"ap {aperture} ({aperture_index + 1}/{aperture_count})"
+            "\x1b[K"
+        )
+        sys.stdout.flush()
+
+    def _progress_done(self) -> None:
+        """Newline at end of sweep so the next print() doesn't
+        overwrite the final progress line."""
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
     def _make_session_id(self) -> str:
         return self.now().strftime("%Y-%m-%d_%H%M%S")
