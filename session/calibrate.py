@@ -71,6 +71,17 @@ class ApertureCalibration:
     at the same brightness, but the flash now fires below its
     mechanical max during the sweep, reducing heating, recycle
     times, and battery drain."""
+    iso_headroom_attempted: bool = False
+    """``True`` when the swap was attempted (regardless of whether it
+    landed within tolerance). Combined with ``iso_headroom_applied``:
+    attempted=True, applied=True → swap accepted. attempted=True,
+    applied=False → swap reverted. attempted=False → swap not even
+    tried (no plateau-triggered ISO bump in cascade)."""
+    iso_headroom_attempt_ev: float | None = None
+    """The EV delta from the verification capture taken after the
+    swap. ``None`` if no swap attempt was made; otherwise the
+    measured ev — useful for diagnosing reverts (the swap dropped
+    exposure by this much)."""
 
 
 @dataclass
@@ -360,8 +371,10 @@ class Calibrator:
             else cfg.TEST_SHOT_MAX_RETRIES + 1
         )
         iso_headroom_applied = False
+        iso_headroom_attempted = False
+        iso_headroom_attempt_ev: float | None = None
         if converged and iso_bumped:
-            applied = self._try_iso_headroom_swap(
+            applied, attempt_ev = self._try_iso_headroom_swap(
                 aperture=aperture,
                 fec=fec,
                 ec=ec,
@@ -374,9 +387,15 @@ class Calibrator:
                 ec_min=ec_min,
                 ec_step=ec_step,
             )
+            iso_headroom_attempted = attempt_ev is not None
+            iso_headroom_attempt_ev = attempt_ev
             if applied is not None:
                 fec, ec, iso, last_median, last_delta = applied
                 iso_headroom_applied = True
+                shots_taken += 1
+            elif iso_headroom_attempted:
+                # Verification shot was taken (and counted) even
+                # though the swap was reverted.
                 shots_taken += 1
 
         return ApertureCalibration(
@@ -392,6 +411,8 @@ class Calibrator:
             ec_ev=ec,
             ec_used=ec_used,
             iso_headroom_applied=iso_headroom_applied,
+            iso_headroom_attempted=iso_headroom_attempted,
+            iso_headroom_attempt_ev=iso_headroom_attempt_ev,
         ), baseline
 
     def _try_iso_headroom_swap(
@@ -408,18 +429,25 @@ class Calibrator:
         shot_index: int,
         ec_min: float,
         ec_step: float,
-    ) -> tuple[float, float, int, float, float] | None:
+    ) -> tuple[
+        tuple[float, float, int, float, float] | None,
+        float | None,
+    ]:
         """Trade ``ISO_HEADROOM_EV`` of flash bias for ISO and verify.
 
-        Returns ``(fec, ec, iso, median, delta)`` on success, or
-        ``None`` if the swap landed outside tolerance (camera state
-        is then reverted by the caller's wrapper). The caller
-        assumes the flash was at mechanical max during cascade.
+        Returns ``(applied, attempt_ev)``:
+        * ``applied`` is ``(fec, ec, iso, median, delta)`` when the
+          verification shot landed within tolerance; ``None``
+          otherwise (camera state is reverted by this method).
+        * ``attempt_ev`` is the verification shot's EV delta. ``None``
+          when the swap couldn't be tried at all (no FEC/EC room
+          OR no ISO ceiling room); otherwise the measured ev for
+          the attempt — useful for diagnosing reverts.
         """
         cfg = self._config
         headroom_ev = float(getattr(cfg, "ISO_HEADROOM_EV", 1.0))
         if headroom_ev <= 0:
-            return None
+            return None, None
         # Reduce FEC down to FEC_MIN, then EC down to its min, by a
         # combined ``headroom_ev``. The flash bias goes down by
         # exactly that much; ISO compensates by the same amount.
@@ -428,7 +456,7 @@ class Calibrator:
         total_room = fec_room + ec_room
         applicable_ev = min(headroom_ev, total_room)
         if applicable_ev <= 0:
-            return None
+            return None, None
         fec_reduce = min(applicable_ev, fec_room)
         ec_reduce = applicable_ev - fec_reduce
         new_fec = _snap(fec - fec_reduce, cfg.FEC_STEP_EV)
@@ -444,7 +472,7 @@ class Calibrator:
             new_iso = stepped
             ev_added += cfg.FEC_STEP_EV
         if abs(ev_added) <= 1e-6:
-            return None  # no ISO room to add; skip the swap entirely
+            return None, None  # no ISO room to add; skip the swap
         # Apply, capture, measure.
         self._camera.set_fec(new_fec)
         if hasattr(self._camera, "set_ec"):
@@ -465,11 +493,12 @@ class Calibrator:
             session_id=session_id,
             notes=(
                 f"iso headroom swap (FEC {fec:+.2f}→{new_fec:+.2f}, "
-                f"EC {ec:+.2f}→{new_ec:+.2f}, ISO {iso}→{new_iso})"
+                f"EC {ec:+.2f}→{new_ec:+.2f}, ISO {iso}→{new_iso}); "
+                f"verification ev={delta:+.2f}"
             ),
         )
         if abs(delta) <= cfg.TEST_SHOT_TOLERANCE_EV:
-            return new_fec, new_ec, new_iso, median, delta
+            return (new_fec, new_ec, new_iso, median, delta), delta
         # Revert: the verification shot landed outside tolerance,
         # so the swap assumption (flash at mechanical max →
         # ISO compensates 1:1 for flash reduction) didn't hold.
@@ -477,7 +506,7 @@ class Calibrator:
         if hasattr(self._camera, "set_ec"):
             self._camera.set_ec(ec)
         self._camera.set_iso(iso)
-        return None
+        return None, delta
 
     # ---- Helpers ----------------------------------------------------------
 

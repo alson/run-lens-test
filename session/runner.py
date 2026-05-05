@@ -1914,7 +1914,23 @@ class SessionRunner:
         )
         for ap, c in cal_result.per_aperture.items():
             status = "ok" if c.hit_tolerance else "MISS"
-            headroom = " +headroom" if c.iso_headroom_applied else ""
+            if c.iso_headroom_applied:
+                headroom = " +headroom"
+            elif getattr(c, "iso_headroom_attempted", False):
+                # Swap was tried but the verification shot landed
+                # outside tolerance — revealed in the post-cal print
+                # so the user knows the flash wasn't actually at
+                # mechanical max despite the plateau detection.
+                attempt_ev = getattr(c, "iso_headroom_attempt_ev", None)
+                if attempt_ev is not None:
+                    headroom = (
+                        f" (headroom: reverted, verification ev="
+                        f"{attempt_ev:+.2f})"
+                    )
+                else:
+                    headroom = " (headroom: reverted)"
+            else:
+                headroom = ""
             ec_used = f" EC={c.ec_ev:+.2f}" if c.ec_used else ""
             iso_bumped = "*" if c.iso_bumped else ""
             print(
