@@ -38,8 +38,32 @@ work through that first.
 - **`pyftdi` / libusb-direct also returns 0 bytes** (`tools/pyftdi_probe.py`,
   run via `sudo`). Bypasses ftdi_sio entirely; bytes reach the wire
   (`write_data` confirms 6 bytes written) but the device emits nothing.
-  This excludes every host-side variable; the issue is on the device
-  side (firmware state, post-reflash protocol drift, or hardware).
+
+### Step 1.0a — The actual fix: SET_BITMODE 0x20FF
+
+After all that, the answer was in the Cognisys reference C++ source
+(`StackshotUSB_app.zip`, `Form1.h:2335-2342`):
+
+```c++
+ftStatus = FT_SetBitMode(*handle, 0xFF, 0x20);
+// Sleep required here for slave device to debounce pins and enter USB control
+Thread::Sleep(500);
+```
+
+Translated to a USB control transfer: vendor request `0x0B` with
+``wValue = 0x20FF`` (mode = 0x20 = CBUS bit bang, mask = 0xFF = all
+pins as outputs). Then a 500 ms sleep so the StackShot's MCU sees
+the CBUS state change and enables its serial command listener.
+
+**This is undocumented in the protocol PDF.** Without sending it,
+the StackShot's MCU stays in standalone / front-panel mode and
+silently ignores every byte of the documented protocol. With it,
+the device responds normally on the very next bulk-OUT.
+
+`tools/pyftdi_probe.py` now mirrors the recipe from
+`StackshotUSB_app.zip` exactly: SET_BITMODE → 500 ms sleep → reset
+cycles → BAUDRATE/LINE/FLOW. Validated end-to-end on this rig: a
+`CC_SOFTWARE_STRING` (cmd 0x1102) read returns `'SW Rev:1.0.09'`.
 
 ### Step 1.0 — Factory reset on the StackShot
 

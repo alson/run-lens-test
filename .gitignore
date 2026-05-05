@@ -26,3 +26,8 @@ data/readline_history
 
 # Claude Code local settings
 .claude/
+
+# Diagnostic captures and third-party reference downloads (kept out of
+# the repo; reproduce via tools/pyftdi_probe.py + usbmon)
+usbmon*.txt
+StackshotUSB_app.zip
