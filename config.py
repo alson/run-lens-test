@@ -49,7 +49,12 @@ FEC_SANITY_MIN_RATIO = 0.5  # FEC=-2 median must be ≤ 50% of FEC=0 median
 
 # ---- Calibration baseline ----------------------------------------------------
 
-BASELINE_REFERENCE_IMAGE: "Path | None" = None
+BASELINE_REFERENCE_IMAGE: "Path | None" = Path(
+    "/home/alson/shared/files/pics/digikam/test-raw-data/2026-01-29/"
+    "Nikon AF Micro-Nikkor 200mm f_4D IF-ED/1_1/F5.6/"
+    "00188|Nikon AF Micro-Nikkor 200mm f_4D IF-ED|1_1|200.0 mm|F5.6|"
+    "alm-20260129-160552-188.jpg"
+)
 """Path to a reference JPEG used as the absolute calibration target.
 The runner measures its central-crop median (using the same
 CROP_*_FRAC values below) at session start and uses that value as
