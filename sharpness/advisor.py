@@ -167,9 +167,15 @@ def advise(
     edge_steps: int = DEFAULT_EDGE_STEPS,
     crop_names: tuple[str, ...] = CROP_NAMES,
 ) -> dict[float, Recommendation]:
-    """Produce one ``Recommendation`` per aperture present in ``dataset``."""
+    """Produce one ``Recommendation`` per aperture present in ``dataset``.
+
+    Replicas at the same (step, aperture) are collapsed via per-crop
+    median before peak / truncation detection so the bell-curve
+    primitives see one point per rail step, not N.
+    """
+    aggregated = dataset.aggregated()
     out: dict[float, Recommendation] = {}
-    for aperture, samples in dataset.by_aperture().items():
+    for aperture, samples in aggregated.by_aperture().items():
         crop_sizes: dict[str, list[int]] = {}
         for name in crop_names:
             series = [s.sizes[name] for s in samples if name in s.sizes]

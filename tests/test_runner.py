@@ -448,6 +448,62 @@ class TestRecycleWait:
 # ---- Droop pause + resume --------------------------------------------------
 
 
+class TestMultiShot:
+    """SHOTS_PER_STEP_APERTURE > 1 captures multiple replicas at each
+    (step, aperture). Replica 0 keeps the legacy filename
+    (``step_NNNN.jpg``); replicas 1..N-1 use ``_b``, ``_c``, …
+    suffixes. Each replica is its own row in shots.csv."""
+
+    def test_three_replicas_per_step_aperture(self, cfg, tmp_path) -> None:
+        cfg.SHOTS_PER_STEP_APERTURE = 3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # 1 cal + 2 steps × 1 aperture × 3 replicas = 7
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"lens": "L", "steps": 2, "end_mm": 2.0},
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        # 2 steps × 3 replicas = 6 sweep rows
+        assert len(sweep_rows) == 6
+        filenames = sorted(r["filename"] for r in sweep_rows)
+        assert filenames == [
+            "f_4/step_0100.jpg", "f_4/step_0100_b.jpg", "f_4/step_0100_c.jpg",
+            "f_4/step_0101.jpg", "f_4/step_0101_b.jpg", "f_4/step_0101_c.jpg",
+        ]
+
+    def test_default_one_shot_preserves_legacy_filenames(
+        self, cfg, tmp_path
+    ) -> None:
+        # Default cfg has no SHOTS_PER_STEP_APERTURE attribute → fall
+        # back to 1 → no replica suffixes.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 6,
+            inputs={"lens": "L", "steps": 2, "end_mm": 2.0},
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        rows = runner.shots_csv.read_rows()
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        # 2 steps × 1 replica = 2 sweep rows, no suffixes
+        assert len(sweep_rows) == 2
+        assert sorted(r["filename"] for r in sweep_rows) == [
+            "f_4/step_0100.jpg", "f_4/step_0101.jpg",
+        ]
+
+
 class TestDroopPause:
     def test_droop_triggers_confirm_and_resets_window(
         self, cfg, tmp_path

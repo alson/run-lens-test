@@ -156,6 +156,52 @@ class TestLiveCollector:
         assert called_args[0] == tmp_path / "x.jpg"
         assert called_args[1] == tmp_path
 
+    def test_aggregated_collapses_replicas_via_median(self) -> None:
+        # Three replicas at (step=0, ap=4.0) with center sizes 10/20/30
+        # → median 20. Single-replica (step=1, ap=4.0) is passed
+        # through unchanged. Different aperture is independent.
+        ds = CollectedDataset(samples=[
+            ShotSample(rail_step=0, aperture=4.0, sizes={"center": 10}, replica_index=0),
+            ShotSample(rail_step=0, aperture=4.0, sizes={"center": 20}, replica_index=1),
+            ShotSample(rail_step=0, aperture=4.0, sizes={"center": 30}, replica_index=2),
+            ShotSample(rail_step=1, aperture=4.0, sizes={"center": 99}, replica_index=0),
+            ShotSample(rail_step=0, aperture=8.0, sizes={"center": 5}, replica_index=0),
+        ])
+        agg = ds.aggregated()
+        # Expect 3 distinct (step, ap) entries.
+        assert len(agg.samples) == 3
+        sizes = {(s.rail_step, s.aperture): s.sizes["center"] for s in agg.samples}
+        assert sizes[(0, 4.0)] == 20  # median of 10, 20, 30
+        assert sizes[(1, 4.0)] == 99
+        assert sizes[(0, 8.0)] == 5
+
+    def test_aggregated_no_op_on_unique_keys(self) -> None:
+        # With no duplicate (step, ap) pairs, aggregated() returns the
+        # same data (in some equivalent ordering).
+        ds = CollectedDataset(samples=[
+            ShotSample(rail_step=0, aperture=4.0, sizes={"center": 10}),
+            ShotSample(rail_step=1, aperture=4.0, sizes={"center": 20}),
+        ])
+        agg = ds.aggregated()
+        assert {(s.rail_step, s.aperture, s.sizes["center"]) for s in agg.samples} == {
+            (0, 4.0, 10), (1, 4.0, 20),
+        }
+
+    def test_record_shot_passes_replica_index_to_sample(
+        self, tmp_path: Path
+    ) -> None:
+        with LiveCollector(
+            tmp_path,
+            crop_fn=_fake_crop({"center": 1}),
+            max_workers=1,
+        ) as c:
+            c.record_shot(0, 4.0, tmp_path / "step_0100.jpg", replica_index=0)
+            c.record_shot(0, 4.0, tmp_path / "step_0100_b.jpg", replica_index=1)
+            c.record_shot(0, 4.0, tmp_path / "step_0100_c.jpg", replica_index=2)
+            c.wait_for_pending()
+        replicas = sorted(s.replica_index for s in c.dataset.samples)
+        assert replicas == [0, 1, 2]
+
     def test_clear_samples_for_steps_drops_matching_rail_steps(
         self, tmp_path: Path
     ) -> None:

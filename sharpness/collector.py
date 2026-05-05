@@ -35,11 +35,18 @@ from sharpness.cropper import CropResult, crop_image_file
 
 @dataclass(frozen=True)
 class ShotSample:
-    """One frame's worth of crop sizes, keyed by rail step + aperture."""
+    """One frame's worth of crop sizes, keyed by rail step + aperture.
+
+    ``replica_index`` distinguishes multiple frames captured at the
+    same (rail_step, aperture) for noise averaging — replica 0 is
+    the first shot, 1 the second, etc. ``CollectedDataset.aggregated``
+    collapses replicas via per-crop median.
+    """
 
     rail_step: int
     aperture: float  # f-number, e.g. 8.0
     sizes: dict[str, int]  # crop name -> JPEG size in bytes
+    replica_index: int = 0
 
 
 @dataclass
@@ -72,6 +79,48 @@ class CollectedDataset:
         ]
         rows.sort()
         return rows
+
+    def aggregated(self) -> "CollectedDataset":
+        """Collapse replicas: one ShotSample per (rail_step, aperture),
+        with each crop's size set to the median of all replicas.
+
+        Used by the advisor and the SharpnessRangeChecker before
+        running peak / truncation detection — replicas are for noise
+        averaging, not extra rail-step coverage, so the advisor must
+        see one point per (step, ap), not N.
+        """
+        from collections import defaultdict
+        groups: dict[tuple[int, float], list[ShotSample]] = defaultdict(list)
+        for s in self.samples:
+            groups[(s.rail_step, s.aperture)].append(s)
+        merged: list[ShotSample] = []
+        for (step, ap), group in groups.items():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+            crop_names = set()
+            for s in group:
+                crop_names.update(s.sizes.keys())
+            medians: dict[str, int] = {}
+            for name in crop_names:
+                vals = sorted(s.sizes[name] for s in group if name in s.sizes)
+                if not vals:
+                    continue
+                medians[name] = vals[len(vals) // 2]
+            merged.append(ShotSample(
+                rail_step=step,
+                aperture=ap,
+                sizes=medians,
+                replica_index=0,
+            ))
+        # Preserve insertion order by first-occurrence of each
+        # (step, ap) so callers iterating over .samples see a stable
+        # order across runs.
+        order: dict[tuple[int, float], int] = {}
+        for i, s in enumerate(self.samples):
+            order.setdefault((s.rail_step, s.aperture), i)
+        merged.sort(key=lambda s: order[(s.rail_step, s.aperture)])
+        return CollectedDataset(samples=merged)
 
 
 # Type alias: a function with the same signature as ``crop_image_file``,
@@ -139,12 +188,24 @@ class LiveCollector:
         rail_step: int,
         aperture: float,
         jpg_path: Path,
+        *,
+        replica_index: int = 0,
     ) -> Future[None]:
-        """Schedule cropping for one shot. Returns immediately."""
+        """Schedule cropping for one shot. Returns immediately.
+
+        ``replica_index`` flows through to the resulting
+        :class:`ShotSample` so :meth:`CollectedDataset.aggregated`
+        can collapse multiple replicas at the same (step, aperture)
+        via per-crop median.
+        """
         if self._shutdown_called:
             raise RuntimeError("record_shot called after shutdown")
         fut = self._executor.submit(
-            self._process, rail_step, aperture, Path(jpg_path)
+            self._process,
+            rail_step,
+            aperture,
+            Path(jpg_path),
+            replica_index,
         )
         self._futures.append(fut)
         return fut
@@ -234,7 +295,13 @@ class LiveCollector:
 
     # -- worker ------------------------------------------------------------
 
-    def _process(self, rail_step: int, aperture: float, jpg_path: Path) -> None:
+    def _process(
+        self,
+        rail_step: int,
+        aperture: float,
+        jpg_path: Path,
+        replica_index: int = 0,
+    ) -> None:
         out = (
             jpg_path.parent / self._cropped_dirname
             if self._crops_under_source
@@ -246,7 +313,12 @@ class LiveCollector:
             with self._lock:
                 self._errors.append(exc)
             raise
-        sample = ShotSample(rail_step=rail_step, aperture=aperture, sizes=result.sizes)
+        sample = ShotSample(
+            rail_step=rail_step,
+            aperture=aperture,
+            sizes=result.sizes,
+            replica_index=replica_index,
+        )
         with self._lock:
             self._dataset.samples.append(sample)
 

@@ -99,6 +99,16 @@ SHARPNESS_MAX_WORKERS = 4
 core count vs flash recycle: 4 keeps a single 45 MP JPEG cropping run
 just under typical 3 s recycle on the test rig."""
 
+SHOTS_PER_STEP_APERTURE = 3
+"""Number of frames captured at each (rail step, aperture) pair.
+
+Replica 0 is saved as ``step_NNNN.jpg`` (no suffix) so existing
+analysis tooling that expects single-shot filenames keeps working.
+Replicas 1..N-1 are saved as ``step_NNNN_b.jpg``, ``step_NNNN_c.jpg``,
+… The advisor aggregates by-(step, aperture) median across replicas
+before peak / truncation detection so JPEG-encoding noise doesn't
+swamp a weak focus signal. Set to 1 to revert to single-shot."""
+
 SHARPNESS_CROPPED_DIRNAME = "cropped"
 """Subdirectory name under each <lens>/<aperture>/ directory where the
 17 crops are persisted. Matches the user's offline-analysis layout."""

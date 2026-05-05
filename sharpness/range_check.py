@@ -98,7 +98,12 @@ class SharpnessRangeChecker(RangeChecker):
         # taken so far. Idempotent — the runner also does this for
         # safety.
         self.collector.wait_for_pending()
-        dataset = self.collector.dataset
+        # Aggregate replicas (multiple shots at the same (step, ap))
+        # before advising so peak / truncation primitives see one
+        # point per rail step. We pass the aggregated dataset to the
+        # downstream curve-builders too — per_aperture in the
+        # RangeResult is one point per step.
+        dataset = self.collector.dataset.aggregated()
         recs = advise(dataset)
 
         if probe_data is None:

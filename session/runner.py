@@ -1079,36 +1079,51 @@ class SessionRunner:
         cal: ApertureCalibration,
         phase: Phase,
     ) -> float:
-        """Apply settings, wait for recycle, capture, log to CSV.
+        """Capture all configured replicas at one (step, aperture).
 
-        Returns the EV delta of the just-captured shot. Used by the
-        main sweep, the droop-recovery reshoot, and any other path
-        that needs to record a single sweep-style frame.
+        Returns the **median** EV delta across replicas — that's what
+        the droop detector pushes against, so a single noisy frame
+        doesn't trip the criterion. Each replica is independently
+        saved to disk, recorded in the sharpness collector with its
+        own ``replica_index``, and logged in shots.csv.
+
+        ``SHOTS_PER_STEP_APERTURE`` controls the replica count
+        (default 1 for legacy behaviour).
         """
+        n = max(1, int(getattr(self.config, "SHOTS_PER_STEP_APERTURE", 1)))
         self._set_capture_settings(aperture, cal)
-        self._wait_for_recycle()
-        dest = self._sweep_destination(lens_dir, aperture, step_index)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        self._last_capture_started_at = self.monotonic()
-        self._last_capture_aperture = aperture
-        self.camera.capture_to(dest)
-        self._record_sharpness(
-            step_index=step_index, aperture=aperture, dest=dest
-        )
-        median = self._measure(dest)
-        ev = ev_delta(median, self.baseline_median or median)
-        self._log_shot(
-            slug=slug,
-            step_index=step_index,
-            position_mm=position_mm,
-            aperture=aperture,
-            cal=cal,
-            median=median,
-            ev=ev,
-            filename=str(dest.relative_to(lens_dir)),
-            phase=phase,
-        )
-        return ev
+        evs: list[float] = []
+        for replica in range(n):
+            self._wait_for_recycle()
+            dest = self._sweep_destination(
+                lens_dir, aperture, step_index, replica=replica
+            )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self._last_capture_started_at = self.monotonic()
+            self._last_capture_aperture = aperture
+            self.camera.capture_to(dest)
+            self._record_sharpness(
+                step_index=step_index,
+                aperture=aperture,
+                dest=dest,
+                replica_index=replica,
+            )
+            median = self._measure(dest)
+            ev = ev_delta(median, self.baseline_median or median)
+            self._log_shot(
+                slug=slug,
+                step_index=step_index,
+                position_mm=position_mm,
+                aperture=aperture,
+                cal=cal,
+                median=median,
+                ev=ev,
+                filename=str(dest.relative_to(lens_dir)),
+                phase=phase,
+            )
+            evs.append(ev)
+        evs.sort()
+        return evs[len(evs) // 2]  # median
 
     def _handle_droop(
         self,
@@ -1418,13 +1433,14 @@ class SessionRunner:
         return stats.p50
 
     def _sweep_destination(
-        self, lens_dir: Path, aperture: str, step_index: int
+        self, lens_dir: Path, aperture: str, step_index: int,
+        *, replica: int = 0,
     ) -> Path:
         slug = self._aperture_subdir(aperture)
         offset = getattr(self.config, "STEP_NUMBER_OFFSET", 100)
         width = getattr(self.config, "STEP_NUMBER_WIDTH", 4)
         return lens_dir / slug / step_filename(
-            step_index, offset=offset, width=width
+            step_index, offset=offset, width=width, replica=replica
         )
 
     @staticmethod
@@ -1432,7 +1448,8 @@ class SessionRunner:
         return aperture.replace("/", "_").replace(".", "_")
 
     def _record_sharpness(
-        self, *, step_index: int, aperture: str, dest: Path
+        self, *, step_index: int, aperture: str, dest: Path,
+        replica_index: int = 0,
     ) -> None:
         """Hand a captured JPEG to the sharpness collector. Defensive —
         cropping errors are surfaced at the next ``wait_for_pending``
@@ -1440,11 +1457,21 @@ class SessionRunner:
         if self._sharpness_collector is None:
             return
         try:
-            self._sharpness_collector.record_shot(
-                rail_step=step_index,
-                aperture=_parse_fnum(aperture),
-                jpg_path=dest,
-            )
+            # Older fakes / null collectors don't accept
+            # replica_index; fall back to the legacy 3-arg form.
+            try:
+                self._sharpness_collector.record_shot(
+                    rail_step=step_index,
+                    aperture=_parse_fnum(aperture),
+                    jpg_path=dest,
+                    replica_index=replica_index,
+                )
+            except TypeError:
+                self._sharpness_collector.record_shot(
+                    rail_step=step_index,
+                    aperture=_parse_fnum(aperture),
+                    jpg_path=dest,
+                )
         except RuntimeError:
             # Collector already shut down (e.g. abort path). The
             # session is winding down; skip silently.
