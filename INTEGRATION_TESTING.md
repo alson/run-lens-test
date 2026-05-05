@@ -233,27 +233,38 @@ If steps 1.4 pass, **mark task #3 (StackShot controller, rig test) complete**.
 
 ## 2. StackShot jog UI
 
-After step 1 passes:
+After step 1 passes (no `--port` needed — the libusb path is the
+default):
 
 ```bash
-.venv/bin/python -m stackshot.jog --port /dev/ttyUSB0
+.venv/bin/python -m stackshot.jog
 ```
 
-You should see:
+Keys:
 
-```
-Jog rail to START. a/d=fine, A/D=coarse, s=set START, q=abort
-[START] position =  +0.000 mm
-```
+| Key | Action |
+|--|--|
+| `a` / `d` | Coarse step backward / forward (1 mm) |
+| `A` / `D` | Fine step backward / forward (0.05 mm) |
+| **SPACE** | Hand the rail back to its **front-panel buttons**. LCD switches from "USB CONTROL" to a normal idle screen; physical fwd/back buttons regain control. Press **ENTER** to take USB control back; the rail's position when you released is preserved and read back. |
+| `s` | Set START at the current position (zeros the rail). |
+| `e` | Set END (only in the END phase). |
+| `q` | Abort. |
 
 Test sequence:
-1. Press `d` a few times — rail steps forward in 0.05 mm increments; line redraws each time.
-2. Press `A` once — rail steps back 1 mm.
-3. Press `s` — `[START set (zeroed)]` shows; prompt moves to END.
-4. Press `D` until you reach a few mm — line updates.
-5. Press `e` — `[END set]`; final printout shows START=0.000 mm and END=<your value>.
 
-If keys aren't registering, check that the terminal is in a real TTY (not piped through anything that buffers stdin — e.g. Claude Code's web shell may not deliver keystrokes byte-by-byte; run from a normal terminal).
+1. Tap `d` a few times — rail steps forward 1 mm per tap; status line redraws.
+2. Tap `A` a few times — fine 0.05 mm backward.
+3. **Hold `d` for ~2 s, release.** Rail should keep moving while held and stop within ~one move-time (~200 ms) of release. No queued post-release motion.
+4. **Hold `d`, then tap `A` while still holding.** Held-key forward motion stops; one fine backward step fires; loop returns to keyboard control.
+5. Press **SPACE**. LCD switches to normal idle. Use the rail's physical fwd/back buttons; rail responds. Press ENTER. LCD returns to "USB CONTROL"; status line updates with the new position.
+6. Press `s` to set START (zeros). Repeat sequence 1–5 for END, then press `e`.
+7. Final printout shows START = 0.000 mm and END = <your value>.
+
+Notes:
+- Keyboard auto-repeat keystrokes that pile up during a move are **drained after the move completes** — same-direction extras are discarded; the first different-direction key (or `q`) is processed next. See `stackshot/jog.py:_drain_after_move`.
+- The drain bypasses Python's stdin buffer via `os.read(fd, 1)` — using `sys.stdin.read(1)` + `select` was broken because `select` only sees the kernel buffer.
+- If keys aren't registering, check that the terminal is a real TTY (cbreak mode requires it). Run from a normal terminal, not through a wrapper that line-buffers stdin.
 
 ---
 
