@@ -210,21 +210,29 @@ def _release_to_panel(
     transport can't toggle bit-mode (e.g.
     :class:`stackshot.transport.SerialTransport`).
     """
+    # Cache the position before releasing — once the rail's MCU is
+    # in front-panel mode (after SET_BITMODE 0x20F0) it doesn't
+    # reliably answer USB protocol queries, so any get_position()
+    # call here would time out. Status writes during panel mode
+    # therefore reuse this cached value (the user is moving the rail
+    # via the StackShot's own LCD, so they don't need a live read
+    # from us).
+    cached_position = controller.get_position()
     try:
         controller.release_to_panel()
     except NotImplementedError as exc:
-        write_status(controller.get_position(), f"{label} (panel release not supported: {exc})")
-        return controller.get_position(), None
+        write_status(cached_position, f"{label} (panel release not supported: {exc})")
+        return cached_position, None
     if on_release is not None:
         try:
             on_release()
         except Exception as exc:                     # noqa: BLE001
             write_status(
-                controller.get_position(),
+                cached_position,
                 f"{label} | PANEL (on_release callback failed: {exc})",
             )
     write_status(
-        controller.get_position(),
+        cached_position,
         f"{label} | PANEL — rail buttons + camera live view; ENTER to resume",
     )
     while True:
@@ -236,7 +244,7 @@ def _release_to_panel(
     # didn't register and queues more keystrokes that leak into the
     # next prompt.
     write_status(
-        controller.get_position(),
+        cached_position,
         f"{label} | reacquiring camera + rail…",
     )
     if on_reacquire is not None:
@@ -244,7 +252,7 @@ def _release_to_panel(
             on_reacquire()
         except Exception as exc:                     # noqa: BLE001
             write_status(
-                controller.get_position(),
+                cached_position,
                 f"{label} (on_reacquire callback failed: {exc})",
             )
     controller.take_from_panel()
