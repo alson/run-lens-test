@@ -156,6 +156,35 @@ class TestLiveCollector:
         assert called_args[0] == tmp_path / "x.jpg"
         assert called_args[1] == tmp_path
 
+    def test_crops_under_source_routes_per_aperture(self, tmp_path: Path) -> None:
+        # In production the runner sets crops_under_source=True so the
+        # cropper writes to <jpg.parent>/cropped/<crop>/<source>.
+        # Without this every aperture's "step_0100.jpg" overwrites the
+        # previous one in <lens>/cropped/<crop>/.
+        out_dirs: list[Path] = []
+
+        def capture(source: Path, out_dir: Path) -> CropResult:
+            out_dirs.append(out_dir)
+            return CropResult(source=source, sizes={"center": 1})
+
+        f4 = tmp_path / "f_4"
+        f4.mkdir()
+        f8 = tmp_path / "f_8"
+        f8.mkdir()
+        with LiveCollector(
+            tmp_path,
+            crop_fn=capture,
+            max_workers=1,
+            crops_under_source=True,
+            cropped_dirname="cropped",
+        ) as c:
+            c.record_shot(0, 4.0, f4 / "step_0100.jpg")
+            c.record_shot(0, 8.0, f8 / "step_0100.jpg")
+        assert sorted(out_dirs) == sorted([
+            f4 / "cropped",
+            f8 / "cropped",
+        ])
+
 
 class TestWaitForPending:
     def test_blocks_until_in_flight_crops_complete(self, tmp_path: Path) -> None:

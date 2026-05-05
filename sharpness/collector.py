@@ -99,8 +99,23 @@ class LiveCollector:
         *,
         max_workers: int = 4,
         crop_fn: CropFn | None = None,
+        crops_under_source: bool = False,
+        cropped_dirname: str = "cropped",
     ) -> None:
+        """``out_dir`` is the default crop output directory.
+
+        When ``crops_under_source=True`` the collector ignores
+        ``out_dir`` and writes each shot's crops under
+        ``<jpg_path.parent>/<cropped_dirname>/``. This is the
+        production layout — per the plan §8.3.5, crops live
+        alongside their source aperture directory so a sweep at f/4
+        and a sweep at f/8 don't share a ``cropped/center/`` folder
+        and overwrite each other (every aperture's source files
+        share the ``step_NNNN.jpg`` filename convention).
+        """
         self._out_dir = Path(out_dir)
+        self._crops_under_source = crops_under_source
+        self._cropped_dirname = cropped_dirname
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: deque[Future[None]] = deque()
         self._lock = threading.Lock()
@@ -199,8 +214,13 @@ class LiveCollector:
     # -- worker ------------------------------------------------------------
 
     def _process(self, rail_step: int, aperture: float, jpg_path: Path) -> None:
+        out = (
+            jpg_path.parent / self._cropped_dirname
+            if self._crops_under_source
+            else self._out_dir
+        )
         try:
-            result = self._crop_fn(jpg_path, self._out_dir)
+            result = self._crop_fn(jpg_path, out)
         except BaseException as exc:  # noqa: BLE001 — re-raise via shutdown
             with self._lock:
                 self._errors.append(exc)

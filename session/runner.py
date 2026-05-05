@@ -1461,9 +1461,16 @@ def main() -> None:
     range_checker = SharpnessRangeChecker(config=config)
 
     def _sharpness_factory(lens_dir: Path) -> SharpnessCollectorLike:
+        # crops_under_source=True writes crops next to the source
+        # JPEG (lens/aperture/cropped/<crop>/step_NNNN.jpg). The
+        # `out_dir` arg is unused in this mode but the API requires
+        # one — pass the lens-level cropped path so it's still a
+        # sensible value if the flag is ever toggled.
         return LiveCollector(
             lens_dir / config.SHARPNESS_CROPPED_DIRNAME,
             max_workers=config.SHARPNESS_MAX_WORKERS,
+            crops_under_source=True,
+            cropped_dirname=config.SHARPNESS_CROPPED_DIRNAME,
         )
 
     def _camera_jog(rail) -> JogResult:
