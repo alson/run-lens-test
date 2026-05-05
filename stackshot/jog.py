@@ -233,23 +233,41 @@ def cbreak_stdin():
 
 
 def _stdin_read_key(timeout: float | None = None) -> str | None:
-    """Read one character from stdin.
+    """Read one character from stdin via the raw fd.
 
-    ``timeout=None`` (the default) blocks until a character is
-    available. ``timeout=0.0`` returns immediately with whatever is
-    queued, or ``None`` if nothing is. ``timeout>0`` waits up to the
-    given number of seconds.
+    We deliberately bypass ``sys.stdin`` (a buffered ``TextIOWrapper``)
+    because :func:`select.select` only sees the kernel's input
+    buffer — anything Python has already pulled into its own buffer
+    is invisible to ``select``. With ``sys.stdin.read(1)`` the drain
+    in :func:`jog_loop` would return early while queued keystrokes
+    sat in the Python buffer, then the next blocking read would
+    find them and execute them as moves *after* the user released
+    the key. Using :func:`os.read` on fd 0 directly avoids the
+    Python buffer entirely; ``select`` and reads see the same data.
 
-    The non-blocking variants are used by the jog loop to drain
-    queued same-direction keystrokes after each move.
+    ``timeout=None`` blocks until a character is available.
+    ``timeout=0.0`` returns immediately with whatever is queued or
+    ``None`` if nothing is. ``timeout>0`` waits up to that many
+    seconds.
     """
-    if timeout is None:
-        return sys.stdin.read(1)
+    import os
     import select
-    ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    if ready:
-        return sys.stdin.read(1)
-    return None
+
+    fd = sys.stdin.fileno()
+    if timeout is not None:
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return None
+    try:
+        b = os.read(fd, 1)
+    except OSError:
+        return None
+    if not b:
+        return None
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _stdout_write_status(position_mm: float, label: str) -> None:
