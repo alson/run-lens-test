@@ -52,6 +52,9 @@ def cfg():
         FEC_MIN_EV=-3.0,
         FEC_MAX_EV=+1.0,
         FEC_STEP_EV=1 / 3,
+        EC_MIN_EV=-3.0,
+        EC_MAX_EV=+3.0,
+        EC_STEP_EV=1 / 3,
         TEST_SHOT_TOLERANCE_EV=1 / 3,
         TEST_SHOT_MAX_RETRIES=3,
         ROLLING_WINDOW=5,
@@ -149,6 +152,9 @@ class FakeCamera:
 
     def set_fec(self, ev: float) -> None:
         self.history.append(("fec", float(ev)))
+
+    def set_ec(self, ev: float) -> None:
+        self.history.append(("ec", float(ev)))
 
     def capture_to(self, dest, *, max_retries: int = 3) -> int:
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
@@ -446,6 +452,42 @@ class TestRecycleWait:
 
 
 # ---- Droop pause + resume --------------------------------------------------
+
+
+class TestCalibrationFailure:
+    """Calibration that doesn't reach tolerance must alert + prompt
+    distinct from droop (it's a lighting / reference issue, not a
+    battery problem)."""
+
+    def test_skip_proceeds_with_non_converged_values(
+        self, cfg, tmp_path
+    ) -> None:
+        # Lighting can never close the gap → calibration saturates.
+        # User picks "skip" and the sweep proceeds anyway.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # All shots stay at 25 (vs baseline 100 → -2 EV) regardless of
+        # FEC / EC / ISO; calibration cycles through its 7 attempts
+        # without converging.
+        medians = [25.0] * 12
+        prompts: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 2, "end_mm": 2.0},
+        )
+        # Pre-set baseline so the first calibration shot is compared
+        # (vs setting the baseline at first capture).
+        runner.baseline_median = 100.0
+        runner.prompt_off_target = (
+            lambda msg: (prompts.append(msg), "skip")[1]
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        # Calibration-failure prompt fired at least once.
+        assert any("Calibration didn't reach" in p for p in prompts)
 
 
 class TestMultiShot:

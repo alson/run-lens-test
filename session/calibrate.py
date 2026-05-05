@@ -62,6 +62,8 @@ class ApertureCalibration:
     iso_bumped: bool
     test_shots_taken: int
     saturated_at_ceiling: bool = False
+    ec_ev: float = 0.0
+    ec_used: bool = False
 
 
 @dataclass
@@ -77,6 +79,7 @@ class CameraLike(Protocol):
     def set_aperture(self, fnum: str) -> None: ...
     def set_iso(self, iso) -> None: ...
     def set_fec(self, ev: float) -> None: ...
+    def set_ec(self, ev: float) -> None: ...
     def capture_to(self, dest) -> int: ...
 
 
@@ -171,13 +174,22 @@ class Calibrator:
         ap_float = _parse_aperture(aperture)
         iso = self._initial_iso(ap_float)
         fec = 0.0
+        ec = 0.0
+        ec_min = float(getattr(cfg, "EC_MIN_EV", -3.0))
+        ec_max = float(getattr(cfg, "EC_MAX_EV", +3.0))
+        ec_step = float(getattr(cfg, "EC_STEP_EV", 1.0 / 3.0))
         self._camera.set_aperture(aperture)
         self._camera.set_iso(iso)
         self._camera.set_fec(fec)
+        # Reset EC to 0 at the start of each aperture so a previous
+        # aperture's bump doesn't carry over silently.
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(ec)
 
         last_median = 0.0
         last_delta = 0.0
         iso_bumped = False
+        ec_used = False
         saturated = False
         for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
             dest = capture_dir / _calibration_filename(aperture, shot_index)
@@ -210,6 +222,8 @@ class Calibrator:
                     hit_tolerance=True,
                     iso_bumped=False,
                     test_shots_taken=1,
+                    ec_ev=ec,
+                    ec_used=False,
                 ), baseline
 
             delta = ev_delta(median, baseline)
@@ -235,40 +249,61 @@ class Calibrator:
                     hit_tolerance=True,
                     iso_bumped=iso_bumped,
                     test_shots_taken=shot_index + 1,
+                    ec_ev=ec,
+                    ec_used=ec_used,
                 ), baseline
 
-            # Adjust: shift FEC by -delta (i.e. if we're +0.5 EV bright,
-            # drop FEC by 0.5 EV). Then snap to a ⅓-stop grid.
+            # Lever priority: FEC first (most direct flash control;
+            # fine-tune lever in AA mode). When FEC saturates, EC
+            # extends headroom by another ec_max stops on each side
+            # — assumes camera custom function e3 is set to "Entire
+            # frame" so EC stacks additively with FEC. ISO is the
+            # last resort since it only acts as a range-extender in
+            # AA mode (the flash quenches sooner at higher ISO).
             new_fec = _clamp(
                 _snap(fec - delta, cfg.FEC_STEP_EV),
                 cfg.FEC_MIN_EV,
                 cfg.FEC_MAX_EV,
             )
-            # Saturation check uses *current* fec, not new_fec. Otherwise
-            # the very first shot at FEC=0 with a delta beyond
-            # FEC_MAX_EV — e.g. -1.7 EV → new_fec clamps to +1.0 —
-            # would be misread as "already at FEC_MAX" and trigger an
-            # ISO bump while skipping the actual ``set_fec(new_fec)``
-            # line below; FEC ends up stuck at 0 forever.
+            # Saturation checks use *current* fec / ec, not new_fec.
+            # Otherwise a first shot far enough off that the requested
+            # correction exceeds FEC_MAX_EV would clamp to FEC_MAX,
+            # be misread as "already at max", trigger an ISO bump, and
+            # ``continue`` — leaving FEC stuck at 0 forever.
             fec_saturated_low = (
                 fec == cfg.FEC_MIN_EV and delta > cfg.TEST_SHOT_TOLERANCE_EV
             )
             fec_saturated_high = (
                 fec == cfg.FEC_MAX_EV and delta < -cfg.TEST_SHOT_TOLERANCE_EV
             )
-            if fec_saturated_high:
-                # Under-exposing at FEC_MAX — bump ISO by ⅓ stop.
-                bumped = next_iso(iso, ceiling=cfg.ISO_CEIL)
-                if bumped == iso:
-                    saturated = True
-                    break
-                iso = bumped
-                iso_bumped = True
-                self._camera.set_iso(iso)
-                continue
-            if fec_saturated_low:
-                # Over-exposing at FEC_MIN — bumping ISO would only
-                # make it worse. Accept current state.
+            if fec_saturated_high or fec_saturated_low:
+                # FEC tapped out. Try EC next; falls back to ISO.
+                # delta < 0 = under-exposed = need positive correction.
+                new_ec = _clamp(_snap(ec - delta, ec_step), ec_min, ec_max)
+                ec_saturated_low = (
+                    ec == ec_min and delta > cfg.TEST_SHOT_TOLERANCE_EV
+                )
+                ec_saturated_high = (
+                    ec == ec_max and delta < -cfg.TEST_SHOT_TOLERANCE_EV
+                )
+                if not (ec_saturated_low or ec_saturated_high):
+                    ec = new_ec
+                    if hasattr(self._camera, "set_ec"):
+                        self._camera.set_ec(ec)
+                    ec_used = True
+                    continue
+                # Both FEC and EC are at their respective limits.
+                if fec_saturated_high or ec_saturated_high:
+                    # Under-exposing at FEC_MAX + EC_MAX — bump ISO.
+                    bumped = next_iso(iso, ceiling=cfg.ISO_CEIL)
+                    if bumped == iso:
+                        saturated = True
+                        break
+                    iso = bumped
+                    iso_bumped = True
+                    self._camera.set_iso(iso)
+                    continue
+                # Over-exposing at FEC_MIN + EC_MIN — ISO can't help.
                 saturated = True
                 break
             fec = new_fec
@@ -284,6 +319,8 @@ class Calibrator:
             iso_bumped=iso_bumped,
             test_shots_taken=cfg.TEST_SHOT_MAX_RETRIES + 1,
             saturated_at_ceiling=saturated,
+            ec_ev=ec,
+            ec_used=ec_used,
         ), baseline
 
     # ---- Helpers ----------------------------------------------------------

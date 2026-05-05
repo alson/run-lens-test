@@ -39,6 +39,16 @@ FEC_MIN_EV = -3.0
 FEC_MAX_EV = +1.0
 FEC_STEP_EV = 1.0 / 3.0
 
+# ---- EC (camera exposure compensation, ⅓-stop) -----------------------------
+# On the Z7 with custom function e3 set to "Entire frame", camera EC
+# stacks additively with FEC for flash output. Calibration uses EC as
+# *fallback* once FEC saturates at FEC_MAX_EV but the rig still hasn't
+# reached the calibration target — extending the camera-side flash
+# headroom by another EC_MAX_EV stops before falling back to ISO.
+EC_MIN_EV = -3.0
+EC_MAX_EV = +3.0
+EC_STEP_EV = 1.0 / 3.0
+
 # ---- Camera startup ---------------------------------------------------------
 
 MIN_CONFIG_TREE_SIZE = 100

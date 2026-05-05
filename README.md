@@ -53,18 +53,23 @@ Read this section before each test session.
    may persist from a previous session.
 3. Set the **mode dial to M** (or U2 if U2 is configured for M). Do not use
    anything else — the program checks `expprogram == M` and aborts otherwise.
-4. Mount the **SB-5000 on the hot shoe in commander mode**, master output `--`,
+4. Confirm custom function **e3 = "Entire frame"** (not the default "Background
+   only"). The calibrator uses camera EC as a fallback when FEC saturates,
+   relying on EC stacking with FEC for flash output. With e3 = "Background
+   only" the EC fallback wouldn't reach the flash, leaving you 3 EV less
+   headroom in the closed loop.
+5. Mount the **SB-5000 on the hot shoe in commander mode**, master output `--`,
    group A in `A` (auto aperture) mode, group FEC = 0.
-5. Switch on the remote flashes (SB-800 + SB-5000), check ready light.
-6. **Power on the camera.** Wait for the rear screen to show live view.
-7. Half-press the shutter to confirm the camera is awake.
-8. **Now connect the USB cable from the camera to the laptop.** Plugging in
+6. Switch on the remote flashes (SB-800 + SB-5000), check ready light.
+7. **Power on the camera.** Wait for the rear screen to show live view.
+8. Half-press the shutter to confirm the camera is awake.
+9. **Now connect the USB cable from the camera to the laptop.** Plugging in
    before power-on tends to make the camera enumerate as a minimal MTP
    device and the program will refuse to start.
 
 If at any point the program reports "config tree too small — battery-pull
 recovery needed", that means the camera dropped into the minimal-MTP state
-and you need to repeat steps 1–8.
+and you need to repeat steps 1–9.
 
 ### Rig prep
 

@@ -518,17 +518,34 @@ class SessionRunner:
             shots_csv=self.shots_csv,
             now=self.now,
         )
-        cal_result = calibrator.run(
-            lens_dir=lens_dir,
-            lens_slug=slug,
-            session_id=self.session_id,
-            apertures=apertures,
-            baseline_median=self.baseline_median,
-        )
-        self.baseline_median = cal_result.baseline_median
-        if self.metadata is not None:
-            self.metadata.baseline_median_luminance = self.baseline_median
-            self._write_metadata()
+        # Calibration retry loop. If any aperture fails to reach
+        # tolerance, the user can adjust the rig and re-run
+        # calibration WITHOUT re-jogging — different from the
+        # off-target re-jog flow which redoes the whole sweep.
+        while True:
+            cal_result = calibrator.run(
+                lens_dir=lens_dir,
+                lens_slug=slug,
+                session_id=self.session_id,
+                apertures=apertures,
+                baseline_median=self.baseline_median,
+            )
+            self.baseline_median = cal_result.baseline_median
+            if self.metadata is not None:
+                self.metadata.baseline_median_luminance = self.baseline_median
+                self._write_metadata()
+            non_converged = [
+                ap for ap, c in cal_result.per_aperture.items()
+                if not c.hit_tolerance
+            ]
+            if not non_converged:
+                break
+            choice = self._handle_calibration_failure(
+                slug=slug, cal_result=cal_result, non_converged=non_converged,
+            )
+            if choice == "skip":
+                break
+            # choice == "rerun": loop and re-run calibration.
         write_json(
             lens_dir / "calibration.json",
             {
@@ -1098,7 +1115,17 @@ class SessionRunner:
         """
         n = max(1, int(getattr(self.config, "SHOTS_PER_STEP_APERTURE", 1)))
         self._set_capture_settings(aperture, cal)
-        evs: list[float] = []
+        # The droop detector wants EV relative to the *per-aperture
+        # calibration target* (cal.final_median), not relative to the
+        # session-wide reference baseline. Calibration may have
+        # converged a fraction of an EV under the reference; treating
+        # that gap as droop signal would risk false-positive trips on
+        # a perfectly stable setup. shots.csv keeps EV-vs-reference-
+        # baseline as the canonical log value (good for inter-session
+        # comparability); EV-vs-calibration is computed locally just
+        # for the droop push.
+        cal_reference = cal.final_median or self.baseline_median or 1.0
+        droop_evs: list[float] = []
         for replica in range(n):
             self._wait_for_recycle()
             dest = self._sweep_destination(
@@ -1115,7 +1142,8 @@ class SessionRunner:
                 replica_index=replica,
             )
             median = self._measure(dest)
-            ev = ev_delta(median, self.baseline_median or median)
+            ev_baseline = ev_delta(median, self.baseline_median or median)
+            ev_to_cal = ev_delta(median, cal_reference)
             self._log_shot(
                 slug=slug,
                 step_index=step_index,
@@ -1123,13 +1151,13 @@ class SessionRunner:
                 aperture=aperture,
                 cal=cal,
                 median=median,
-                ev=ev,
+                ev=ev_baseline,
                 filename=str(dest.relative_to(lens_dir)),
                 phase=phase,
             )
-            evs.append(ev)
-        evs.sort()
-        return evs[len(evs) // 2]  # median
+            droop_evs.append(ev_to_cal)
+        droop_evs.sort()
+        return droop_evs[len(droop_evs) // 2]  # median
 
     def _handle_droop(
         self,
@@ -1204,6 +1232,73 @@ class SessionRunner:
             )
         droop.reset_all()
         return reshot_current_step
+
+    def _handle_calibration_failure(
+        self,
+        *,
+        slug: str,
+        cal_result: CalibrationResult,
+        non_converged: list[str],
+    ) -> str:
+        """Alert + 3-way prompt when calibration didn't reach
+        tolerance on one or more apertures. Returns ``"rerun"`` to
+        run calibration again (caller loops; user has presumably
+        adjusted the rig in between) or ``"skip"`` to accept the
+        non-converged values and proceed. Raises
+        :class:`SessionAborted` on ``"abort"``.
+
+        Distinct from droop: the fix is rig adjustment (lighting
+        distance, commander group FEC, reference brightness), not
+        battery swaps.
+        """
+        lines = []
+        for ap in non_converged:
+            c = cal_result.per_aperture[ap]
+            saturated = " (lighting saturated)" if c.saturated_at_ceiling else ""
+            lines.append(
+                f"  {ap}: ev={c.final_ev_delta:+.2f}  "
+                f"FEC={c.fec_ev:+.2f}  EC={c.ec_ev:+.2f}  ISO={c.iso}"
+                f"{saturated}"
+            )
+        body = (
+            f"{slug}: calibration didn't reach tolerance on "
+            f"{len(non_converged)}/{len(cal_result.per_aperture)} apertures.\n"
+            + "\n".join(lines)
+        )
+        if self.ntfy is not None:
+            self.ntfy.with_body(
+                Notification(
+                    title="Calibration didn't converge",
+                    body="",
+                    priority="high",
+                    tags=("warning",),
+                ),
+                body,
+            )
+        wav_path = getattr(self.config, "ALERT_WAV", None)
+        if wav_path is not None:
+            try:
+                play_alert(wav_path)
+            except Exception:                            # noqa: BLE001
+                log.exception("alert sound failed")
+        choice = self.prompt_off_target(
+            f"\nCalibration didn't reach tolerance on "
+            f"{', '.join(non_converged)}.\n"
+            + "\n".join(lines)
+            + "\n\nThis is a *lighting* / *reference* issue, not a "
+            "battery droop. Adjust the rig (commander group FEC, "
+            "flash distance, or pick a dimmer "
+            "BASELINE_REFERENCE_IMAGE) before continuing. "
+            "[ENTER] re-run calibration after adjusting, "
+            "[s] proceed anyway with current values, "
+            "[q] abort: "
+        )
+        if choice == "abort":
+            raise SessionAborted("user aborted at calibration-failure prompt")
+        # prompt_off_target returns "rejog" / "skip" / "abort"; map
+        # "rejog" → "rerun" since calibration failure recalibrates
+        # without redoing the jog.
+        return "rerun" if choice == "rejog" else "skip"
 
     def _handle_off_target(self, *, slug: str, result) -> str:
         """Notify + prompt when every aperture's curve is flat.

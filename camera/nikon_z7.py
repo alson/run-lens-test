@@ -47,6 +47,26 @@ VR_WIDGET_CANDIDATES: tuple[str, ...] = (
 VR_OFF_CHOICES: tuple[str, ...] = ("Off", "OFF", "off", "Disabled", "0")
 
 
+def _format_ec_label(ev: float) -> str:
+    """Z7 widget label for an EC value in EV (⅓-stop grid).
+
+    Examples: ``0.0 → "0"``, ``+1.0 → "+1"``, ``+1.333 → "+1 1/3"``,
+    ``-1.667 → "-1 2/3"``.
+    """
+    if abs(ev) < 1e-9:
+        return "0"
+    sign = "+" if ev > 0 else "-"
+    a = abs(ev)
+    whole = int(a)
+    frac_third = round((a - whole) * 3)
+    if frac_third == 3:
+        whole += 1
+        frac_third = 0
+    if frac_third == 0:
+        return f"{sign}{whole}"
+    return f"{sign}{whole} {frac_third}/3"
+
+
 def _is_question_mark(value: object) -> bool:
     """Detect the transient ``'?'`` value the Z7 sometimes returns
     immediately after a burst of DevicePropChanged events."""
@@ -234,6 +254,40 @@ class NikonZ7:
 
     def set_fec(self, ev: float) -> None:
         self._set_range("flashexposurecompensation", float(ev))
+
+    def set_ec(self, ev: float) -> None:
+        """Set camera exposure compensation (in EV).
+
+        Some Z7 firmware exposes EC as a radio widget with string
+        choices like ``"+1"`` / ``"+1 1/3"`` / ``"-2"``; others as a
+        range. Try the radio path first (looking up the closest
+        ⅓-stop label) and fall back to the range setter."""
+        cfg = self.camera.get_config()
+        widget = find(cfg, "exposurecompensation")
+        if widget is None:
+            return
+        try:
+            wtype = widget.get_type()
+        except Exception:                                # noqa: BLE001
+            wtype = None
+        gp = self._gp
+        if wtype == getattr(gp, "GP_WIDGET_RANGE", None):
+            widget.set_value(float(ev))
+            self.camera.set_config(cfg)
+            self.drain_events()
+            return
+        # Radio: look up the closest ⅓-stop label. Z7 conventions:
+        # whole stops as "+1" / "-2"; thirds as "+1 1/3", "-1 2/3";
+        # zero as "0".
+        choices = widget_choices(widget)
+        label = _format_ec_label(ev)
+        if label not in choices:
+            # Try whole-stop fallback (round to nearest integer).
+            label = _format_ec_label(round(ev))
+        if label in choices:
+            widget.set_value(label)
+            self.camera.set_config(cfg)
+            self.drain_events()
 
     def set_aperture_iso_fec(
         self, *, aperture: str, iso: str | int, fec: float

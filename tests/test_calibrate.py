@@ -44,6 +44,9 @@ def cfg():
         FEC_MIN_EV=-3.0,
         FEC_MAX_EV=+1.0,
         FEC_STEP_EV=1.0 / 3.0,
+        EC_MIN_EV=-3.0,
+        EC_MAX_EV=+3.0,
+        EC_STEP_EV=1.0 / 3.0,
         TEST_SHOT_TOLERANCE_EV=1.0 / 3.0,
         TEST_SHOT_MAX_RETRIES=6,
     )
@@ -67,6 +70,9 @@ class FakeCamera:
 
     def set_fec(self, ev: float) -> None:
         self.history.append(("fec", float(ev)))
+
+    def set_ec(self, ev: float) -> None:
+        self.history.append(("ec", float(ev)))
 
     def capture_to(self, dest) -> int:
         self.last_dest = Path(dest)
@@ -207,19 +213,17 @@ class TestClosedLoop:
             round(ap.fec_ev / cfg.FEC_STEP_EV)
         )
 
-    def test_first_dim_shot_pushes_fec_to_max_before_iso_bump(
+    def test_first_dim_shot_pushes_fec_to_max_before_fallback(
         self, camera, cfg, tmp_path
     ) -> None:
-        # Regression: when the *first* test shot lands so dim that
-        # the requested correction exceeds FEC_MAX_EV, the calibrator
-        # used to misread the clamped target as "FEC already at max"
-        # and bump ISO instead of FEC, leaving FEC stuck at 0 forever.
-        # Now: first iteration sets FEC to FEC_MAX (+1); only if a
-        # subsequent shot is *still* under-exposed at FEC_MAX does ISO
-        # bump. Script: shot 0 dim → set FEC=+1 (no ISO bump yet),
-        # shot 1 still dim → bump ISO (now iso_bumped=True), shot 2
-        # comes back at baseline → hit tolerance.
-        medians = [25.0, 50.0, 100.0]  # ev: -2.0, -1.0, 0.0 vs baseline 100
+        # Regression for the FEC-saturation off-by-one: when the
+        # *first* test shot lands so dim that the requested
+        # correction exceeds FEC_MAX_EV, the calibrator used to
+        # misread the clamped target as "FEC already at max" and
+        # bump ISO instead of FEC, leaving FEC stuck at 0 forever.
+        # Now FEC reaches FEC_MAX before any fallback (EC then ISO)
+        # kicks in.
+        medians = [25.0, 50.0, 100.0]  # ev: -2.0, -1.0, 0.0
         calib = make_calibrator(camera, cfg, medians=medians)
         result = calib.run(
             lens_dir=tmp_path,
@@ -234,8 +238,33 @@ class TestClosedLoop:
         # FEC was set on the camera at least once with FEC_MAX_EV.
         fec_history = [v for k, v in camera.history if k == "fec"]
         assert cfg.FEC_MAX_EV in fec_history
-        # Came in well under tolerance after ISO + FEC dance.
+        # Tolerance hit via FEC + EC dance (not ISO yet — EC has
+        # plenty of headroom).
         assert ap.hit_tolerance is True
+        assert ap.ec_used is True
+        assert ap.iso_bumped is False
+
+    def test_iso_only_bumps_after_fec_and_ec_both_saturate(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        # Force a deficit larger than FEC_MAX + EC_MAX combined so
+        # the lever cascade is fully exercised: FEC pushed to max,
+        # then EC pushed to max, then ISO finally bumps.
+        # baseline 100, medians stay very dim:
+        # FEC_MAX=+1, EC_MAX=+3 → combined +4 EV — still ~6 EV short
+        # of where we'd land if shots kept reading 6/100 (-6 EV).
+        medians = [6.0] * 8
+        calib = make_calibrator(camera, cfg, medians=medians)
+        result = calib.run(
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            apertures=["f/4"],
+            baseline_median=100.0,
+        )
+        ap = result.per_aperture["f/4"]
+        assert ap.fec_ev == cfg.FEC_MAX_EV
+        assert ap.ec_ev == getattr(cfg, "EC_MAX_EV", 3.0)
         assert ap.iso_bumped is True
 
     def test_iso_bumps_when_fec_saturates_high(self, camera, cfg, tmp_path) -> None:
