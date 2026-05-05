@@ -78,6 +78,12 @@ class FakeTransport:
     def close(self) -> None:
         self.closed = True
 
+    def release_to_panel(self) -> None:
+        self.sent.append(_Sent(frame=Frame(sync=0, cmd=0, action=Action.READ, data=b"release"), expected_cmd=Cmd.RAIL_STATUS))
+
+    def take_from_panel(self) -> None:
+        self.sent.append(_Sent(frame=Frame(sync=0, cmd=0, action=Action.READ, data=b"take"), expected_cmd=Cmd.RAIL_STATUS))
+
 
 def _ok_response(cmd: Cmd, data: bytes = b"") -> Frame:
     return Frame(sync=SYNC_SLAVE, cmd=int(cmd), action=Action.RSP_OK, data=data)
@@ -331,3 +337,37 @@ class TestClose:
     ) -> None:
         controller.close()
         assert transport.closed is True
+
+
+class TestTakeFromPanel:
+    def test_drains_sticky_user_aborted_bit(
+        self, controller: StackShotController, transport: FakeTransport
+    ) -> None:
+        # The protocol's USER_ABORTED status bit is sticky and clears
+        # on read. Front-panel button activity during panel mode
+        # may set it; without an explicit drain on take_from_panel,
+        # the next USB-driven move's wait_until_idle would see the
+        # leftover bit and raise StackShotUserAborted spuriously.
+        # Script: take_from_panel triggers one status read which
+        # returns the user-aborted bit (clearing it). The subsequent
+        # move_and_wait sees a clean IDLE response.
+        transport.script(
+            _status_response(RailStatus.USER_ABORTED),  # drain on take_from_panel
+            _ok_response(Cmd.RAIL_MOVE),                # move command response
+            _status_response(RailStatus(0)),            # IDLE on first poll
+        )
+        controller.take_from_panel()
+        # No exception expected — bit was drained.
+        controller.move_and_wait(Direction.FORWARD, 1.0)
+
+    def test_drain_failure_is_swallowed(
+        self, controller: StackShotController, transport: FakeTransport
+    ) -> None:
+        # If the post-take_from_panel status read itself errors out,
+        # the call should not raise — it's best-effort. Subsequent
+        # moves still get the chance to read status normally.
+        transport.script(
+            StackShotProtocolError("transient transport error"),
+        )
+        # Should not raise.
+        controller.take_from_panel()

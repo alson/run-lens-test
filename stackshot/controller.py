@@ -201,8 +201,25 @@ class StackShotController:
         self._tx.release_to_panel()
 
     def take_from_panel(self) -> None:
-        """Re-acquire USB control after a :meth:`release_to_panel`."""
+        """Re-acquire USB control after a :meth:`release_to_panel`.
+
+        Drains the rail status once after the bit-mode toggle. The
+        ``RAIL_STATUS_USER_ABORTED`` bit is sticky and clears on read;
+        any front-panel button activity during panel mode (including
+        the rail's auto-stop logic when the user changes direction)
+        sets it. Without this drain, the *next* USB-driven move's
+        :meth:`wait_until_idle` would see the leftover bit and raise
+        :class:`StackShotUserAborted`, even though the user did not
+        actually abort the current session.
+        """
         self._tx.take_from_panel()
+        try:
+            self.get_status()
+        except Exception:                                # noqa: BLE001
+            # If the status read itself fails (e.g. transport not
+            # ready), ignore — the next legitimate poll will surface
+            # any real protocol error. The drain is best-effort.
+            pass
 
     # ---- Lifecycle --------------------------------------------------------
 
