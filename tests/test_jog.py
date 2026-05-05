@@ -48,8 +48,21 @@ def controller():
 
 
 def _scripted_reader(*chars: str):
+    """Build a read_key callable for tests. Compatible with both the
+    blocking signature (``read_key()``) and the non-blocking variant
+    (``read_key(0.0)``) the jog loop uses to drain queued keys."""
     queue = deque(chars)
-    return lambda: queue.popleft()
+
+    def _read(timeout=None):
+        if queue:
+            return queue.popleft()
+        # Empty queue: blocking would hang in production; tests should
+        # never reach this. Non-blocking returns None (drained).
+        if timeout is None:
+            raise IndexError("scripted reader exhausted")
+        return None
+
+    return _read
 
 
 # ---- _step_for_key --------------------------------------------------------
@@ -149,15 +162,84 @@ class TestJogLoopMovement:
         self, controller, keys: JogKeyMap
     ) -> None:
         write_status = MagicMock()
+        # Use distinct keys so the drain doesn't consolidate
+        # consecutive same-direction presses into one move.
         jog_loop(
             controller,
-            read_key=_scripted_reader("d", "d", "s"),
+            read_key=_scripted_reader("d", "A", "s"),
             write_status=write_status,
             keys=keys,
             set_key="s",
         )
         # Initial + 2 moves + final-after-zero = 4.
         assert write_status.call_count == 4
+
+
+class TestJogLoopDrainAfterMove:
+    """A held key generates ~30 Hz auto-repeat keystrokes that queue
+    in stdin while the rail is busy with a previous move. Without
+    drain, those queued moves fire after the user releases — running
+    into an end-stop. The loop drains them after each move."""
+
+    def test_consecutive_same_direction_keys_collapse_to_one_move(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        # Scripted as if the user briefly held 'd' (4 auto-repeats)
+        # then pressed 's' to set START.
+        jog_loop(
+            controller,
+            read_key=_scripted_reader("d", "d", "d", "d", "s"),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="s",
+        )
+        # Only ONE move — the first 'd'. The other three were drained
+        # and discarded.
+        assert controller.move_and_wait.call_count == 1
+        # Final position is 0.0 (after zero on 's'); rail moved +1 mm
+        # before zero.
+
+    def test_drain_keeps_first_different_key_as_pending(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        # Hold d (3 keys), then press 'A' (a fine backward step).
+        # Expect: one coarse forward move, then one fine backward move.
+        jog_loop(
+            controller,
+            read_key=_scripted_reader("d", "d", "d", "A", "e"),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        assert controller.move_and_wait.call_args_list == [
+            call(Direction.FORWARD, pytest.approx(1.0), backlash=True),
+            call(Direction.BACKWARD, pytest.approx(0.1), backlash=True),
+        ]
+        # Net: +1.0 - 0.1 = +0.9 mm.
+        assert controller._pos == pytest.approx(+0.9)
+
+    def test_drain_works_with_legacy_no_timeout_reader(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        """If a test passes a read_key callable that doesn't accept
+        ``timeout``, drain silently no-ops — the loop falls back to
+        the pre-drain behaviour."""
+        # Build a reader that ONLY accepts no-arg calls (TypeError on
+        # any positional arg). This mimics older test fixtures.
+        queue = deque(["d", "d", "s"])
+
+        def _legacy_read():
+            return queue.popleft()
+
+        jog_loop(
+            controller,
+            read_key=_legacy_read,
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="s",
+        )
+        # Drain TypeErrored, so both 'd's were processed individually.
+        assert controller.move_and_wait.call_count == 2
 
 
 class TestJogLoopAbort:

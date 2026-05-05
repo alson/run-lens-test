@@ -64,7 +64,7 @@ PANEL_RELEASE_KEY = " "
 def jog_loop(
     controller: StackShotController,
     *,
-    read_key: Callable[[], str],
+    read_key: Callable[..., str | None],
     write_status: Callable[[float, str], None],
     keys: JogKeyMap | None = None,
     set_key: str = "s",
@@ -78,7 +78,13 @@ def jog_loop(
         Object with :meth:`get_position`, :meth:`move_and_wait`. Movement
         is always ``backlash=True`` since the user reverses freely.
     read_key :
-        Returns a single character on each call. Blocks if no key.
+        Reads a single keystroke. Called as ``read_key()`` (or
+        equivalently ``read_key(None)``) to block until input is
+        available. Called as ``read_key(0.0)`` to return immediately
+        with whatever is queued, or ``None`` if nothing is. The
+        non-blocking form is used to drain queued same-direction
+        keystrokes after each movement so a held key doesn't queue
+        up post-release moves into an end-stop.
     write_status :
         Receives ``(position_mm, label)`` after every position change so
         the UI can redraw.
@@ -108,8 +114,13 @@ def jog_loop(
 
     position = controller.get_position()
     write_status(position, label)
+    pending_key: str | None = None
     while True:
-        key = read_key()
+        if pending_key is not None:
+            key = pending_key
+            pending_key = None
+        else:
+            key = read_key()
         if key == keys.abort_key:
             raise SessionAborted(f"jog aborted at {label}")
         if key == set_key:
@@ -136,6 +147,32 @@ def jog_loop(
         controller.move_and_wait(direction, abs(step), backlash=True)
         position = controller.get_position()
         write_status(position, label)
+        # Drain any queued same-direction keystrokes that piled up
+        # while the move ran (held key + ~30 Hz auto-repeat). Discard
+        # them so we don't run into an end-stop after release. Keep
+        # the first different keystroke for the next iteration.
+        pending_key = _drain_after_move(read_key, key)
+
+
+def _drain_after_move(
+    read_key: Callable[..., str | None],
+    moved_key: str,
+) -> str | None:
+    """Pop everything currently queued. Discard same-direction
+    keystrokes; return the first different keystroke (if any) so the
+    main loop processes it next."""
+    while True:
+        try:
+            extra = read_key(0.0)
+        except TypeError:
+            # read_key callable doesn't accept a timeout (legacy
+            # signature in some tests). Skip drain silently.
+            return None
+        if extra is None:
+            return None
+        if extra == moved_key:
+            continue
+        return extra
 
 
 def _release_to_panel(
@@ -195,13 +232,32 @@ def cbreak_stdin():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def _stdin_read_key() -> str:
-    """Block until one character is available on stdin and return it."""
-    return sys.stdin.read(1)
+def _stdin_read_key(timeout: float | None = None) -> str | None:
+    """Read one character from stdin.
+
+    ``timeout=None`` (the default) blocks until a character is
+    available. ``timeout=0.0`` returns immediately with whatever is
+    queued, or ``None`` if nothing is. ``timeout>0`` waits up to the
+    given number of seconds.
+
+    The non-blocking variants are used by the jog loop to drain
+    queued same-direction keystrokes after each move.
+    """
+    if timeout is None:
+        return sys.stdin.read(1)
+    import select
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if ready:
+        return sys.stdin.read(1)
+    return None
 
 
 def _stdout_write_status(position_mm: float, label: str) -> None:
-    sys.stdout.write(f"\r[{label}] position = {position_mm:+8.3f} mm   ")
+    # ``\x1b[K`` is ANSI "clear from cursor to end of line", so a
+    # shorter status doesn't leave trailing chars from a longer
+    # previous one (the panel-release status line is much longer
+    # than the keyboard status line).
+    sys.stdout.write(f"\r[{label}] position = {position_mm:+8.3f} mm\x1b[K")
     sys.stdout.flush()
 
 
