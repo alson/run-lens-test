@@ -9,6 +9,7 @@ from sharpness.planner import (
     DEFAULT_MAX_APERTURE,
     DEFAULT_REPLICAS,
     HIGH_MAG_THRESHOLD,
+    MIN_RAIL_STEP_MM,
     POSITIONS_ACROSS_FWHM_DEFAULT,
     POSITIONS_ACROSS_FWHM_HIGH_MAG,
     SamplePlan,
@@ -222,6 +223,43 @@ class TestPlanSweep:
         p = plan_sweep(1.0, 2.8, positions_across_fwhm=10)
         # step = FWHM / 10 = 0.0168 mm
         assert p.rail_step_mm == pytest.approx(0.0168, rel=1e-3)
+
+    def test_step_clamped_at_floor(self) -> None:
+        # Push parameters into a regime where the raw step would be
+        # below the StackShot's mechanical floor. With a tight custom
+        # min_step we can verify clamping without going to extreme M/N.
+        p = plan_sweep(1.0, 2.8, min_step_mm=0.05)
+        # raw step at M=1, N=2.8 is 0.0336 mm < 0.05 ⇒ clamp
+        assert p.step_clamped is True
+        assert p.rail_step_mm == pytest.approx(0.05, rel=1e-9)
+
+    def test_step_not_clamped_when_above_floor(self) -> None:
+        p = plan_sweep(1.0, 2.8)
+        # Default min is 5 µm; raw step at this regime is ~33.6 µm ⇒ no clamp
+        assert p.step_clamped is False
+        assert p.rail_step_mm > MIN_RAIL_STEP_MM
+
+    def test_extreme_high_mag_wide_open_clamps_at_default_floor(self) -> None:
+        # M=3, widest=f/1.4 → DOF tiny → raw step well under 5 µm
+        # DOF = 2 * 0.030 * 1.4 * 4 / 9 ≈ 0.0373 mm
+        # FWHM ≈ 0.0187 mm; high-mag density 8 ⇒ raw step ≈ 2.3 µm
+        p = plan_sweep(3.0, 1.4)
+        assert p.step_clamped is True
+        assert p.rail_step_mm == pytest.approx(MIN_RAIL_STEP_MM, rel=1e-9)
+
+    def test_clamp_affects_position_count(self) -> None:
+        # Same range, with vs without clamp ⇒ fewer positions when clamped
+        # (because step is rounded UP from raw).
+        p_unclamped = plan_sweep(1.0, 2.8, rail_range_mm=1.0, min_step_mm=1e-9)
+        p_clamped = plan_sweep(1.0, 2.8, rail_range_mm=1.0, min_step_mm=0.1)
+        assert p_clamped.rail_positions < p_unclamped.rail_positions
+        assert p_clamped.step_clamped is True
+
+    def test_invalid_min_step_raises(self) -> None:
+        with pytest.raises(ValueError, match="min_step_mm"):
+            plan_sweep(1.0, 2.8, min_step_mm=0)
+        with pytest.raises(ValueError, match="min_step_mm"):
+            plan_sweep(1.0, 2.8, min_step_mm=-1)
 
 
 # --- SamplePlan ---------------------------------------------------------

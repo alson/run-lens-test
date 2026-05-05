@@ -91,6 +91,16 @@ POSITIONS_ACROSS_FWHM_DEFAULT = 5
 POSITIONS_ACROSS_FWHM_HIGH_MAG = 8
 HIGH_MAG_THRESHOLD = 1.5
 
+# Practical lower bound on rail step in mm. The Cognisys StackShot
+# accepts arbitrarily small distances over the wire but the rail's
+# mechanical resolution (leadscrew pitch + motor backlash) is around
+# 2–5 µm; below ~5 µm the requested move starts disappearing into
+# mechanical noise. The planner clamps any recommended step at this
+# floor and reports ``step_clamped=True`` so the caller knows the
+# step would otherwise have been finer (and the actual sweep will
+# under-sample the bell at that point).
+MIN_RAIL_STEP_MM = 0.005
+
 
 @dataclass(frozen=True)
 class SamplePlan:
@@ -115,6 +125,7 @@ class SamplePlan:
     subsample_factors: dict[float, int] = field(default_factory=dict)
     rail_range_mm: float | None = None
     rail_positions: int | None = None
+    step_clamped: bool = False  # True when the StackShot floor was hit
 
     @property
     def total_shots(self) -> int | None:
@@ -219,6 +230,7 @@ def plan_sweep(
     coc_mm: float = DEFAULT_COC_MM,
     replicas: int = DEFAULT_REPLICAS,
     positions_across_fwhm: int | None = None,
+    min_step_mm: float = MIN_RAIL_STEP_MM,
 ) -> SamplePlan:
     """Recommend a rail step for the whole aperture sweep.
 
@@ -235,6 +247,13 @@ def plan_sweep(
     25-position-per-scenario data: 5 was enough at moderate mag,
     and 8 was needed for the high-mag narrow-peak case.
 
+    The recommended step is clamped at ``min_step_mm`` (default 5 µm,
+    the StackShot's mechanical noise floor). When the clamp fires
+    the returned plan has ``step_clamped=True`` and the caller
+    should expect the bell to be under-sampled at the widest
+    aperture — there's no way to physically do better with this
+    rail.
+
     Pass ``rail_range_mm`` to also get a position count for that
     range; otherwise just step size is returned.
     """
@@ -244,6 +263,8 @@ def plan_sweep(
         raise ValueError(
             f"max_aperture ({max_aperture}) must be ≥ widest_aperture ({widest_aperture})"
         )
+    if min_step_mm <= 0:
+        raise ValueError(f"min_step_mm must be positive, got {min_step_mm}")
 
     if positions_across_fwhm is None:
         if magnification >= HIGH_MAG_THRESHOLD:
@@ -253,7 +274,13 @@ def plan_sweep(
 
     dof = estimate_dof_mm(magnification, widest_aperture, coc_mm=coc_mm)
     fwhm = dof / 2
-    rail_step_mm = fwhm / positions_across_fwhm
+    raw_step = fwhm / positions_across_fwhm
+    if raw_step < min_step_mm:
+        rail_step_mm = min_step_mm
+        step_clamped = True
+    else:
+        rail_step_mm = raw_step
+        step_clamped = False
 
     factors = {
         ap: subsample_factor(ap, widest_aperture)
@@ -277,4 +304,5 @@ def plan_sweep(
         subsample_factors=factors,
         rail_range_mm=rail_range_mm,
         rail_positions=rail_positions,
+        step_clamped=step_clamped,
     )
