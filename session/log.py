@@ -39,6 +39,7 @@ class Phase(str, Enum):
     PROBE = "probe"
     EXTENSION = "extension"
     ABORTED = "aborted"
+    RESHOOT = "reshoot"
 
 
 # ---- Shot row --------------------------------------------------------------

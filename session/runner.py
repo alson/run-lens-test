@@ -609,6 +609,7 @@ class SessionRunner:
                 step_index=step_index,
                 step_count=steps,
                 position_mm=position_mm,
+                step_size_mm=step_size_mm,
                 apertures=apertures,
                 calibration=calibration,
                 droop=droop,
@@ -625,6 +626,7 @@ class SessionRunner:
         step_index: int,
         step_count: int,
         position_mm: float,
+        step_size_mm: float,
         apertures: list[str],
         calibration: CalibrationResult,
         droop: DroopDetector,
@@ -649,32 +651,28 @@ class SessionRunner:
                 aperture_index=ap_index,
                 aperture_count=len(apertures),
             )
-            self._set_capture_settings(aperture, cal)
-            self._wait_for_recycle()
-            dest = self._sweep_destination(lens_dir, aperture, step_index)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            self._last_capture_started_at = self.monotonic()
-            self._last_capture_aperture = aperture
-            self.camera.capture_to(dest)
-            self._record_sharpness(
-                step_index=step_index, aperture=aperture, dest=dest
-            )
-            median = self._measure(dest)
-            ev = ev_delta(median, self.baseline_median or median)
-            self._log_shot(
+            ev = self._capture_one(
+                lens_dir=lens_dir,
                 slug=slug,
                 step_index=step_index,
                 position_mm=position_mm,
                 aperture=aperture,
                 cal=cal,
-                median=median,
-                ev=ev,
-                filename=str(dest.relative_to(lens_dir)),
                 phase=Phase.SWEEP,
             )
-            event = droop.push(aperture, ev)
+            event = droop.push(aperture, ev, step_index=step_index)
             if event is not None:
-                self._handle_droop(event, droop)
+                self._handle_droop(
+                    event,
+                    droop,
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    current_step_index=step_index,
+                    current_position_mm=position_mm,
+                    step_size_mm=step_size_mm,
+                    apertures=apertures,
+                    calibration=calibration,
+                )
                 aborted = True
                 continue
 
@@ -1013,7 +1011,61 @@ class SessionRunner:
             return 0
         return int(round(position_mm / step_size_mm))
 
-    def _handle_droop(self, event: DroopEvent, droop: DroopDetector) -> None:
+    def _capture_one(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        step_index: int,
+        position_mm: float,
+        aperture: str,
+        cal: ApertureCalibration,
+        phase: Phase,
+    ) -> float:
+        """Apply settings, wait for recycle, capture, log to CSV.
+
+        Returns the EV delta of the just-captured shot. Used by the
+        main sweep, the droop-recovery reshoot, and any other path
+        that needs to record a single sweep-style frame.
+        """
+        self._set_capture_settings(aperture, cal)
+        self._wait_for_recycle()
+        dest = self._sweep_destination(lens_dir, aperture, step_index)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        self._last_capture_started_at = self.monotonic()
+        self._last_capture_aperture = aperture
+        self.camera.capture_to(dest)
+        self._record_sharpness(
+            step_index=step_index, aperture=aperture, dest=dest
+        )
+        median = self._measure(dest)
+        ev = ev_delta(median, self.baseline_median or median)
+        self._log_shot(
+            slug=slug,
+            step_index=step_index,
+            position_mm=position_mm,
+            aperture=aperture,
+            cal=cal,
+            median=median,
+            ev=ev,
+            filename=str(dest.relative_to(lens_dir)),
+            phase=phase,
+        )
+        return ev
+
+    def _handle_droop(
+        self,
+        event: DroopEvent,
+        droop: DroopDetector,
+        *,
+        lens_dir: Path,
+        slug: str,
+        current_step_index: int,
+        current_position_mm: float,
+        step_size_mm: float,
+        apertures: list[str],
+        calibration: CalibrationResult,
+    ) -> None:
         if self.ntfy is not None:
             self.ntfy.with_body(
                 BATTERY_DROOP,
@@ -1039,7 +1091,74 @@ class SessionRunner:
         )
         if not ok:
             raise SessionAborted("user aborted at droop pause")
+        # Find the earliest step (across all apertures) whose EV ≤
+        # the firing trip threshold. That's the first under-exposed
+        # shot we trust the user wants to overwrite with a fresh
+        # capture. ``window_snapshot`` is the firing aperture's
+        # window only; ``earliest_underexposed_step`` consults all.
+        restart_step = droop.earliest_underexposed_step(event.threshold)
+        if restart_step is not None and restart_step < current_step_index:
+            self._reshoot_steps(
+                lens_dir=lens_dir,
+                slug=slug,
+                from_step=restart_step,
+                through_step=current_step_index,
+                from_position_mm=current_position_mm,
+                step_size_mm=step_size_mm,
+                apertures=apertures,
+                calibration=calibration,
+            )
         droop.reset_all()
+
+    def _reshoot_steps(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        from_step: int,
+        through_step: int,
+        from_position_mm: float,
+        step_size_mm: float,
+        apertures: list[str],
+        calibration: CalibrationResult,
+    ) -> None:
+        """Move the rail back and overwrite the captured shots in
+        ``[from_step, through_step]`` (inclusive) with fresh frames.
+
+        The original under-exposed JPEGs are overwritten in place
+        (filenames are deterministic from step_index). New
+        ``shots.csv`` rows are appended with ``phase=reshoot`` so
+        downstream analysis can prefer them. EVs collected during
+        reshoot are *not* fed back into the droop detector — its
+        windows are reset by the caller after this returns.
+        """
+        self._announce(
+            f"Reshooting steps {from_step}..{through_step} after droop "
+            "(overwriting under-exposed frames)..."
+        )
+        # Move rail backward to from_step's position with backlash
+        # compensation (we're reversing direction).
+        self._move_to(from_position_mm, from_step * step_size_mm)
+        sweep_direction = (
+            Direction.FORWARD if step_size_mm >= 0 else Direction.BACKWARD
+        )
+        for step_index in range(from_step, through_step + 1):
+            if step_index > from_step:
+                self.rail.move_and_wait(
+                    sweep_direction, abs(step_size_mm), backlash=False
+                )
+            position_mm = step_index * step_size_mm
+            for aperture in apertures:
+                cal = calibration.per_aperture[aperture]
+                self._capture_one(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    step_index=step_index,
+                    position_mm=position_mm,
+                    aperture=aperture,
+                    cal=cal,
+                    phase=Phase.RESHOOT,
+                )
 
     def _log_aborted_remainder(
         self,

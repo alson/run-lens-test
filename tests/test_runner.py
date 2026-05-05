@@ -518,6 +518,50 @@ class TestDroopPause:
         with pytest.raises(SessionAborted):
             runner.run()
 
+    def test_resume_reshoots_from_first_underexposed_step(
+        self, cfg, tmp_path
+    ) -> None:
+        # 5-step single-aperture sweep. Step 1 is the first
+        # under-exposed shot (median 30 → ≈ -3.8 EV). Step 3 is the
+        # second sample ≤ -2 EV which trips criterion B. On resume
+        # the runner should rewind to step 1 and reshoot steps
+        # 1..3 inclusive (the trigger step). Step 0 is fine, so
+        # reshoot doesn't touch it.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        medians = [
+            100.0,    # calibration baseline
+            100.0,    # step 0 sweep  (ev = 0)
+            30.0,     # step 1 sweep  (ev ≈ -3.8) — first under-exposed
+            100.0,    # step 2 sweep
+            25.0,     # step 3 sweep  (ev ≈ -4.4) — 2nd ≤ -2 EV → trip
+            100.0,    # reshoot step 1
+            100.0,    # reshoot step 2
+            100.0,    # reshoot step 3
+            100.0,    # step 4 sweep (continues after reshoot)
+        ]
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 5, "end_mm": 4.0},
+        )
+        runner.confirm = lambda _msg: True   # always resume on droop prompt
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        reshoot_rows = [r for r in rows if r["phase"] == "reshoot"]
+        assert len(sweep_rows) == 5
+        # Reshoot covers steps 1..3 inclusive (the trigger step is 3).
+        assert [int(r["rail_step"]) for r in reshoot_rows] == [1, 2, 3]
+        for r in reshoot_rows:
+            assert r["filename"].endswith(".jpg")
+
 
 # ---- Lens-change recovery -------------------------------------------------
 
