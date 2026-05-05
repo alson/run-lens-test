@@ -1186,6 +1186,11 @@ class SessionRunner:
             restart_step is not None and restart_step < current_step_index
         )
         if reshot_current_step:
+            # Reset the droop window before recursing so the nested
+            # reshoot starts from a clean slate; if its captures are
+            # still under-exposed the new samples will trip droop
+            # again and recurse further.
+            droop.reset_all()
             self._reshoot_steps(
                 lens_dir=lens_dir,
                 slug=slug,
@@ -1195,6 +1200,7 @@ class SessionRunner:
                 step_size_mm=step_size_mm,
                 apertures=apertures,
                 calibration=calibration,
+                droop=droop,
             )
         droop.reset_all()
         return reshot_current_step
@@ -1302,6 +1308,7 @@ class SessionRunner:
         step_size_mm: float,
         apertures: list[str],
         calibration: CalibrationResult,
+        droop: DroopDetector,
     ) -> None:
         """Move the rail back and overwrite the captured shots in
         ``[from_step, through_step]`` (inclusive) with fresh frames.
@@ -1309,9 +1316,15 @@ class SessionRunner:
         The original under-exposed JPEGs are overwritten in place
         (filenames are deterministic from step_index). New
         ``shots.csv`` rows are appended with ``phase=reshoot`` so
-        downstream analysis can prefer them. EVs collected during
-        reshoot are *not* fed back into the droop detector — its
-        windows are reset by the caller after this returns.
+        downstream analysis can prefer them.
+
+        EVs collected during the reshoot **are** pushed into ``droop``
+        — a still-weak flash only reveals itself by firing again,
+        and that's only visible during a capture. If droop trips
+        again mid-reshoot, ``_handle_droop`` recurses into another
+        :meth:`_reshoot_steps` call covering ``[new_earliest,
+        current_step_index]``; on return this loop continues from
+        ``current_step_index + 1``.
         """
         # Step numbering in user-facing messages matches the
         # progress bar's 1-based count.
@@ -1319,6 +1332,29 @@ class SessionRunner:
             f"Reshooting steps {from_step + 1}..{through_step + 1} after droop "
             "(overwriting under-exposed frames)..."
         )
+        # Drop the now-stale shots.csv rows up front: the original
+        # phase=sweep / aborted rows for the reshot range describe
+        # files that this reshoot is about to overwrite, and any
+        # phase=reshoot rows from a partial earlier-reshoot attempt
+        # (in the recursive case where droop fired during reshoot)
+        # are also stale. Doing the drop at the *start* — instead of
+        # only at the end — keeps the CSV consistent across nested
+        # reshoots: each level wipes the bad rows from the previous
+        # attempt before adding fresh ones.
+        if self.shots_csv is not None:
+            steps_set = set(range(from_step, through_step + 1))
+            stale_phases = {
+                Phase.SWEEP.value,
+                Phase.ABORTED.value,
+                Phase.RESHOOT.value,
+            }
+            self.shots_csv.drop_rows(
+                lambda r: (
+                    r.get("lens_config_slug") == slug
+                    and r.get("phase") in stale_phases
+                    and self._safe_int(r.get("rail_step")) in steps_set
+                )
+            )
         # Drop the (already-cropped) under-exposed samples at the
         # reshoot range from the in-memory collector dataset; the
         # reshoot's record_shot calls will re-add fresh samples.
@@ -1349,9 +1385,13 @@ class SessionRunner:
                     sweep_direction, abs(step_size_mm), backlash=False
                 )
             position_mm = step_index * step_size_mm
+            skip_remainder = False
             for aperture in apertures:
+                if skip_remainder:
+                    # An inner reshoot already covered this step.
+                    continue
                 cal = calibration.per_aperture[aperture]
-                self._capture_one(
+                ev = self._capture_one(
                     lens_dir=lens_dir,
                     slug=slug,
                     step_index=step_index,
@@ -1360,23 +1400,24 @@ class SessionRunner:
                     cal=cal,
                     phase=Phase.RESHOOT,
                 )
-        # Drop the now-stale shots.csv rows: the original
-        # phase=sweep rows for the reshot range described files that
-        # have been overwritten on disk, and any phase=aborted rows
-        # in the same range (from the inner aperture loop after the
-        # droop trip) refer to apertures the reshoot covered. Done
-        # *after* the reshoot loop so a crashed reshoot leaves an
-        # audit trail rather than blank rows.
-        if self.shots_csv is not None:
-            steps_set = set(range(from_step, through_step + 1))
-            stale_phases = {Phase.SWEEP.value, Phase.ABORTED.value}
-            self.shots_csv.drop_rows(
-                lambda r: (
-                    r.get("lens_config_slug") == slug
-                    and r.get("phase") in stale_phases
-                    and self._safe_int(r.get("rail_step")) in steps_set
-                )
-            )
+                event = droop.push(aperture, ev, step_index=step_index)
+                if event is not None:
+                    covered = self._handle_droop(
+                        event,
+                        droop,
+                        lens_dir=lens_dir,
+                        slug=slug,
+                        current_step_index=step_index,
+                        current_position_mm=position_mm,
+                        step_size_mm=step_size_mm,
+                        apertures=apertures,
+                        calibration=calibration,
+                    )
+                    if covered:
+                        # Nested reshoot covered everything up
+                        # through this step; stop hitting it again
+                        # and let the outer for-loop move forward.
+                        skip_remainder = True
 
     @staticmethod
     def _safe_int(value) -> int | None:
