@@ -30,7 +30,7 @@ For each lens configuration the user defines:
 
 | Component | Connection |
 |--|--|
-| Nikon Z7 | USB to laptop. Used for capture and all camera control. |
+| Nikon Z7 | USB to laptop. Used for capture and all camera control. **Requires a USB 3.0 (5 Gbps) or faster cable.** USB 2.0 cables negotiate the link at 480M, which can't reliably sustain the 12 MB/frame bulk transfer — capture appears to succeed (shutter fires, flashes go off) but the post-capture file retrieval errors with `PTP General Error / I/O problem` and wedges the gphoto2 USB session. Verified working: 5 Gbps USB-A-to-C cable; 40 Gbps USB-C-to-C cable. Check post-plug with `lsusb -t` — the Z7's interface should show `5000M` (or higher), not `480M`. |
 | StackShot rail | USB serial to laptop. Used for motion control. |
 | SB-5000 | Hot shoe on Z7, **commander mode**, master output `--`. |
 | SB-800 + SB-5000 (remotes) | Optical slaves, A mode, channel/group matching commander. |
@@ -168,6 +168,7 @@ All tunable constants are at the top of `config.py`. Notable ones:
 | Symptom | Likely cause | Fix |
 |--|--|--|
 | "Config tree too small" at startup | Camera came up in minimal-MTP mode | Battery-pull recovery (camera prep §1–8). |
+| `PTP General Error` / `I/O problem` on capture (camera fires but file transfer fails) | USB 2.0 cable on the Z7; can't sustain 12 MB bulk transfer | Use a USB 3.0+ cable. Confirm with `lsusb -t` shows the Z7 at `5000M`, not `480M`. |
 | "Camera not in M mode" | Mode dial wrong, or U2 bank reset | Set dial to M. |
 | FEC sanity check fails | SU-800 mounted instead of SB-5000, or lens cap on | Check commander; confirm flashes fire. |
 | All test shots have similar luminance | Crop is on a saturated highlight, or ambient overwhelming flash | Verify overlay JPEG; close room blinds; check wafer position. |

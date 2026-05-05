@@ -353,7 +353,15 @@ class NikonZ7:
 def _cli() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Nikon Z7 health check / capture")
+    parser = argparse.ArgumentParser(
+        description="Nikon Z7 health check / capture",
+        epilog=(
+            "The Z7 is fragile about init/exit cycles (see DESIGN_NOTES). "
+            "Pass --health and --capture together rather than running this "
+            "tool twice — each fresh init has a non-zero chance of leaving "
+            "the camera in a half-state that requires a battery pull."
+        ),
+    )
     parser.add_argument("--health", action="store_true",
                         help="run verify_healthy and print key properties")
     parser.add_argument("--capture", type=str, default=None,
@@ -363,16 +371,27 @@ def _cli() -> None:
     cam = NikonZ7()
     cam.open()
     try:
-        if args.health or args.capture is None:
-            cam.verify_healthy()
-            cfg = cam.camera.get_config()
-            print(f"config tree widgets: {count_widgets(cfg)}")
-            for prop in ("expprogram", "iso", "f-number", "shutterspeed",
-                         "flashexposurecompensation"):
-                w = find(cfg, prop)
-                v = w.get_value() if w else "<missing>"
-                print(f"  {prop} = {v!r}")
+        # Always print the health diagnostic so a single invocation
+        # gives both. The camera is fragile about repeated init/exit
+        # cycles — combining flags keeps the smoke test to one cycle.
+        cam.verify_healthy()
+        cfg = cam.camera.get_config()
+        print(f"config tree widgets: {count_widgets(cfg)}")
+        for prop in ("expprogram", "iso", "f-number", "shutterspeed",
+                     "flashexposurecompensation"):
+            w = find(cfg, prop)
+            # Compare against None explicitly: SWIG-wrapped
+            # CameraWidget proxies are falsy in some configs even
+            # when they're a valid widget object.
+            v = w.get_value() if w is not None else "<missing>"
+            print(f"  {prop} = {v!r}")
         if args.capture:
+            # Apply the same session config the production runner
+            # uses — most importantly capturetarget=Internal RAM, so
+            # capture() doesn't try to write to the SD card slot
+            # (which can wedge the USB session if the camera flips
+            # to a different storage backend mid-session).
+            cam.apply_session_config()
             size = cam.capture_to(args.capture)
             print(f"captured {size} bytes to {args.capture}")
     finally:
