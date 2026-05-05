@@ -150,6 +150,27 @@ class TestFirstCall:
         assert result.peak_side == "far"
         assert result.needs_extension is True
 
+    def test_all_flat_yields_all_off_target(self, cfg) -> None:
+        # Every crop's series is flat (max/min < FLAT_RATIO) at every
+        # aperture. The aggregated RangeResult must surface
+        # all_off_target=True so the runner can prompt for re-jog
+        # instead of silently accepting a meaningless OK.
+        flat = [1000] * 7
+        samples = []
+        for ap in (4.0, 8.0, 16.0):
+            samples.extend(_samples_for_aperture(ap, flat))
+        dataset = FakeCollector(samples=samples)
+        checker = SharpnessRangeChecker(cfg, collector=dataset)
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=1.0, apertures=["f/4", "f/8", "f/16"],
+        )
+        assert result.all_off_target is True
+        # ok stays False (the data is *not* good); no extension is
+        # warranted since extending wouldn't add signal.
+        assert result.ok is False
+        assert result.needs_extension is False
+
     def test_falling_series_means_near(self, cfg) -> None:
         dataset = FakeCollector(
             samples=_samples_for_aperture(8.0, _falling(7))

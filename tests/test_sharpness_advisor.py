@@ -76,6 +76,27 @@ class TestAdvise:
         # The worst-case crop should drive extra_steps
         assert rec.extra_steps >= 2
 
+    def test_all_off_target_yields_off_target_verdict(self) -> None:
+        # Every crop is flat. The aperture has no truncated crops AND
+        # no real-peak crops, so the verdict is OFF_TARGET (not OK).
+        flat = [70] * len(BELL)
+        ds = _dataset(
+            {
+                8.0: {
+                    "center": flat,
+                    "left-edge": flat,
+                    "right-edge": flat,
+                    "bottom-edge": flat,
+                }
+            }
+        )
+        rec = advise(ds)[8.0]
+        assert rec.verdict == Verdict.OFF_TARGET
+        assert rec.direction == Direction.NONE
+        assert rec.extra_steps == 0
+        assert "OFF_TARGET" in rec.summary()
+        assert "no focus signal" in rec.summary()
+
     def test_off_target_alone_does_not_trigger_reshoot(self) -> None:
         # 4 on-target bells + 1 off-target flat crop ⇒ scenario is OK
         ds = _dataset(

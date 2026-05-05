@@ -73,6 +73,13 @@ class RangeResult:
     """Free text for the persisted ``range_check.json`` and any
     user-visible messages."""
 
+    all_off_target: bool = False
+    """Every aperture's sharpness curve is flat — no real focus
+    signal anywhere in the sweep. Distinct from ``ok=True`` (a real
+    peak comfortably inside the range). The runner treats this as a
+    re-jog request: extending won't help if there's no signal at
+    all; the user almost certainly needs a different START/END."""
+
     per_aperture: list[ApertureCurve] = field(default_factory=list)
     """The curves the detector built; useful for diagnostics."""
 

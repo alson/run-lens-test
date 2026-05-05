@@ -50,6 +50,13 @@ class Direction(str, Enum):
 class Verdict(str, Enum):
     OK = "OK"
     NEEDS_RESHOOT = "NEEDS_RESHOOT"
+    OFF_TARGET = "OFF_TARGET"
+    """No crop in this aperture has a real bell curve — every series
+    is flat (max/min < DEFAULT_FLAT_RATIO) or the cross-compare flag
+    rejected it. Either the rail spans an entirely out-of-focus
+    region or the test target lacks micro-detail at every crop
+    location. The runner treats this as a re-jog signal at the
+    session level when *all* apertures land here."""
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,11 @@ class Recommendation:
             n_off = len(self.off_target_crops)
             base = f"f/{self.aperture:g}: OK"
             return base + (f" ({n_off} off-target crops ignored)" if n_off else "")
+        if self.verdict == Verdict.OFF_TARGET:
+            return (
+                f"f/{self.aperture:g}: OFF_TARGET — every crop is flat; "
+                "no focus signal in this sweep"
+            )
         crops = ", ".join(c.crop_name for c in self.truncated_crops)
         if self.direction == Direction.EXTEND_FORWARD:
             arrow = "extend forward (further past start position)"
@@ -114,7 +126,21 @@ def _build_recommendation(
     aperture: float, analyses: list[CropAnalysis]
 ) -> Recommendation:
     truncated = tuple(c for c in analyses if c.status.is_truncated)
-    if not truncated:
+    if truncated:
+        direction = _direction_for(truncated)
+        extra = _extra_steps_for(truncated)
+        return Recommendation(
+            aperture=aperture,
+            verdict=Verdict.NEEDS_RESHOOT,
+            direction=direction,
+            extra_steps=extra,
+            crop_analyses=tuple(analyses),
+        )
+    # No truncated crops. Distinguish "every crop has a real peak in
+    # range" (OK) from "every crop is flat / off-target" (OFF_TARGET).
+    # If even one crop reports CropStatus.OK the aperture has signal.
+    has_real_peak = any(c.status == CropStatus.OK for c in analyses)
+    if has_real_peak:
         return Recommendation(
             aperture=aperture,
             verdict=Verdict.OK,
@@ -122,13 +148,11 @@ def _build_recommendation(
             extra_steps=0,
             crop_analyses=tuple(analyses),
         )
-    direction = _direction_for(truncated)
-    extra = _extra_steps_for(truncated)
     return Recommendation(
         aperture=aperture,
-        verdict=Verdict.NEEDS_RESHOOT,
-        direction=direction,
-        extra_steps=extra,
+        verdict=Verdict.OFF_TARGET,
+        direction=Direction.NONE,
+        extra_steps=0,
         crop_analyses=tuple(analyses),
     )
 

@@ -443,6 +443,128 @@ class TestProbeFails:
         assert "user aborted" in rc["notes"]
 
 
+class TestOffTarget:
+    """All apertures' curves are flat — the runner must alert and
+    prompt for a re-jog instead of treating the result as OK."""
+
+    def test_skip_records_off_target_marker(self, cfg, tmp_path) -> None:
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        prompts: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.prompt_off_target = (
+            lambda msg: (prompts.append(msg), "skip")[1]
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="centered",
+                        needs_extension=False,
+                        all_off_target=True,
+                        notes="all flat"),
+        ])
+        _run_one_lens_config(runner)
+
+        assert any("off-target" in p.lower() for p in prompts)
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["all_off_target"] is True
+        assert rc["rejog_requested"] is False
+        assert "user accepted" in rc["notes"]
+
+    def test_rejog_re_runs_sweep_with_new_range(self, cfg, tmp_path) -> None:
+        # First sweep: 3 steps over 20mm. Off-target prompt fires;
+        # user picks 'rejog'. Test jog injects a new 30mm range with
+        # 4 steps. Second sweep is OK -> normal flow proceeds.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        prompts: list[str] = []
+
+        # The custom jog: first call returns 20mm; on the re-jog it
+        # returns 30mm. The make_runner's default jog isn't reused
+        # here because we need it to change between calls.
+        from session.runner import JogResult
+        jog_calls = {"n": 0}
+
+        def _jog(rail: FakeRail) -> JogResult:
+            jog_calls["n"] += 1
+            end = 20.0 if jog_calls["n"] == 1 else 30.0
+            rail.position_mm = end
+            return JogResult(end_mm=end)
+
+        # Step counts: first call returns 3, second returns 4
+        # (re-jog asks again).
+        step_calls = {"n": 0}
+
+        def _step_count() -> int:
+            step_calls["n"] += 1
+            return 3 if step_calls["n"] == 1 else 4
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"lens": "L"},
+        )
+        runner.jog = _jog
+        runner.prompt_step_count = _step_count
+        runner.prompt_off_target = (
+            lambda msg: (prompts.append(msg), "rejog")[1]
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="centered",
+                        needs_extension=False,
+                        all_off_target=True,
+                        notes="all flat (first sweep)"),
+            RangeResult(ok=True, peak_side="centered",
+                        needs_extension=False,
+                        notes="ok (after re-jog)"),
+        ])
+
+        def _prompt_lens(calls={"n": 0}) -> str | None:
+            calls["n"] += 1
+            return "L" if calls["n"] == 1 else None
+
+        runner.prompt_lens_config = _prompt_lens
+        runner.run()
+
+        # Two sweeps' worth of captures: 1 cal + 3 sweep + 1 cal-skip + 4 sweep
+        # Calibration runs once (preserved across re-jog), so total =
+        # 1 cal + 3 first sweep + 4 re-sweep = 8.
+        capture_count = sum(1 for k, _ in camera.history if k == "capture")
+        assert capture_count == 8
+        # The off-target prompt fired once.
+        assert len(prompts) == 1
+        # range_check.json reflects the *second* run's state (final
+        # ok=True, no off-target marker).
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc.get("all_off_target") is not True
+        assert rc["ok"] is True
+
+    def test_abort_raises_session_aborted(self, cfg, tmp_path) -> None:
+        from errors import SessionAborted
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.prompt_off_target = lambda msg: "abort"
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="centered",
+                        needs_extension=False,
+                        all_off_target=True,
+                        notes="all flat"),
+        ])
+        with pytest.raises(SessionAborted):
+            _run_one_lens_config(runner)
+
+
 # ---- Step-index helper math -----------------------------------------------
 
 

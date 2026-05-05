@@ -131,6 +131,10 @@ class SharpnessRangeChecker(RangeChecker):
         is_second_call: bool,
     ) -> RangeResult:
         verdict_ok = all(r.verdict == Verdict.OK for r in recs.values())
+        all_off_target = (
+            len(recs) > 0
+            and all(r.verdict == Verdict.OFF_TARGET for r in recs.values())
+        )
         peak_side = self._aggregate_peak_side(recs)
         per_aperture = self._build_curves(
             apertures=apertures, dataset=dataset, step_size_mm=step_size_mm
@@ -142,6 +146,7 @@ class SharpnessRangeChecker(RangeChecker):
             needs_extension=(not verdict_ok) and peak_side != "centered",
             peak_in_range_after_probe=is_second_call and verdict_ok,
             notes=notes,
+            all_off_target=all_off_target,
             per_aperture=per_aperture,
         )
 

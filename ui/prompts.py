@@ -148,3 +148,29 @@ def prompt_range_inadequate(
     if t in ("s", "skip", "n", "no"):
         return "skip"
     return "extend"
+
+
+def prompt_off_target(
+    prompt: str,
+    *,
+    input_func: InputFunc = input,
+) -> str:
+    """Three-way prompt for the all-off-target decision.
+
+    Returns one of:
+    * ``"rejog"`` — ENTER (default): re-jog START / END and re-sweep
+      this lens config; calibration is preserved.
+    * ``"skip"`` — ``s`` / ``skip``: accept the flat data as-is and
+      continue to the lens-change prompt anyway.
+    * ``"abort"`` — ``q`` / EOF.
+    """
+    try:
+        text = input_func(prompt)
+    except EOFError:
+        return "abort"
+    t = text.strip().lower()
+    if t in ("q", "quit", "abort"):
+        return "abort"
+    if t in ("s", "skip", "n", "no"):
+        return "skip"
+    return "rejog"

@@ -53,10 +53,18 @@ from stackshot.protocol import Direction
 from ui.prompts import (
     confirm,
     prompt_lens_config,
+    prompt_off_target,
     prompt_range_inadequate,
     prompt_step_count,
     slugify_lens_config,
 )
+
+
+class _RejogRequested(Exception):
+    """Internal signal: user picked re-jog at the all-off-target
+    prompt. Caught by ``_run_one_lens_config_inner`` to redo the
+    sweep with a new START / END inside the same lens-config run.
+    Calibration data is preserved across re-jogs."""
 
 log = logging.getLogger(__name__)
 
@@ -237,6 +245,9 @@ class SessionRunner:
     confirm: Callable[[str], bool] = field(default_factory=lambda: confirm)
     prompt_range_inadequate: Callable[[str], str] = field(
         default_factory=lambda: prompt_range_inadequate
+    )
+    prompt_off_target: Callable[[str], str] = field(
+        default_factory=lambda: prompt_off_target
     )
     jog: JogStartEnd | None = None
     droop_detector: DroopDetector | None = None
@@ -526,34 +537,45 @@ class SessionRunner:
             },
         )
 
-        # Sweep.
-        self._announce(
-            f"Sweeping {slug}: {steps} steps × {len(apertures)} apertures..."
-        )
-        self._run_sweep(
-            lens_dir=lens_dir,
-            slug=slug,
-            steps=steps,
-            step_size_mm=step_size_mm,
-            calibration=cal_result,
-            apertures=apertures,
-        )
-
-        # Range check + optional probe + optional extension sweep.
-        # Returns the total number of forward steps the rail has moved
-        # (original sweep + any extension), so we know how far back to
-        # go to reach position 0.
-        forward_steps_done = steps - 1
-        if self.range_checker is not None:
-            forward_steps_done = self._run_range_check_and_extend(
+        # Sweep + range-check loop. The off-target prompt may ask
+        # the user to re-jog and re-sweep this lens config; that path
+        # raises ``_RejogRequested`` to bring us back here with a
+        # fresh range, fresh collector, and the rail back at step 0.
+        # Calibration is preserved across re-jogs.
+        while True:
+            self._announce(
+                f"Sweeping {slug}: {steps} steps × {len(apertures)} apertures..."
+            )
+            self._run_sweep(
                 lens_dir=lens_dir,
                 slug=slug,
-                end_mm=end_mm,
-                step_size_mm=step_size_mm,
                 steps=steps,
+                step_size_mm=step_size_mm,
                 calibration=cal_result,
                 apertures=apertures,
             )
+
+            forward_steps_done = steps - 1
+            if self.range_checker is not None:
+                try:
+                    forward_steps_done = self._run_range_check_and_extend(
+                        lens_dir=lens_dir,
+                        slug=slug,
+                        end_mm=end_mm,
+                        step_size_mm=step_size_mm,
+                        steps=steps,
+                        calibration=cal_result,
+                        apertures=apertures,
+                    )
+                except _RejogRequested:
+                    # User wants new START / END; rewind, recreate
+                    # the collector, rerun the sweep loop.
+                    end_mm, steps, step_size_mm = self._rejog_for_lens_config(
+                        lens_dir=lens_dir,
+                        current_position_mm=(steps - 1) * step_size_mm,
+                    )
+                    continue
+            break
 
         # Return rail to 0 for the next lens config (backlash on; we
         # may have moved into negative territory if the extension was
@@ -709,6 +731,41 @@ class SessionRunner:
             step_size_mm=step_size_mm,
             apertures=apertures,
         )
+        # Off-target before any extension flow: the sharpness curves
+        # are flat at every aperture, so extending the range won't
+        # help — the user's START / END is on a featureless area or
+        # entirely out of the lens's depth-of-field. Alert and
+        # offer re-jog.
+        if getattr(result, "all_off_target", False):
+            choice = self._handle_off_target(slug=slug, result=result)
+            if choice == "rejog":
+                # Persist what we know before re-jogging so the
+                # off-target sweep is at least documented on disk.
+                write_json(lens_dir / "range_check.json", {
+                    "ok": False,
+                    "peak_side": result.peak_side,
+                    "extension_applied": False,
+                    "all_off_target": True,
+                    "rejog_requested": True,
+                    "notes": result.notes,
+                })
+                raise _RejogRequested()
+            # choice == "skip": fall through to the normal "no
+            # extension needed" early-return below, but mark the
+            # off-target state in the persisted json so downstream
+            # readers don't mistake this for a real OK.
+            write_json(lens_dir / "range_check.json", {
+                "ok": False,
+                "peak_side": result.peak_side,
+                "extension_applied": False,
+                "all_off_target": True,
+                "rejog_requested": False,
+                "notes": (
+                    "all apertures off-target; user accepted the "
+                    "flat data and continued. " + result.notes
+                ),
+            })
+            return steps - 1
         if (
             result.ok
             or not result.needs_extension
@@ -1109,6 +1166,78 @@ class SessionRunner:
                 calibration=calibration,
             )
         droop.reset_all()
+
+    def _handle_off_target(self, *, slug: str, result) -> str:
+        """Notify + prompt when every aperture's curve is flat.
+
+        Returns ``"rejog"`` (default action — caller raises
+        ``_RejogRequested``), ``"skip"`` (caller falls through to
+        write the persisted json with off-target marker and
+        continue), or raises :class:`SessionAborted` on ``"abort"``.
+        """
+        if self.ntfy is not None:
+            self.ntfy.with_body(
+                Notification(
+                    title="Sweep off-target",
+                    body="",
+                    priority="high",
+                    tags=("warning",),
+                ),
+                f"{slug}: every aperture's sharpness curve is flat. "
+                "Likely the rail span doesn't cover the lens's depth "
+                "of field, or the test target lacks micro-detail at "
+                "the chosen position. Re-jog recommended.",
+            )
+        wav_path = getattr(self.config, "ALERT_WAV", None)
+        if wav_path is not None:
+            try:
+                play_alert(wav_path)
+            except Exception:                            # noqa: BLE001
+                log.exception("alert sound failed")
+        choice = self.prompt_off_target(
+            f"\nAll apertures off-target on {slug} — every sharpness "
+            "curve is flat. Either the rail span misses the focus "
+            "zone or the target lacks micro-detail. "
+            "[ENTER] re-jog START / END and re-sweep, "
+            "[s] skip and continue with this data, "
+            "[q] abort: "
+        )
+        if choice == "abort":
+            raise SessionAborted("user aborted at off-target prompt")
+        return choice  # "rejog" or "skip"
+
+    def _rejog_for_lens_config(
+        self,
+        *,
+        lens_dir: Path,
+        current_position_mm: float,
+    ) -> tuple[float, int, float]:
+        """Run the jog UI again, return rail to step 0, and rebuild
+        the per-lens-config sharpness collector so the next sweep's
+        dataset is fresh.
+
+        Returns the new ``(end_mm, steps, step_size_mm)``.
+        """
+        if self.jog is None:
+            raise RuntimeError("SessionRunner.jog not configured")
+        jog_result = self.jog(self.rail)
+        end_mm = jog_result.end_mm
+        steps = self.prompt_step_count()
+        step_size_mm = end_mm / (steps - 1)
+        # Rail is wherever the jog left it; bring it back to step 0
+        # via the sign-aware return helper.
+        self._return_rail_to_zero(self.rail.position_mm)
+        # Replace the sharpness collector so the new sweep doesn't
+        # mix samples with the discarded off-target ones.
+        try:
+            if self._sharpness_collector is not None:
+                self._sharpness_collector.shutdown(wait=True)
+        except Exception:                                # noqa: BLE001
+            log.exception("sharpness collector shutdown during re-jog failed")
+        self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
+        if self.range_checker is not None:
+            self.range_checker.set_collector(self._sharpness_collector)
+        return end_mm, steps, step_size_mm
 
     def _reshoot_steps(
         self,
