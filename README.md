@@ -124,44 +124,139 @@ If the program pauses with a "Battery droop detected" alert:
 
 1. Swap the AA batteries in the affected flash(es).
 2. Wait for steady ready lights on the flash.
-3. Press ENTER in the program. The rail stays at its current position; the
-   program redoes the current rail step and continues.
+3. Press ENTER in the program.
+
+The runner then **rewinds the rail** to the earliest under-exposed step
+(across all apertures, taken from the rolling-window samples that tripped
+the criterion) and **reshoots that step through the trigger step** with
+fresh power. The under-exposed JPEGs on disk are overwritten in place;
+`shots.csv` carries new rows with `phase=reshoot` for the affected steps,
+and the original `phase=sweep` rows for those steps are dropped to keep
+the metadata clean.
+
+If droop fires *during* the reshoot — i.e., a flash you didn't catch on
+the first swap is also weak — the runner pauses again, prompts again,
+and recurses into another reshoot covering the new earliest under-exposed
+step through the trigger step. This nests as many times as needed.
 
 You do **not** need to re-jog the rail, the StackShot is being driven by
 the program throughout.
 
+### Range-adequacy prompts
+
+After the main sweep, the runner runs a sharpness analysis to check
+whether the captured rail span actually covered the focus peak.
+
+* **Truncated bell on one side** → the runner shoots a probe in that
+  direction; if it brackets the peak it then fills out the rest of an
+  extension sweep automatically and continues. No prompt.
+* **Truncated bell that the probe didn't bracket** → the runner prompts:
+  `[ENTER] extend by ~N mm on the failing side, [s] skip and continue
+  to lens change, [q] abort`. ENTER to keep extending until the peak
+  brackets; `s` to accept the partial data and move on; `q` to abort.
+* **All apertures' curves are flat (`OFF_TARGET`)** → the rail span
+  almost certainly missed the focus zone, or the wafer position lacks
+  micro-detail. The runner sends a high-priority ntfy alert + chirp
+  and prompts: `[ENTER] re-jog START / END and re-sweep,
+  [s] skip and continue with this data, [q] abort`. ENTER reruns the
+  jog UI and redoes the sweep at a new range with the existing
+  calibration preserved (no re-calibration burn).
+
 ### Quitting
 
-Enter an empty line at the lens-config prompt to quit cleanly. The program
-moves the rail back to position 0, closes the camera and rail, and writes
-the final session log.
+Type an empty line, `q`, `quit`, or anything shorter than 5 characters
+at the lens-config prompt to quit cleanly. The program moves the rail
+back to position 0, closes the camera and rail, and writes the final
+session log.
 
-Ctrl-C also works — the program issues a StackShot stop, closes connections,
-and exits. Any in-progress shot may be lost.
+Ctrl-C also works — the program issues a StackShot stop, closes
+connections, and exits cleanly without dumping a traceback. Any
+in-progress shot may be lost.
 
 ## Output
 
-Per-session directory under `OUTPUT_ROOT`, named with a timestamp.
-Inside it:
+Per-session directory under `OUTPUT_ROOT`, named with a timestamp:
 
-- `session.json` — session metadata including chosen lens configs, calibrated
-  FEC values per aperture per lens, ntfy topic, StackShot software ID, etc.
-- `shots.csv` — one row per shot taken, with rail step, aperture, ISO, FEC,
-  measured median luminance, EV-relative-to-baseline, filename, phase.
-- `<lens_config_slug>/calibration.json` — per-aperture (FEC, ISO) tuples
-  determined during the calibration phase.
-- `<lens_config_slug>/f<aperture>/step_NNN.jpg` — the JPEGs.
+```
+~/macro-lens-test-output/
+└── <session_id>/                          e.g. 2026-05-05_172105
+    ├── session.json                       session-level metadata
+    ├── shots.csv                          one row per capture
+    ├── fec_sanity_baseline.jpg            FEC sanity test shots
+    ├── fec_sanity_low.jpg
+    └── <lens_config_slug>/                free-text name, slugified
+        ├── calibration.json               per-aperture (FEC, ISO) tuples
+        ├── range_check.json               peak-side, extension applied, etc.
+        ├── calibration/
+        │   └── cal_f_<X>_<NN>.jpg         calibration test shots
+        └── <aperture>/                    e.g. f_4_5, f_5_6, f_8, f_11, f_16
+            ├── step_<NNNN>.jpg            replica 0 (legacy filename)
+            ├── step_<NNNN>_b.jpg          replica 1 (when SHOTS_PER_STEP_APERTURE > 1)
+            ├── step_<NNNN>_c.jpg          replica 2
+            └── cropped/                   17 crops per source JPEG
+                ├── center/step_<NNNN>.jpg
+                ├── top-left/step_<NNNN>.jpg
+                └── …
+```
+
+* **Filename → step_index**: `STEP_NUMBER_OFFSET = 100`, so
+  `step_0100.jpg` = step_index 0, `step_0099.jpg` = step_index −1
+  (near-side extension), `step_0107.jpg` = step_index 7 (far-side
+  extension). Phase (sweep / probe / extension / reshoot) lives in
+  `shots.csv`'s `phase` column, not the filename — the same
+  `step_NNNN.jpg` is reused across phases (file gets overwritten in
+  place on a reshoot).
+* **Replica suffix**: replica 0 keeps the legacy unsuffixed name so
+  existing offline-analysis tooling sees no change; replicas 1, 2, …
+  use `_b`, `_c`, …
+* **`session.json`** records `lens_configs`, `baseline_median_luminance`,
+  StackShot software / hardware IDs, ntfy topic, `aborted` flag,
+  and `ended_at`.
+* **`shots.csv`** rows: rail step, aperture, ISO, FEC, measured
+  median luminance, EV-relative-to-baseline, filename, phase. Stale
+  rows are *dropped* from the file when a reshoot or off-target
+  re-jog overwrites their data — only the canonical, latest row per
+  (step, aperture, replica) is kept.
 
 ## Configuration
 
 All tunable constants are at the top of `config.py`. Notable ones:
 
 - `MAX_FSTOP` — the largest f-number to test (session-wide).
-- `RANGE_EXTENSION` — per-aperture ISO bumps and recycle delays.
+- `WHOLE_STOP_SCALE` — the canonical f-stop ladder; the per-lens
+  aperture sequence is the lens's widest aperture plus each whole
+  stop on this ladder up to `MAX_FSTOP`.
+- `RANGE_EXTENSION` — per-aperture (base ISO, flash recycle seconds).
+  The recycle wait is *subtracted* by elapsed time since the previous
+  capture, so set_config + capture during the recycle window count
+  against the budget.
+- `BASELINE_REFERENCE_IMAGE` — `Path` to a reference JPEG; the runner
+  measures its central-crop median once and uses that value as the
+  absolute calibration target across every session. Set to `None` to
+  fall back to "first widest-aperture shot of the first lens config"
+  per-session baseline.
+- `SHOTS_PER_STEP_APERTURE` — replicas captured at each (rail step,
+  aperture) pair (default 3). The advisor / range-checker collapse
+  replicas via per-crop median before peak detection. Set to 1 to
+  revert to single-shot.
+- `STEP_NUMBER_OFFSET` / `STEP_NUMBER_WIDTH` — filename layout for
+  near-side extensions (default offset 100, width 4 → `step_0099.jpg`
+  for step −1, `step_0100.jpg` for step 0, etc.).
+- `SHARPNESS_MAX_WORKERS` — concurrent crop workers (default 4).
+- `SHARPNESS_CROPPED_DIRNAME` — subdir name under each
+  `<lens>/<aperture>/` where the 17 crops are persisted.
 - `OUTPUT_ROOT` — where session directories are created.
-- `NTFY_TOPIC` — the ntfy.sh topic string. Set this once per laptop.
+- `NTFY_TOPIC` / `NTFY_BASE_URL` — ntfy.sh topic + endpoint. Set the
+  topic once per laptop.
+- `ALERT_WAV` — local audible alert file (paplay) for droop /
+  off-target events.
 - `JOG_FINE_MM` / `JOG_COARSE_MM` — rail jog increments.
 - `CROP_*_FRAC` — central-crop position and size on the wafer.
+- `ROLLING_WINDOW`, `DROOP_CRIT_A`, `DROOP_CRIT_B` — droop detector
+  window length + the two trip criteria
+  (default: 3-of-10 ≤ −0.7 EV OR 2-of-10 ≤ −2.0 EV).
+- `RANGE_CHECK_ENABLED`, `RANGE_EXTENSION_FRACTION`,
+  `RANGE_CHECK_PROBE_STEPS` — auto-extension behaviour.
 
 ## Troubleshooting
 

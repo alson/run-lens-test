@@ -312,3 +312,117 @@ aperture's exposure isn't masked by another aperture's correct shots.
   only option.** The direct-control architecture is materially better
   than what was originally planned. The protocol documents the moves
   and status reads we need; we never had to use auto-step at all.
+
+## 6. Discoveries from on-rig integration (2026-05-05 session)
+
+### 6.1 Per-shot PTP overhead dominates wall-clock time
+
+The Z7's per-call PTP `set_config` cycle costs ~1.5–3 s wall-clock —
+each one is a full get-config tree → mutate → set-config → drain-events
+round-trip. The original sweep loop did three of these per shot
+(aperture, ISO, FEC), plus the capture itself, which on the rig
+measured 8.2 s/shot median. Batching aperture/ISO/FEC into a single
+`set_aperture_iso_fec` call (one get_config, mutate three widgets,
+one set_config + drain) dropped that to 4.0 s/shot — a 51 % win,
+about 17 minutes saved on a 5-config × 30-step session.
+
+The profiler that produced these numbers is checked in at
+`tools/profile_capture.py` and can be re-run after firmware / cable
+changes.
+
+### 6.2 Recycle delay should subtract elapsed work
+
+The per-aperture `RANGE_EXTENSION[ap].recycle_s` is a *minimum*
+between consecutive shutter fires, not a sleep on top of work
+already done. The runner now records `_last_capture_started_at`
+just before each `capture_to`, and the wait — moved to *before* the
+next capture — sleeps `max(0, recycle_s − elapsed)` so the
+~2.5 s set_config of the next shot counts against the recycle
+budget. Across thousands of frames this is hours saved.
+
+The recycle is also keyed on the *previous* aperture's value (the
+flash that just discharged), not the upcoming one — a small
+aperture's longer recycle is paid *after* its capture, not before
+the next.
+
+### 6.3 Replicas-for-noise-averaging beat tighter thresholds
+
+Initial on-target sweeps came back with `max/min < 1.15` per
+aperture across the focus stack — i.e., the curves looked flat to
+the advisor's `is_flat` heuristic. The fix wasn't to lower the
+threshold (which risks treating real noise as a peak) but to
+average multiple replicas at each (step, aperture) before peak
+detection. `SHOTS_PER_STEP_APERTURE = 3` plus a per-crop median in
+`CollectedDataset.aggregated()` gives a much cleaner sharpness
+signal at the cost of 3× capture time per shot.
+
+### 6.4 Droop reshoot must rewind, not skip-and-continue
+
+First implementation reset the rolling window after droop and let
+the sweep continue forward — the under-exposed frames at the trip
+step and the previous samples that contributed to the trip stayed
+in `shots.csv` and on disk as the canonical data. Wrong: every
+sample ≤ the firing trip threshold should be overwritten with a
+fresh capture. The runner now finds the earliest under-exposed
+step across all apertures' droop windows, rewinds the rail, and
+reshoots that step through the trigger step inclusive
+(filenames are deterministic from step_index, so reshoot
+overwrites in place). Stale `phase=sweep` rows for the reshot
+range are dropped from `shots.csv`.
+
+### 6.5 Droop must be re-detected during reshoot
+
+Initial reshoot ran with droop disabled (window cleared, captures
+not pushed back in). If the user missed a flash on the first swap,
+or another battery was also weak, the reshoot itself produced
+under-exposed frames that landed in the canonical filenames —
+silently. Now reshoot pushes every capture's EV through the
+detector; on a nested trip, `_handle_droop` recurses into
+another `_reshoot_steps` call covering `[new_earliest,
+current_step_index]`. Each reshoot's start-of-method drop wipes
+earlier `phase=reshoot` rows in its range so the freshest
+reshoot's rows are the ones that survive in the CSV.
+
+### 6.6 Off-target ≠ truncated bell
+
+A flat curve at every aperture is *not* the same as "needs
+extension" — extending wouldn't add signal if there's no signal
+to find. The cause is usually one of: (a) the rail span misses
+the focus zone entirely, or (b) the wafer position lacks
+micro-detail at the chosen crops. Both resolve via re-jog. The
+advisor now returns `Verdict.OFF_TARGET` per aperture when no
+crop has a real peak, and the SharpnessRangeChecker exposes
+`RangeResult.all_off_target` when every aperture is off. The
+runner branches on this flag *before* the extension flow and
+prompts the user to re-jog.
+
+### 6.7 In-memory dataset and on-disk crops have separate failure modes
+
+The `LiveCollector` keys its in-memory `CollectedDataset` by
+`(rail_step, aperture, replica_index)` — the advisor sees per-
+aperture data correctly even when the on-disk crop output had a
+bug. Concretely: the cropper's `out_dir` was lens-level
+(`<lens>/cropped/<crop>/<source>`), so every aperture writing
+`step_0100.jpg` overwrote the previous on disk; only the last
+aperture's crops survived. The advisor was unaffected (in-memory
+data is keyed by aperture), but offline analysis lost 4/5 of the
+data. Fix is `crops_under_source=True` →
+`<lens>/<aperture>/cropped/<crop>/<source>`. Worth keeping in
+mind that the live decision and the persisted artefacts can drift
+apart — verify both when investigating.
+
+### 6.8 BASELINE_REFERENCE_IMAGE and the calibration ceiling
+
+The first sessions set baseline from "first widest-aperture shot
+of the first lens config" — fine for within-session comparability
+but lens-config-dependent across sessions (a 105 mm + extension
+opens at a different brightness than a 200 mm at 1:1). Fixing the
+baseline to a designated reference JPEG's central-crop median
+(default 129/255 for the user's reference) makes inter-session
+comparisons valid. **Caveat**: if the current lens setup is
+significantly dimmer than the reference (different focal length,
+extension, or working distance) the FEC closed-loop calibrator can
+hit FEC=0 + ISO < ceiling and still report `hit_tolerance=False`
+— it gives up before pushing FEC to +1 EV. Worth a follow-up to
+confirm the calibrator escalates fully through FEC max → ISO
+ceiling before declaring failure.

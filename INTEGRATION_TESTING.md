@@ -450,35 +450,36 @@ The `phase` column should show `calibration` first, then `sweep` rows for each s
 
 ## 6. Battery droop simulation
 
-After step 5 passes once cleanly.
+**Validated 2026-05-05** — works end-to-end with reshoot from earliest under-exposed step and nested droop re-detection during reshoot.
 
 ### Run
 
-Start a fresh session as in step 5. During the sweep phase, **physically pull a battery** from one of the off-camera flashes mid-sweep (around step 2 or 3 of a 5-step sweep).
+Start a fresh session as in step 5. During the sweep phase, **physically pull a battery** from one of the off-camera flashes mid-sweep (around step 3 of a 5-step sweep — the criteria need a couple of under-exposed samples to accumulate before tripping).
 
 ### Expected
 
-- Within a few captures, terminal shows `Battery droop on f/X` with a window snapshot.
+- Within a few captures, terminal shows `Battery droop on f/X. Swap flash batteries, wait for steady ready light, then press ENTER to resume. q = abort`.
 - Mac/phone receives a `Battery droop detected` ntfy notification (priority high).
 - Local speaker chirps (if `ALERT_WAV` is configured).
-- Prompt: `Swap flash batteries, wait for steady ready light, then press ENTER to resume. q = abort`.
-- Reinsert the battery. Press ENTER.
-- Sweep continues from the **current** rail step (the rail did not move during the pause).
-- The rolling-window detector resets so the just-low samples don't immediately re-trip.
+- Reinsert the battery, wait for steady ready light. Press ENTER.
+- Runner prints e.g. `Reshooting steps 3..5 after droop (overwriting under-exposed frames)...` and the rail rewinds to the earliest under-exposed step (across all apertures, taken from the rolling-window samples that tripped the criterion).
+- The reshoot loop reshoots that step through the trigger step inclusive, overwriting the under-exposed JPEGs in place. Each reshoot capture's EV is fed back into the droop detector, so a still-weak flash will trip again and trigger a nested reshoot.
+- After the reshoot completes, the outer sweep continues from `trigger_step + 1`.
+- `shots.csv` has fresh `phase=reshoot` rows for the reshot range; the original under-exposed `phase=sweep` rows for those steps are *dropped* from the file at the start of the reshoot to keep the metadata clean.
+
+### Step-numbering note
+
+Both the progress bar and the reshoot announcement use **1-based** step numbers (`step 5/7`, `Reshooting steps 3..5`). The `rail_step` column in `shots.csv` and any internal log messages are **0-based**. Mapping: 1-based display = 0-based `rail_step + 1`.
 
 ### If it doesn't trigger
 
-The droop criteria are `3 of last 10 ≤ -0.7 EV` or `2 of last 10 ≤ -2.0 EV`. If the flash recovers fast enough that the EV drop never reaches threshold, the detector won't fire — that's correct behaviour. Try pulling AND keeping the battery out for 3+ shots.
+The droop criteria are `3 of last 10 ≤ -0.7 EV` or `2 of last 10 ≤ -2.0 EV`. If the flash recovers fast enough that the EV drop never reaches threshold, the detector won't fire — that's correct behaviour. Try pulling AND keeping the battery out for 3+ shots at the same aperture.
 
 ---
 
 ## 7. Lens-change recovery
 
-After step 5 passes.
-
-### Run
-
-Continue the session past step 5's lens change prompt.
+**Will be validated organically** during real multi-config sessions; no dedicated test.
 
 ### Procedure when prompted
 
@@ -492,7 +493,7 @@ Continue the session past step 5's lens change prompt.
 ### Expected
 
 - Runner reopens the camera, runs `verify_healthy` (config tree ≥ 100 widgets, `expprogram == M`).
-- Reapplies session config.
+- Reapplies session config (capturetarget=Internal RAM, autofocus=Off, VR=Off, ISO floor, shutter speed, etc.).
 - Prompts for the next lens-config name.
 
 ### If reconnect fails
@@ -503,42 +504,48 @@ The runner retries up to 3 times. On the 3rd failure: high-priority ntfy alert "
 
 ## 8. Range-check + auto-extension on rig
 
-After step 5 passes once.
+**Validated 2026-05-05** — `peak_side='near'`, 3 extend rounds, 12 near-side extension steps, final verdict OK on all apertures.
 
 ### Setup
 
-For the real `SharpnessRangeChecker` to produce a `NEEDS_RESHOOT` verdict, the captured rail range must be **deliberately too narrow** for the lens. Aim to cover only one side of the lens's focus bell.
+For `SharpnessRangeChecker` to produce a `NEEDS_RESHOOT` verdict, the captured rail range must be **deliberately too narrow** for the lens. Aim to cover only one side of the lens's focus bell.
 
-Concretely: jog the START to a position where the wafer is visibly in focus, then jog END to a position only ~half-way deeper than where the lens's natural depth-of-field ends. With 5 steps over 3 mm at high magnification, the bell will likely be truncated.
+Concretely: jog START where the wafer is visibly in focus, then jog END to a position only ~half-way deeper than where the lens's natural depth-of-field ends. With 5 steps over 3 mm at high magnification, the bell will likely be truncated.
 
 ### Run
 
 Start a session per step 5; pick the deliberately-narrow START/END.
 
-### Expected
+### Expected behaviour
 
-After the main sweep:
-- Runner emits `Range still inadequate` notes only if the probe also fails. Otherwise:
-- Runner shoots 1-2 grid-aligned probe shots in the extension (filenames `step_0103.jpg` etc. for far, `step_0099.jpg` for near).
-- If probes bracket the peak: extension sweep continues, additional `step_NNNN.jpg` files appear.
-- `<lens>/range_check.json` records `{"peak_side": "far"|"near"|"both", "extension_applied": true|false, "extension_step_count": {"far": N, "near": M}}`.
+After the main sweep, the runner runs the sharpness analysis and the flow branches three ways:
+
+**A. Truncated bell on one side (or both)**: The runner shoots `RANGE_CHECK_PROBE_STEPS` (default 2) grid-aligned probe shots in the failing direction (filenames `step_0103.jpg` … on the far side, `step_0099.jpg` … on the near side, or both for `peak_side=both`). If the probes bracket the peak it then fills out the rest of the extension at the original step size automatically. No prompt. `range_check.json` records `extension_applied: true` and the `extension_step_count` per side.
+
+**B. Truncated bell that the probe didn't bracket**: The runner prompts: `Range still inadequate on <slug> (peak_side=…). [ENTER] extend by ~N mm (M steps) on the failing side, [s] skip and continue to lens change, [q] abort`. ENTER shoots another `extension_steps` worth of grid slots on the failing side(s), re-evaluates, and re-prompts; loops until peak brackets or you skip / abort. `range_check.json` records `extend_rounds` (count of times you pressed ENTER).
+
+**C. All apertures' curves are flat (`OFF_TARGET`)**: Every aperture's `max/min < DEFAULT_FLAT_RATIO` — the rail span almost certainly missed the focus zone or the wafer position lacks micro-detail. Runner sends `Sweep off-target` ntfy + chirp and prompts: `[ENTER] re-jog START / END and re-sweep, [s] skip and continue with this data, [q] abort`. ENTER reruns the jog UI; calibration is preserved. The discarded sweep's `phase ∈ {sweep, probe, extension, reshoot, aborted}` rows are dropped from `shots.csv` for that slug at the moment of re-jog.
 
 ### Verify the cropping kept up
 
 ```bash
-# Total source JPEGs in the per-aperture dir
-n=$(ls <session>/<lens>/f_4/step_*.jpg | wc -l)
+# Total source JPEGs at one aperture
+n=$(ls <session>/<lens>/f_4_5/step_*.jpg | wc -l)
 # Cropped JPEGs per crop name (should equal n)
-ls <session>/<lens>/f_4/cropped/center/ | wc -l
+ls <session>/<lens>/f_4_5/cropped/center/ | wc -l
 ```
 
 The two should match. If `cropped/` has fewer files, the collector's queue didn't drain in time — `wait_for_pending()` should prevent this; if it doesn't, capture the issue with `dmesg` and the runner's stderr.
+
+### Multi-shot replicas
+
+With `SHOTS_PER_STEP_APERTURE > 1` (default 3), each `step_NNNN.jpg` source appears alongside `step_NNNN_b.jpg`, `step_NNNN_c.jpg`, … and the cropped output has the same per-replica filenames. The advisor collapses replicas via per-crop median before peak detection, so the verdict is computed against one point per (step, aperture), not N.
 
 ---
 
 ## 9. Graceful Ctrl-C
 
-Standalone test, anytime after step 5 passes.
+**Validated 2026-05-05** — clean exit, no traceback dump.
 
 ### Run
 
@@ -550,7 +557,9 @@ Start a session per step 5. Mid-sweep, press `Ctrl-C` in the terminal.
 - Camera closes cleanly.
 - `session.json` finalised with `aborted: true` and `ended_at` set.
 - Any in-flight crops drain via the collector's shutdown path.
-- Process exits with a `KeyboardInterrupt` traceback (or non-zero status — both are fine).
+- `main()` catches `KeyboardInterrupt` and logs `session aborted via Ctrl-C` instead of dumping a traceback. Exit code is 0.
+
+Same UX for typing `q`, `quit`, `exit`, or anything shorter than 5 characters at the lens-change prompt or the lens-config prompt — the runner raises `SessionAborted` internally and `main()` logs `session aborted: …` cleanly.
 
 If the rail keeps moving after Ctrl-C: the StackShot didn't acknowledge `CC_RAIL_STOP`. Check `dmesg` and the StackShot front panel.
 
@@ -558,18 +567,21 @@ If the rail keeps moving after Ctrl-C: the StackShot didn't acknowledge `CC_RAIL
 
 ## 10. Checklist before declaring "rig integration done"
 
-- [ ] StackShot reference app talks to the rig on Windows (step 1.1)
-- [ ] We've captured a working frame (step 1.2)
-- [ ] Linux-side replay of the working frame succeeds (step 1.3)
-- [ ] `python -m stackshot.controller --info` returns sensible IDs and position (step 1.4)
-- [ ] `python -m stackshot.controller --move 1.0` moves the rail (step 1.4)
-- [ ] `python -m stackshot.jog` lets you set START / END (step 2)
-- [ ] `python -m camera.nikon_z7 --health` reports ≥100 widgets, M mode (step 3.1)
-- [ ] `python -m camera.nikon_z7 --capture` writes a JPEG (step 3.2)
-- [ ] FEC sanity check ratio < 0.5 (step 3.3)
-- [ ] `python -m notify.ntfy --test` delivers (step 4)
-- [ ] `python -m session.runner` runs one full lens config end-to-end (step 5)
-- [ ] Battery-droop pause+resume works (step 6)
-- [ ] Lens-change recovery works (step 7)
-- [ ] Range-check + extension fires on a deliberately narrow range (step 8)
-- [ ] Ctrl-C aborts cleanly (step 9)
+- [x] StackShot reference app talks to the rig on Windows (step 1.1)
+- [x] We've captured a working frame (step 1.2)
+- [x] Linux-side replay of the working frame succeeds (step 1.3)
+- [x] `python -m stackshot.controller --info` returns sensible IDs and position (step 1.4)
+- [x] `python -m stackshot.controller --move 1.0` moves the rail (step 1.4)
+- [x] `python -m stackshot.jog` lets you set START / END (step 2)
+- [x] `python -m camera.nikon_z7 --health` reports ≥100 widgets, M mode (step 3.1)
+- [x] `python -m camera.nikon_z7 --capture` writes a JPEG (step 3.2)
+- [x] FEC sanity check ratio < 0.5 (step 3.3)
+- [x] `python -m notify.ntfy --test` delivers (step 4)
+- [x] `python -m session.runner` runs one full lens config end-to-end (step 5)
+- [x] Battery-droop pause + reshoot from earliest under-exposed step (step 6)
+- [ ] Lens-change recovery — deferred; will surface organically in real
+      multi-config sessions (step 7)
+- [x] Range-check + extension fires on a deliberately narrow range (step 8)
+- [x] Off-target detection prompts for re-jog when curves are flat
+      (step 8 §C)
+- [x] Ctrl-C aborts cleanly without dumping a traceback (step 9)
