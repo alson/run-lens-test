@@ -322,16 +322,20 @@ class TestBothExtension:
 
 class TestProbeFails:
     def test_no_extension_user_prompted(self, cfg, tmp_path) -> None:
+        # User picks 'skip' at the range-inadequate prompt → keep
+        # the data we have and continue to the lens-change prompt.
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
-        confirms: list[str] = []
+        prompts: list[str] = []
 
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
             medians=[100.0] * 20,
             inputs={"steps": 3, "end_mm": 20.0},
         )
-        runner.confirm = lambda msg: (confirms.append(msg), True)[1]
+        runner.prompt_range_inadequate = (
+            lambda msg: (prompts.append(msg), "skip")[1]
+        )
         runner.range_checker = ScriptedRangeChecker([
             RangeResult(ok=False, peak_side="far",
                         needs_extension=True, notes="peak beyond end"),
@@ -347,12 +351,96 @@ class TestProbeFails:
         assert len(list(sweep_dir.glob("step_*.jpg"))) == 4
 
         # Range-still-inadequate prompt was shown.
-        assert any("Range still inadequate" in c for c in confirms)
+        assert any("Range still inadequate" in p for p in prompts)
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
         assert rc["extension_applied"] is False
         assert "did not bracket peak" in rc["notes"]
+        assert rc["extend_rounds"] == 0
+
+    def test_extend_more_loops_until_bracketed(self, cfg, tmp_path) -> None:
+        # User says 'extend' twice. Second extend round brings the
+        # peak into range. Then the runner fills any remaining grid
+        # slots inside the original extension (none here — extension
+        # is one step and the probe used it) and writes a successful
+        # range_check.json.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        prompts: list[str] = []
+        choices = iter(["extend", "extend"])
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.prompt_range_inadequate = (
+            lambda msg: (prompts.append(msg), next(choices))[1]
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            # 1) first call after main sweep
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True,
+                        notes="peak beyond end"),
+            # 2) after probe — still no bracket
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True,
+                        peak_in_range_after_probe=False,
+                        notes="still beyond end"),
+            # 3) after first extend-more round — still no
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True,
+                        peak_in_range_after_probe=False,
+                        notes="still beyond end"),
+            # 4) after second extend-more round — bracket!
+            RangeResult(ok=True, peak_side="far",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket"),
+        ])
+        _run_one_lens_config(runner)
+
+        # 1 cal + 3 sweep + 1 probe + 2 extend-more rounds × 1 step = 7
+        capture_count = sum(1 for k, _ in camera.history if k == "capture")
+        assert capture_count == 7
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["extension_applied"] is True
+        assert rc["extend_rounds"] == 2
+        # Two prompts: one per extend choice (no third because the
+        # 4th evaluate returned bracket).
+        assert len(prompts) == 2
+
+    def test_abort_at_inadequate_prompt(self, cfg, tmp_path) -> None:
+        # User picks 'abort' at the prompt → SessionAborted bubbles
+        # out and the session.json reflects it.
+        from errors import SessionAborted
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 20,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.prompt_range_inadequate = lambda msg: "abort"
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True, notes="peak beyond"),
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True,
+                        peak_in_range_after_probe=False,
+                        notes="still beyond"),
+        ])
+        with pytest.raises(SessionAborted):
+            _run_one_lens_config(runner)
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert "user aborted" in rc["notes"]
 
 
 # ---- Step-index helper math -----------------------------------------------

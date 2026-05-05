@@ -121,3 +121,30 @@ def confirm(
     except EOFError:
         return False
     return text.strip().lower() not in ("q", "quit", "abort")
+
+
+def prompt_range_inadequate(
+    prompt: str,
+    *,
+    input_func: InputFunc = input,
+) -> str:
+    """Three-way prompt for the range-still-inadequate decision.
+
+    Returns one of:
+    * ``"extend"`` — empty input / ENTER (default: extend the sweep
+      by one more standard increment on the failing side).
+    * ``"skip"`` — ``s`` / ``skip`` / ``n``: accept the current
+      data as-is and continue to the lens-change prompt.
+    * ``"abort"`` — ``q`` / ``quit`` / ``abort`` / EOF: abort the
+      session.
+    """
+    try:
+        text = input_func(prompt)
+    except EOFError:
+        return "abort"
+    t = text.strip().lower()
+    if t in ("q", "quit", "abort"):
+        return "abort"
+    if t in ("s", "skip", "n", "no"):
+        return "skip"
+    return "extend"

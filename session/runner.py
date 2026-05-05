@@ -52,6 +52,7 @@ from stackshot.protocol import Direction
 from ui.prompts import (
     confirm,
     prompt_lens_config,
+    prompt_range_inadequate,
     prompt_step_count,
     slugify_lens_config,
 )
@@ -233,6 +234,9 @@ class SessionRunner:
     prompt_lens_config: Callable[[], str | None] = field(default_factory=lambda: lambda: prompt_lens_config())
     prompt_step_count: Callable[[], int] = field(default_factory=lambda: lambda: prompt_step_count())
     confirm: Callable[[str], bool] = field(default_factory=lambda: confirm)
+    prompt_range_inadequate: Callable[[str], str] = field(
+        default_factory=lambda: prompt_range_inadequate
+    )
     jog: JogStartEnd | None = None
     droop_detector: DroopDetector | None = None
     crop_box: CropBox | None = None
@@ -485,6 +489,16 @@ class SessionRunner:
     ) -> None:
 
         # Calibration at rail step 0.
+        # User-facing status so the terminal isn't silent during the
+        # ~30-60s of FEC closed-loop test shots that happen before
+        # the first sweep frame. Without this, the next thing the
+        # user sees after pressing ENTER for step count is the
+        # progress bar — minutes later — and they can't tell whether
+        # the rig is working or hung.
+        self._announce(
+            f"Calibrating {slug}: {len(apertures)} apertures "
+            f"({', '.join(apertures)})..."
+        )
         calibrator = Calibrator(
             camera=self.camera,
             measure=self._measure,
@@ -512,6 +526,9 @@ class SessionRunner:
         )
 
         # Sweep.
+        self._announce(
+            f"Sweeping {slug}: {steps} steps × {len(apertures)} apertures..."
+        )
         self._run_sweep(
             lens_dir=lens_dir,
             slug=slug,
@@ -788,8 +805,20 @@ class SessionRunner:
             "probe_positions_mm": probe_positions_per_side,
         }
 
-        if not result2.peak_in_range_after_probe:
-            if self.ntfy is not None:
+        # Track total grid slots shot per side across probes +
+        # any extend-more rounds. The "fill rest" branch below
+        # uses this to know how far to continue from.
+        shot_so_far_per_side: dict[str, int] = {"far": 0, "near": 0}
+        for side, count in sides:
+            shot_so_far_per_side[side] = count
+        extension_step_count_per_side: dict[str, int] = {"far": 0, "near": 0}
+        extend_rounds = 0
+
+        # Extend-more loop: as long as the data still doesn't bracket
+        # the peak, give the user the choice to extend further by one
+        # more standard increment, accept what we have, or abort.
+        while not result2.peak_in_range_after_probe:
+            if self.ntfy is not None and extend_rounds == 0:
                 self.ntfy.with_body(
                     Notification(
                         title="Range still inadequate",
@@ -798,27 +827,80 @@ class SessionRunner:
                         tags=("warning",),
                     ),
                     f"{slug}: probe on {result.peak_side} side did not "
-                    "bracket peak; please re-jog and retry.",
+                    "bracket peak.",
                 )
-            self.confirm(
-                f"\nRange still inadequate on {slug}. Press ENTER to "
-                "continue to lens change anyway, q to abort: "
+            extend_mm_per_side = extension_steps * abs(step_size_mm)
+            choice = self.prompt_range_inadequate(
+                f"\nRange still inadequate on {slug} "
+                f"(peak_side={result2.peak_side or result.peak_side}). "
+                f"[ENTER] extend by ~{extend_mm_per_side:.1f} mm "
+                f"({extension_steps} steps) on the failing side, "
+                "[s] skip and continue to lens change, [q] abort: "
             )
-            write_json(lens_dir / "range_check.json", {
-                "ok": False,
-                "extension_applied": False,
-                **record_base,
-                "notes": "probe did not bracket peak",
-            })
-            return self._steps_from_zero_at(current_pos, step_size_mm)
+            if choice == "abort":
+                write_json(lens_dir / "range_check.json", {
+                    "ok": False,
+                    "extension_applied": extend_rounds > 0,
+                    **record_base,
+                    "extension_step_count": extension_step_count_per_side,
+                    "extend_rounds": extend_rounds,
+                    "notes": "user aborted at range-inadequate prompt",
+                })
+                raise SessionAborted("user aborted at range-inadequate prompt")
+            if choice == "skip":
+                write_json(lens_dir / "range_check.json", {
+                    "ok": False,
+                    "extension_applied": extend_rounds > 0,
+                    **record_base,
+                    "extension_step_count": extension_step_count_per_side,
+                    "extend_rounds": extend_rounds,
+                    "notes": (
+                        "probe did not bracket peak; user accepted "
+                        "incomplete data"
+                    ),
+                })
+                return self._steps_from_zero_at(current_pos, step_size_mm)
+            # choice == "extend": shoot extension_steps more grid
+            # slots on each originally-failing side.
+            for side, _ in sides:
+                for i in range(extension_steps):
+                    offset = shot_so_far_per_side[side] + i
+                    step_index = self._extension_step_index(
+                        side=side, original_steps=steps,
+                        offset_in_extension=offset,
+                    )
+                    target = step_index * step_size_mm
+                    self._move_to(current_pos, target)
+                    current_pos = target
+                    self._shoot_at_position(
+                        lens_dir=lens_dir,
+                        slug=slug,
+                        step_index=step_index,
+                        position_mm=target,
+                        apertures=apertures,
+                        calibration=calibration,
+                        phase=Phase.EXTENSION,
+                        file_factory=lambda ap, idx=step_index:
+                            self._sweep_destination(lens_dir, ap, idx),
+                    )
+                    extension_step_count_per_side[side] += 1
+                shot_so_far_per_side[side] += extension_steps
+            extend_rounds += 1
+            if self._sharpness_collector is not None:
+                self._sharpness_collector.wait_for_pending()
+            result2 = self.range_checker.evaluate(
+                lens_dir=lens_dir,
+                end_mm=end_mm,
+                step_size_mm=step_size_mm,
+                apertures=apertures,
+                probe_data=probe_data,
+            )
 
-        # Probe brackets the peak — fill in the remaining grid slots
-        # in the extension, on each requested side. Probes already
-        # cover ``count`` slots per side; we shoot the additional
-        # ``extension_steps - count`` slots.
-        extension_step_count_per_side: dict[str, int] = {"far": 0, "near": 0}
-        for side, probe_count_used in sides:
-            for i in range(probe_count_used, extension_steps):
+        # Probe (and any extend-more rounds) brackets the peak — fill
+        # in the remaining grid slots inside the original extension on
+        # each requested side, so the data is dense up to ``extension_steps``.
+        for side, _ in sides:
+            for i in range(shot_so_far_per_side[side], extension_steps):
                 step_index = self._extension_step_index(
                     side=side, original_steps=steps, offset_in_extension=i
                 )
@@ -837,12 +919,17 @@ class SessionRunner:
                         self._sweep_destination(lens_dir, ap, idx),
                 )
                 extension_step_count_per_side[side] += 1
+                shot_so_far_per_side[side] += 1
 
+        # `ok` here reflects the *original* first-call verdict — the
+        # data needed extension. The fact that we extended (and now
+        # bracket the peak) is captured by `extension_applied=True`.
         write_json(lens_dir / "range_check.json", {
             "ok": False,
             "extension_applied": True,
             **record_base,
             "extension_step_count": extension_step_count_per_side,
+            "extend_rounds": extend_rounds,
             "probe_step_count": {
                 "far": dict(sides).get("far", 0),
                 "near": dict(sides).get("near", 0),
@@ -1152,6 +1239,15 @@ class SessionRunner:
                 notes="",
             )
         )
+
+    def _announce(self, message: str) -> None:
+        """Print a stage indicator on its own line + flush.
+
+        Used to break the silence between user input and the next
+        long-running phase (calibration, sweep). Always emits a
+        newline so it doesn't fight with the in-place progress bar.
+        """
+        print(message, flush=True)
 
     def _progress(
         self,
