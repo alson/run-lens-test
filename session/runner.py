@@ -608,9 +608,7 @@ class SessionRunner:
                 aperture_index=ap_index,
                 aperture_count=len(apertures),
             )
-            self.camera.set_aperture(aperture)
-            self.camera.set_iso(cal.iso)
-            self.camera.set_fec(cal.fec_ev)
+            self._set_capture_settings(aperture, cal)
             dest = self._sweep_destination(lens_dir, aperture, step_index)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.camera.capture_to(dest)
@@ -854,9 +852,7 @@ class SessionRunner:
     ) -> None:
         for aperture in apertures:
             cal = calibration.per_aperture[aperture]
-            self.camera.set_aperture(aperture)
-            self.camera.set_iso(cal.iso)
-            self.camera.set_fec(cal.fec_ev)
+            self._set_capture_settings(aperture, cal)
             dest = file_factory(aperture)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.camera.capture_to(dest)
@@ -996,6 +992,22 @@ class SessionRunner:
         )
 
     # ---- Helpers --------------------------------------------------------
+
+    def _set_capture_settings(self, aperture: str, cal) -> None:
+        """Configure aperture / ISO / FEC for the next capture.
+
+        Uses the camera's batched setter when available (one PTP
+        round-trip; saves several seconds per shot on the Z7) and
+        falls back to three individual setters otherwise — the
+        FakeCamera in the runner tests stays a drop-in.
+        """
+        batched = getattr(self.camera, "set_aperture_iso_fec", None)
+        if batched is not None:
+            batched(aperture=aperture, iso=cal.iso, fec=cal.fec_ev)
+            return
+        self.camera.set_aperture(aperture)
+        self.camera.set_iso(cal.iso)
+        self.camera.set_fec(cal.fec_ev)
 
     def _measure(self, jpg_path: Path) -> float:
         if self.measure_path is not None:

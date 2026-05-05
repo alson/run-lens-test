@@ -34,6 +34,18 @@ from errors import (
 
 EXPPROGRAM_REQUIRED = "M"
 
+# Z7 firmware variants expose VR under several names. Try them in order
+# and use the first widget that exists. Lifted from
+# tools/z7_settings_and_fec_test.py.
+VR_WIDGET_CANDIDATES: tuple[str, ...] = (
+    "vr",
+    "vrenable",
+    "vibrationreduction",
+    "vibrationreductiontype",
+    "imagestabilization",
+)
+VR_OFF_CHOICES: tuple[str, ...] = ("Off", "OFF", "off", "Disabled", "0")
+
 
 def _is_question_mark(value: object) -> bool:
     """Detect the transient ``'?'`` value the Z7 sometimes returns
@@ -155,7 +167,31 @@ class NikonZ7:
             self._set_radio("f-number", [aperture])
         self._set_radio("shutterspeed", list(shutter_candidates))
         self._set_radio("autofocus", [autofocus])
+        self._disable_vr()
         self._set_range("flashexposurecompensation", float(fec))
+
+    def _disable_vr(self) -> None:
+        """Best-effort VR disable across Z7 firmware variants.
+
+        VR introduces shake-pattern variability that swamps the
+        sharpness signal at slower shutter speeds. Iterate the known
+        widget names; for the first one present, set it to an
+        Off-like choice. Missing-widget and missing-Off-choice are
+        silently skipped — VR off is a sharpness preference, not a
+        correctness requirement, and Z firmware varies.
+        """
+        cfg = self.camera.get_config()
+        for name in VR_WIDGET_CANDIDATES:
+            widget = find(cfg, name)
+            if widget is None:
+                continue
+            chosen = first_matching_choice(widget, VR_OFF_CHOICES)
+            if chosen is None:
+                return
+            widget.set_value(chosen)
+            self.camera.set_config(cfg)
+            self.drain_events()
+            return
 
     def _set_radio(self, name: str, candidates: Sequence[str]) -> None:
         cfg = self.camera.get_config()
@@ -198,6 +234,50 @@ class NikonZ7:
 
     def set_fec(self, ev: float) -> None:
         self._set_range("flashexposurecompensation", float(ev))
+
+    def set_aperture_iso_fec(
+        self, *, aperture: str, iso: str | int, fec: float
+    ) -> None:
+        """Set f-number, ISO, and FEC in a single get_config / set_config /
+        drain cycle.
+
+        Each individual setter on the Z7 costs ~1.5–3 s (one full PTP
+        get_config + set_config + event drain). The hot sweep loop
+        previously called three of them back-to-back; this batched
+        version cuts that to one round-trip, which on a 250-shot
+        session saves on the order of 10 minutes of wall-clock time.
+
+        Missing widgets (rare across firmware variants) are silently
+        skipped, matching :meth:`apply_session_config`.
+        """
+        cfg = self.camera.get_config()
+
+        f_widget = find(cfg, "f-number")
+        if f_widget is not None:
+            chosen = first_matching_choice(f_widget, [aperture])
+            if chosen is None:
+                raise CameraStateError(
+                    f"{aperture!r} is not a valid choice for 'f-number' "
+                    f"(choices: {widget_choices(f_widget)[:8]!r})"
+                )
+            f_widget.set_value(chosen)
+
+        iso_widget = find(cfg, "iso")
+        if iso_widget is not None:
+            chosen = first_matching_choice(iso_widget, [str(iso)])
+            if chosen is None:
+                raise CameraStateError(
+                    f"{iso!r} is not a valid choice for 'iso' "
+                    f"(choices: {widget_choices(iso_widget)[:8]!r})"
+                )
+            iso_widget.set_value(chosen)
+
+        fec_widget = find(cfg, "flashexposurecompensation")
+        if fec_widget is not None:
+            fec_widget.set_value(float(fec))
+
+        self.camera.set_config(cfg)
+        self.drain_events()
 
     # ---- Capture --------------------------------------------------------
 

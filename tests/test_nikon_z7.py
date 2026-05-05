@@ -130,6 +130,8 @@ class TestVerifyHealthy:
 class TestApplySessionConfig:
     def test_sets_all_present_widgets(self, nikon, camera) -> None:
         # Build one big tree with all the widgets the wrapper touches.
+        # Order matches the wrapper's get_config call sequence — VR
+        # scan happens between autofocus and flashexposurecompensation.
         widgets = {
             "capturetarget": make_widget(
                 "capturetarget", "Memory card", choices=["Internal RAM", "Memory card"]
@@ -142,6 +144,7 @@ class TestApplySessionConfig:
                 "shutterspeed", "1/250", choices=["0.0050s", "1/250"]
             ),
             "autofocus": make_widget("autofocus", "On", choices=["On", "Off"]),
+            "vr": make_widget("vr", "On", choices=["On", "Off"]),
             "flashexposurecompensation": make_widget(
                 "flashexposurecompensation", 1.0
             ),
@@ -152,13 +155,14 @@ class TestApplySessionConfig:
             make_widget("main", children=[w]) for w in widgets.values()
         ]
         nikon.apply_session_config()
-        # set_config called once per widget present.
-        assert camera.set_config.call_count == 6
+        # set_config called once per widget present (including VR).
+        assert camera.set_config.call_count == 7
         widgets["capturetarget"].set_value.assert_called_with("Internal RAM")
         widgets["imagequality"].set_value.assert_called_with("JPEG Fine")
         widgets["iso"].set_value.assert_called_with("100")
         widgets["shutterspeed"].set_value.assert_called_with("0.0050s")
         widgets["autofocus"].set_value.assert_called_with("Off")
+        widgets["vr"].set_value.assert_called_with("Off")
         widgets["flashexposurecompensation"].set_value.assert_called_with(0.0)
 
     def test_skips_missing_widgets(self, nikon, camera) -> None:
@@ -175,6 +179,32 @@ class TestApplySessionConfig:
         camera.get_config.return_value = make_widget("main", children=[widget])
         with pytest.raises(CameraStateError, match="shutterspeed"):
             nikon.apply_session_config()
+
+    def test_disables_vr_under_alt_widget_name(self, nikon, camera) -> None:
+        # Z7 firmware that exposes VR as `vibrationreduction` instead
+        # of `vr` is still handled.
+        vr = make_widget(
+            "vibrationreduction", "On", choices=["On", "Off"]
+        )
+        camera.get_config.return_value = make_widget("main", children=[vr])
+        nikon.apply_session_config()
+        vr.set_value.assert_called_with("Off")
+
+    def test_skips_vr_when_no_off_choice(self, nikon, camera) -> None:
+        # No Off-like label among choices: silently skip rather than
+        # picking the wrong setting.
+        vr = make_widget("vr", "Normal", choices=["Normal", "Sport"])
+        camera.get_config.return_value = make_widget("main", children=[vr])
+        nikon.apply_session_config()
+        vr.set_value.assert_not_called()
+
+    def test_skips_vr_when_widget_absent(self, nikon, camera) -> None:
+        # No VR widget present (lens has no IS, or firmware variant
+        # without the widget): no error, no set_value.
+        camera.get_config.return_value = make_widget("main")
+        nikon.apply_session_config()
+        # Empty tree -> no widgets touched at all.
+        assert camera.set_config.call_count == 0
 
 
 # ---- drain_events ----------------------------------------------------------
