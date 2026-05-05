@@ -61,6 +61,34 @@ class TestPromptLensConfig:
         ) == "abc"
 
 
+class TestPromptMagnification:
+    def test_accepts_ratio(self) -> None:
+        from ui.prompts import prompt_magnification
+        assert prompt_magnification(input_func=lambda _: "1:1") == 1.0
+        assert prompt_magnification(input_func=lambda _: "1.5:1") == 1.5
+
+    def test_accepts_bare_float(self) -> None:
+        from ui.prompts import prompt_magnification
+        assert prompt_magnification(input_func=lambda _: "0.5") == 0.5
+
+    def test_reprompts_on_bad_input(self, capsys) -> None:
+        from ui.prompts import prompt_magnification
+        # Yields two bad inputs then a good one.
+        seq = iter(["abc", "0", "1:1"])
+        result = prompt_magnification(input_func=lambda _: next(seq))
+        assert result == 1.0
+        # The bad-input feedback was printed at least twice.
+        captured = capsys.readouterr()
+        assert captured.out.count("try e.g.") >= 2
+
+    def test_eof_reraises(self) -> None:
+        from ui.prompts import prompt_magnification
+        def _eof(_p: str) -> str:
+            raise EOFError
+        with pytest.raises(EOFError):
+            prompt_magnification(input_func=_eof)
+
+
 class TestPromptStepCount:
     def test_accepts_valid_int(self) -> None:
         assert prompt_step_count(input_func=lambda _: "30") == 30

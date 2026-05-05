@@ -435,6 +435,55 @@ of the data). Now production wiring sets
 of the implementation plan; matches the user's existing
 offline-analysis layout.
 
+### 5.9 Magnification-driven step size; subsample factors deferred to Phase B
+
+The runner used to ask the user for an explicit step count, then derive
+`step_size_mm = end_mm / (steps - 1)`. Step size was one constant for
+the whole sweep regardless of which aperture was being shot.
+
+The user built `sharpness/planner.py` to do the math properly. Given
+the lens's widest aperture (the worst case for sampling — narrowest
+DOF, sharpest peak) and the magnification, `plan_sweep` returns a
+physically-motivated `rail_step_mm` from the thin-lens DOF formula
+(`DOF = 2·c·N·(1+M)/M²`, c = 30 µm, FX sensor) and density of 5
+positions across FWHM (8 if M ≥ 1.5).
+
+The runner now prompts for **magnification** right after the
+lens-config name (accepts ratio forms like `1:1`, `1.5:1`, `1:1.5`,
+`2:1`, plus bare floats), reads the **widest aperture** from the
+camera, and after the jog calls the planner with `rail_range_mm =
+abs(end_mm)`. The result drives `(rail_step_mm, rail_positions)`.
+
+If the resulting position count is below `MIN_RAIL_POSITIONS`
+(default 10), the runner refuses with a re-jog prompt — 10 is the
+floor for reliable peak detection at the widest aperture's narrow
+DOF.
+
+The `SamplePlan` (including `subsample_factors` per aperture) is
+persisted in `session.json`'s `lens_configs` list — which is now
+`list[dict]` instead of `list[str]`. Each entry carries `slug`,
+`magnification`, `widest_aperture`, and the full plan. Downstream
+sharpness analysis reads the subsample factors to skip every Nth
+position at smaller apertures (where the broader DOF doesn't
+require the same density).
+
+**Capture-time subsampling is deferred (Phase B)**. This phase
+captures every aperture at every rail step regardless of subsample
+factor. Skipping at capture time would save rig time but requires
+adapting:
+- the advisor's `peak_index` / `extra_steps_needed` math (currently
+  assumes contiguous indices),
+- the droop detector's rolling window (currently 10 shots; with
+  subsampled f/16 those 10 shots span 5× more rail time, dilating
+  the droop signal),
+- the probe / extension shooting grid (today shoots all apertures
+  at each new step; with subsampling it should honour per-aperture
+  factors).
+
+The data format is forward-compatible: subsample_factors stored in
+session.json today are exactly what Phase B will honour at capture
+time tomorrow.
+
 ## 6. What would be different if redoing the project
 
 - **Test the SB-5000 commander earlier.** The first half of the planning

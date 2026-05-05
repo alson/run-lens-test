@@ -114,6 +114,32 @@ def prompt_step_count(
         return value
 
 
+def prompt_magnification(
+    prompt: str = (
+        "Magnification (e.g. 1:1, 1.5:1, 1:1.5, or a number like 0.5): "
+    ),
+    *,
+    input_func: InputFunc = input,
+) -> float:
+    """Prompt for a magnification, accepting ratio or float forms.
+
+    Uses :func:`sharpness.planner.parse_magnification` for the actual
+    parsing; re-prompts on any :class:`ValueError`. EOF re-raises so
+    callers can distinguish "user gave up" from "user gave junk".
+    """
+    from sharpness.planner import parse_magnification
+
+    while True:
+        try:
+            text = input_func(prompt)
+        except EOFError:
+            raise
+        try:
+            return parse_magnification(text)
+        except ValueError as exc:
+            print(f"  {exc}; try e.g. 1:1, 1.5:1, 0.5")
+
+
 def confirm(
     prompt: str,
     *,

@@ -15,6 +15,7 @@ straight-line: each phase reads as one method on
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass, field
@@ -50,12 +51,13 @@ from session.log import (
 )
 from stackshot.controller import StackShotController
 from stackshot.protocol import Direction
+from sharpness.planner import SamplePlan, plan_sweep
 from ui.prompts import (
     confirm,
     prompt_lens_config,
+    prompt_magnification,
     prompt_off_target,
     prompt_range_inadequate,
-    prompt_step_count,
     slugify_lens_config,
 )
 
@@ -111,9 +113,10 @@ def aperture_sequence(
     return out
 
 
-def _parse_fnum(text: str) -> float:
-    cleaned = text.strip().lstrip("fF").lstrip("/")
-    return float(cleaned)
+# Aperture parsing lives in the planner (the planner's plan_sweep needs
+# it for its widest-aperture float input). Re-export here so existing
+# call sites in this module keep working unchanged.
+from sharpness.planner import parse_aperture as _parse_fnum
 
 
 # ---- Rail / camera contracts the runner depends on ------------------------
@@ -241,7 +244,10 @@ class SessionRunner:
     monotonic: Callable[[], float] = time.monotonic
     now: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
     prompt_lens_config: Callable[[], str | None] = field(default_factory=lambda: lambda: prompt_lens_config())
-    prompt_step_count: Callable[[], int] = field(default_factory=lambda: lambda: prompt_step_count())
+    prompt_magnification: Callable[[], float] = field(
+        default_factory=lambda: lambda: prompt_magnification()
+    )
+    plan_sweep: Callable[..., SamplePlan] = field(default_factory=lambda: plan_sweep)
     confirm: Callable[[str], bool] = field(default_factory=lambda: confirm)
     prompt_range_inadequate: Callable[[str], str] = field(
         default_factory=lambda: prompt_range_inadequate
@@ -444,22 +450,37 @@ class SessionRunner:
         lens_dir = self.session_dir / slug
         lens_dir.mkdir(parents=True, exist_ok=True)
 
-        jog_result = self.jog(self.rail)
-        end_mm = jog_result.end_mm
-        steps = self.prompt_step_count()
-        step_size_mm = end_mm / (steps - 1)
-
-        # Move rail back to position 0 with backlash compensation.
-        # end_mm and step_size_mm may be negative (user jogged
-        # backward to END) — use the sign-aware helper so the rail
-        # gets a non-negative distance with the correct direction.
-        self._return_rail_to_zero(end_mm)
+        # Magnification is asked once per lens config; the sweep
+        # plan is a function of M, the lens's widest aperture, and
+        # the jogged range.
+        magnification = self.prompt_magnification()
 
         apertures = aperture_sequence(
             self.camera.list_apertures(),
             whole_stop_scale=self.config.WHOLE_STOP_SCALE,
             max_fstop=self.config.MAX_FSTOP,
         )
+        if not apertures:
+            raise RuntimeError("camera reports no apertures; aborting")
+        widest_aperture_str = apertures[0]
+        widest_aperture = _parse_fnum(widest_aperture_str)
+
+        # Jog → planner → check refuse loop. The user can re-jog as
+        # many times as they want until the range yields the
+        # configured minimum rail-position count.
+        end_mm, plan = self._jog_and_plan(
+            magnification=magnification,
+            widest_aperture=widest_aperture,
+            widest_aperture_str=widest_aperture_str,
+        )
+        steps = plan.rail_positions
+        step_size_mm = math.copysign(plan.rail_step_mm, end_mm)
+
+        # Move rail back to position 0 with backlash compensation.
+        # end_mm and step_size_mm may be negative (user jogged
+        # backward to END) — use the sign-aware helper so the rail
+        # gets a non-negative distance with the correct direction.
+        self._return_rail_to_zero(end_mm)
 
         # One sharpness collector per lens config. Crops land under
         # <lens>/<aperture>/cropped/<crop-name>/<source-filename>.jpg
@@ -477,6 +498,8 @@ class SessionRunner:
                 steps=steps,
                 step_size_mm=step_size_mm,
                 apertures=apertures,
+                magnification=magnification,
+                plan=plan,
             )
         finally:
             try:
@@ -489,6 +512,53 @@ class SessionRunner:
                 self.range_checker.set_collector(None)
             self._sharpness_collector = None
 
+    def _jog_and_plan(
+        self,
+        *,
+        magnification: float,
+        widest_aperture: float,
+        widest_aperture_str: str,
+    ) -> tuple[float, SamplePlan]:
+        """Run the jog UI, build a sweep plan, and refuse-prompt-rejog
+        if the resulting position count is below
+        ``config.MIN_RAIL_POSITIONS``.
+
+        Returns ``(end_mm, plan)``. ``end_mm`` is signed (negative
+        if the user jogged backward); ``plan.rail_positions`` is
+        guaranteed ≥ MIN_RAIL_POSITIONS.
+        """
+        min_positions = int(getattr(self.config, "MIN_RAIL_POSITIONS", 10))
+        while True:
+            jog_result = self.jog(self.rail)  # type: ignore[misc]
+            end_mm = jog_result.end_mm
+            plan = self.plan_sweep(
+                magnification=magnification,
+                widest_aperture=widest_aperture,
+                max_aperture=self.config.MAX_FSTOP,
+                rail_range_mm=abs(end_mm),
+                replicas=int(getattr(self.config, "SHOTS_PER_STEP_APERTURE", 1)),
+            )
+            positions = plan.rail_positions or 0
+            if positions >= min_positions:
+                self._announce(
+                    f"Plan: M={magnification:g}, widest={widest_aperture_str}, "
+                    f"rail_step={plan.rail_step_mm:.3f} mm, "
+                    f"positions={positions}, "
+                    f"replicas={plan.replicas_per_position}"
+                )
+                return end_mm, plan
+            ok = self.confirm(
+                f"\nJogged range ({abs(end_mm):.2f} mm) yields only "
+                f"{positions} rail positions at M={magnification:g}, "
+                f"widest={widest_aperture_str} (planner step="
+                f"{plan.rail_step_mm:.3f} mm; need ≥ {min_positions} "
+                "positions for reliable peak detection).\n"
+                "[ENTER] re-jog START / END, [q] abort: "
+            )
+            if not ok:
+                raise SessionAborted("user aborted at tiny-range prompt")
+            # Loop: re-jog, recompute plan.
+
     def _run_one_lens_config_inner(
         self,
         *,
@@ -498,6 +568,8 @@ class SessionRunner:
         steps: int,
         step_size_mm: float,
         apertures: list[str],
+        magnification: float,
+        plan: SamplePlan,
     ) -> None:
 
         # Calibration at rail step 0.
@@ -587,10 +659,14 @@ class SessionRunner:
                 except _RejogRequested:
                     # User wants new START / END; rewind, recreate
                     # the collector, rerun the sweep loop.
-                    end_mm, steps, step_size_mm = self._rejog_for_lens_config(
+                    widest_aperture_str = apertures[0]
+                    end_mm, steps, step_size_mm, plan = self._rejog_for_lens_config(
                         lens_dir=lens_dir,
                         current_position_mm=(steps - 1) * step_size_mm,
                         slug=slug,
+                        magnification=magnification,
+                        widest_aperture=_parse_fnum(widest_aperture_str),
+                        widest_aperture_str=widest_aperture_str,
                     )
                     continue
             break
@@ -604,9 +680,20 @@ class SessionRunner:
         # Record this lens config in session metadata *before* the
         # lens-change prompt — if the user types `q` to abort the
         # session there, the work we just did still needs to show up
-        # in session.json.
-        if self.metadata is not None and slug not in self.metadata.lens_configs:
-            self.metadata.lens_configs.append(slug)
+        # in session.json. Each entry carries the magnification, the
+        # widest aperture, and the full SamplePlan (incl. the
+        # subsample_factors that downstream tooling will eventually
+        # honour at analysis time).
+        from dataclasses import asdict as _asdict
+        if self.metadata is not None and not any(
+            lc.get("slug") == slug for lc in self.metadata.lens_configs
+        ):
+            self.metadata.lens_configs.append({
+                "slug": slug,
+                "magnification": float(magnification),
+                "widest_aperture": float(plan.widest_aperture),
+                "sample_plan": _asdict(plan),
+            })
             self._write_metadata()
 
         # Lens-change prompt.
@@ -1345,19 +1432,27 @@ class SessionRunner:
         lens_dir: Path,
         current_position_mm: float,
         slug: str | None = None,
-    ) -> tuple[float, int, float]:
+        magnification: float = 1.0,
+        widest_aperture: float = 4.0,
+        widest_aperture_str: str = "f/4",
+    ) -> tuple[float, int, float, SamplePlan]:
         """Run the jog UI again, return rail to step 0, and rebuild
         the per-lens-config sharpness collector so the next sweep's
         dataset is fresh.
 
-        Returns the new ``(end_mm, steps, step_size_mm)``.
+        Returns ``(end_mm, steps, step_size_mm, plan)``. The new
+        plan includes any updated ``rail_positions`` for the
+        re-jogged range.
         """
         if self.jog is None:
             raise RuntimeError("SessionRunner.jog not configured")
-        jog_result = self.jog(self.rail)
-        end_mm = jog_result.end_mm
-        steps = self.prompt_step_count()
-        step_size_mm = end_mm / (steps - 1)
+        end_mm, plan = self._jog_and_plan(
+            magnification=magnification,
+            widest_aperture=widest_aperture,
+            widest_aperture_str=widest_aperture_str,
+        )
+        steps = plan.rail_positions or 0
+        step_size_mm = math.copysign(plan.rail_step_mm, end_mm)
         # Rail is wherever the jog left it; bring it back to step 0
         # via the sign-aware return helper.
         self._return_rail_to_zero(self.rail.position_mm)
@@ -1390,7 +1485,7 @@ class SessionRunner:
                     and r.get("phase") in stale_phases
                 )
             )
-        return end_mm, steps, step_size_mm
+        return end_mm, steps, step_size_mm, plan
 
     def _reshoot_steps(
         self,

@@ -13,9 +13,64 @@ from sharpness.planner import (
     POSITIONS_ACROSS_FWHM_HIGH_MAG,
     SamplePlan,
     estimate_dof_mm,
+    parse_aperture,
+    parse_magnification,
     plan_sweep,
     subsample_factor,
 )
+
+
+# --- parse_magnification ------------------------------------------------
+
+
+class TestParseMagnification:
+    def test_one_to_one_ratio(self) -> None:
+        assert parse_magnification("1:1") == 1.0
+
+    def test_one_and_a_half_to_one_ratio(self) -> None:
+        assert parse_magnification("1.5:1") == 1.5
+
+    def test_one_to_one_and_a_half_ratio(self) -> None:
+        assert parse_magnification("1:1.5") == pytest.approx(1.0 / 1.5)
+
+    def test_two_to_one_ratio(self) -> None:
+        assert parse_magnification("2:1") == 2.0
+
+    def test_bare_float(self) -> None:
+        assert parse_magnification("0.5") == 0.5
+        assert parse_magnification("1") == 1.0
+        assert parse_magnification("1.0") == 1.0
+
+    def test_whitespace_tolerated(self) -> None:
+        assert parse_magnification("  1:1  ") == 1.0
+        assert parse_magnification(" 1.5 : 1 ") == 1.5
+
+    @pytest.mark.parametrize("bad", ["", "abc", "1:0", "0:1", "1:", ":1", "-1", "1:-1"])
+    def test_invalid_raises(self, bad: str) -> None:
+        with pytest.raises(ValueError):
+            parse_magnification(bad)
+
+
+# --- parse_aperture -----------------------------------------------------
+
+
+class TestParseAperture:
+    @pytest.mark.parametrize("text,expected", [
+        ("f/4", 4.0),
+        ("F/4.5", 4.5),
+        ("f/2.8", 2.8),
+        ("4", 4.0),
+        ("4.5", 4.5),
+        ("f/16", 16.0),
+        ("  f/8  ", 8.0),
+    ])
+    def test_accepts_common_forms(self, text: str, expected: float) -> None:
+        assert parse_aperture(text) == expected
+
+    @pytest.mark.parametrize("bad", ["", "abc", "0", "-4", "f/abc"])
+    def test_invalid_raises(self, bad: str) -> None:
+        with pytest.raises(ValueError):
+            parse_aperture(bad)
 
 
 # --- estimate_dof_mm ----------------------------------------------------

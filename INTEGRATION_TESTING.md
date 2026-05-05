@@ -387,13 +387,13 @@ After steps 1-4 all pass.
 The runner will:
 1. Open hardware, run `verify_healthy`, apply session config, run FEC sanity check.
 2. Prompt: `Lens config (free text, blank to quit):` — enter something descriptive, e.g. `Sigma 105 macro test 1`.
-3. Drop into the START jog. Use `a/d` (fine, 0.05 mm) and `A/D` (coarse, 1 mm) to position the rail at the start of focus, then press `s`.
-4. END jog. Position the rail at the deepest focus point. Press `e`.
-5. Prompt: `Number of rail steps for this lens config (>=2):` — enter `5` for a deliberately quick test.
-6. Confirmation prompt; ENTER to begin.
-7. Calibration phase: one test shot per aperture at rail position 0. Watch the terminal — it should converge each aperture's FEC within ≤ 3 shots.
-8. Sweep phase: 5 rail steps × N apertures. You'll hear the rail step and the flashes fire per shot. Cropping happens in the background per shot.
-9. Range check at end: with the real `SharpnessRangeChecker` it'll either `ok` (write `range_check.json` and move on) or trigger the probe + extension flow. With a 5-step deliberately-narrow range it'll likely trigger one side.
+3. Prompt: `Magnification (e.g. 1:1, 1.5:1, 1:1.5, or a number like 0.5):` — enter the lens's working magnification ratio.
+4. Drop into the START jog. Use `a/d` (fine, 0.05 mm) and `A/D` (coarse, 1 mm) to position the rail at the start of focus, then press `s`.
+5. END jog. Position the rail at the deepest focus point. Press `e`.
+6. Runner prints the plan: `Plan: M=1, widest=f/2.8, rail_step=0.034 mm, positions=88, replicas=3`. If the jogged range gives fewer than `MIN_RAIL_POSITIONS` (default 10) positions, you'll be prompted: `[ENTER] re-jog START / END, [q] abort`. Re-jog wider, plan succeeds.
+7. Calibration phase: one test shot per aperture at rail position 0. Watch the terminal — it should converge each aperture's FEC (and EC + ISO if needed) within ≤ 3 shots.
+8. Sweep phase: `positions` rail steps × N apertures × `replicas` per (step, aperture). You'll hear the rail step and the flashes fire per shot. Cropping happens in the background per shot.
+9. Range check at end: with the real `SharpnessRangeChecker` it'll either `ok` (write `range_check.json` and move on) or trigger the probe + extension flow.
 10. Lens change prompt: ENTER to continue (or `q` to abort gracefully).
 11. Empty lens-config name → graceful shutdown.
 

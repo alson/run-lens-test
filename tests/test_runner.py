@@ -55,6 +55,8 @@ def cfg():
         EC_MIN_EV=-3.0,
         EC_MAX_EV=+3.0,
         EC_STEP_EV=1 / 3,
+        SHOTS_PER_STEP_APERTURE=1,
+        MIN_RAIL_POSITIONS=2,
         TEST_SHOT_TOLERANCE_EV=1 / 3,
         TEST_SHOT_MAX_RETRIES=3,
         ROLLING_WINDOW=5,
@@ -225,8 +227,8 @@ def make_runner(
     def _prompt_lens() -> str | None:
         return inputs.get("lens", "lens-1")
 
-    def _prompt_step_count() -> int:
-        return inputs.get("steps", 3)
+    def _prompt_magnification() -> float:
+        return inputs.get("magnification", 1.0)
 
     def _confirm(_msg) -> bool:
         return inputs.get("confirm", True)
@@ -236,6 +238,32 @@ def make_runner(
         end_mm = inputs.get("end_mm", 4.0)
         rail.position_mm = end_mm
         return JogResult(end_mm=end_mm)
+
+    # Fake planner so tests can set "steps" via inputs without
+    # caring about the underlying physics (DOF / FWHM math). The
+    # plan honours the legacy ``inputs["steps"]`` and the
+    # ``inputs["end_mm"]`` so existing fixtures keep working with
+    # minimal churn.
+    from sharpness.planner import SamplePlan
+
+    def _fake_plan_sweep(
+        *, magnification, widest_aperture, max_aperture,
+        rail_range_mm, replicas,
+        coc_mm=None, positions_across_fwhm=None,
+    ) -> SamplePlan:
+        steps = inputs.get("steps", 3)
+        step_size = rail_range_mm / max(1, steps - 1) if steps > 1 else rail_range_mm
+        return SamplePlan(
+            rail_step_mm=step_size,
+            replicas_per_position=replicas,
+            estimated_dof_mm_widest=1.0,
+            estimated_fwhm_mm_widest=0.5,
+            widest_aperture=widest_aperture,
+            max_aperture=max_aperture,
+            subsample_factors={widest_aperture: 1},
+            rail_range_mm=rail_range_mm,
+            rail_positions=steps,
+        )
 
     return SessionRunner(
         camera=camera,
@@ -248,7 +276,8 @@ def make_runner(
         sleep=lambda s: None,
         now=lambda: fixed_now,
         prompt_lens_config=_prompt_lens,
-        prompt_step_count=_prompt_step_count,
+        prompt_magnification=_prompt_magnification,
+        plan_sweep=_fake_plan_sweep,
         confirm=_confirm,
         jog=_jog,
     )
@@ -290,6 +319,93 @@ class TestStartStop:
 
 
 # ---- One full lens-config sweep --------------------------------------------
+
+
+class TestTinyRangeRejog:
+    """When the planner returns fewer rail positions than
+    ``MIN_RAIL_POSITIONS``, the runner refuses and prompts a
+    re-jog. ENTER → re-jog with the new range; q → SessionAborted."""
+
+    def test_rejogs_when_range_yields_too_few_positions(
+        self, cfg, tmp_path
+    ) -> None:
+        # MIN_RAIL_POSITIONS=2 in the test cfg; force the first plan
+        # to return 1 (below the floor) and the second to return 3.
+        cfg.MIN_RAIL_POSITIONS = 3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        from sharpness.planner import SamplePlan as _SamplePlan
+        plan_calls = {"n": 0}
+
+        def _plan(*, rail_range_mm, replicas, widest_aperture, max_aperture, **_):
+            plan_calls["n"] += 1
+            positions = 1 if plan_calls["n"] == 1 else 4
+            return _SamplePlan(
+                rail_step_mm=rail_range_mm / max(1, positions - 1),
+                replicas_per_position=replicas,
+                estimated_dof_mm_widest=1.0,
+                estimated_fwhm_mm_widest=0.5,
+                widest_aperture=widest_aperture,
+                max_aperture=max_aperture,
+                subsample_factors={widest_aperture: 1},
+                rail_range_mm=rail_range_mm,
+                rail_positions=positions,
+            )
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"lens": "L", "end_mm": 4.0},
+        )
+        runner.plan_sweep = _plan
+        confirm_msgs: list[str] = []
+
+        def _confirm(msg: str) -> bool:
+            confirm_msgs.append(msg)
+            return True   # ENTER → re-jog
+
+        runner.confirm = _confirm
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        # Tiny-range prompt fired once.
+        assert any("yields only" in m for m in confirm_msgs)
+        # Plan was called twice (first refused, second accepted).
+        assert plan_calls["n"] == 2
+
+    def test_q_at_tiny_range_prompt_aborts(self, cfg, tmp_path) -> None:
+        from errors import SessionAborted
+        cfg.MIN_RAIL_POSITIONS = 3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        from sharpness.planner import SamplePlan as _SamplePlan
+
+        def _plan(*, rail_range_mm, replicas, widest_aperture, max_aperture, **_):
+            return _SamplePlan(
+                rail_step_mm=rail_range_mm,
+                replicas_per_position=replicas,
+                estimated_dof_mm_widest=1.0,
+                estimated_fwhm_mm_widest=0.5,
+                widest_aperture=widest_aperture,
+                max_aperture=max_aperture,
+                subsample_factors={widest_aperture: 1},
+                rail_range_mm=rail_range_mm,
+                rail_positions=1,  # always too few
+            )
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 5,
+            inputs={"lens": "L", "end_mm": 4.0},
+        )
+        runner.plan_sweep = _plan
+        runner.confirm = lambda _msg: False  # q at tiny-range prompt
+        runner.prompt_lens_config = lambda: "L"
+
+        with pytest.raises(SessionAborted, match="tiny-range"):
+            runner.run()
 
 
 class TestSweep:
@@ -796,6 +912,10 @@ class TestLensChange:
             runner.run()
 
         meta = json.loads((runner.session_dir / "session.json").read_text())
-        assert meta["lens_configs"] == ["test-lens"]
+        slugs = [lc["slug"] for lc in meta["lens_configs"]]
+        assert slugs == ["test-lens"]
+        # Per-lens-config dict carries the magnification + plan.
+        assert meta["lens_configs"][0]["magnification"] == 1.0
+        assert "sample_plan" in meta["lens_configs"][0]
         assert meta["aborted"] is True
         assert meta["ended_at"] is not None

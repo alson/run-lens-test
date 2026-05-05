@@ -204,6 +204,9 @@ class SessionMetadata:
     stackshot_software_id: int | None = None
     stackshot_hardware_id: int | None = None
     baseline_median_luminance: float | None = None
-    lens_configs: list[str] = field(default_factory=list)
+    lens_configs: list[dict[str, Any]] = field(default_factory=list)
+    """Per-completed-lens-config metadata. Each entry is a dict with
+    keys ``slug``, ``magnification``, ``widest_aperture``, and
+    ``sample_plan`` (the full SamplePlan as a dict)."""
     aborted: bool = False
     notes: str = ""

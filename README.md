@@ -102,10 +102,16 @@ The program will:
 1. Open the StackShot and camera.
 2. Validate camera state (M mode, full config tree, FEC sanity test).
 3. Prompt for the first lens configuration as a free-text line.
-4. Drop you into a jog session: use `a`/`d` to step the rail back/forward
+4. Prompt for the **magnification** in ratio (`1:1`, `1.5:1`, `1:1.5`,
+   `2:1`) or float form (`0.5`, `1.0`). The runner uses this plus the
+   lens's widest aperture to compute the rail step size from a thin-lens
+   DOF model — you no longer pick a step count manually.
+5. Drop you into a jog session: use `a`/`d` to step the rail back/forward
    in fine increments, `A`/`D` for coarse, `s` to mark the start position,
    `e` to mark the end, `q` to abort. The current position is shown live.
-5. Ask for a step count.
+   The runner prints the planned rail step + position count once you've
+   set END; if the jogged range yields fewer than `MIN_RAIL_POSITIONS`
+   (default 10) positions, you'll be prompted to re-jog wider.
 6. Run FEC calibration at step 0 (one test shot per aperture, possibly more).
 7. Run the rail sweep.
 8. Notify on completion and prompt for the next lens config.

@@ -495,13 +495,26 @@ class TestOffTarget:
             rail.position_mm = end
             return JogResult(end_mm=end)
 
-        # Step counts: first call returns 3, second returns 4
-        # (re-jog asks again).
-        step_calls = {"n": 0}
+        # Step counts: first plan call returns 3 positions, second
+        # returns 4 (re-jog with new range).
+        plan_calls = {"n": 0}
 
-        def _step_count() -> int:
-            step_calls["n"] += 1
-            return 3 if step_calls["n"] == 1 else 4
+        from sharpness.planner import SamplePlan as _SamplePlan
+
+        def _plan(*, rail_range_mm, replicas, widest_aperture, max_aperture, **_kw):
+            plan_calls["n"] += 1
+            steps = 3 if plan_calls["n"] == 1 else 4
+            return _SamplePlan(
+                rail_step_mm=rail_range_mm / max(1, steps - 1),
+                replicas_per_position=replicas,
+                estimated_dof_mm_widest=1.0,
+                estimated_fwhm_mm_widest=0.5,
+                widest_aperture=widest_aperture,
+                max_aperture=max_aperture,
+                subsample_factors={widest_aperture: 1},
+                rail_range_mm=rail_range_mm,
+                rail_positions=steps,
+            )
 
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
@@ -509,7 +522,7 @@ class TestOffTarget:
             inputs={"lens": "L"},
         )
         runner.jog = _jog
-        runner.prompt_step_count = _step_count
+        runner.plan_sweep = _plan
         runner.prompt_off_target = (
             lambda msg: (prompts.append(msg), "rejog")[1]
         )

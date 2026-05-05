@@ -124,6 +124,61 @@ class SamplePlan:
         return self.rail_positions * self.replicas_per_position
 
 
+def parse_magnification(text: str) -> float:
+    """Parse a magnification expression to a float.
+
+    Accepts:
+    * Ratio form: ``"1:1"`` → 1.0, ``"1.5:1"`` → 1.5, ``"1:1.5"`` →
+      ≈ 0.667, ``"2:1"`` → 2.0. Numerator and denominator must both
+      be positive numbers.
+    * Bare float: ``"1.0"`` → 1.0, ``"0.5"`` → 0.5, ``"1"`` → 1.0.
+
+    Whitespace tolerant. Raises :class:`ValueError` on unparseable
+    input or non-positive result.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("empty magnification")
+    if ":" in cleaned:
+        parts = cleaned.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"bad ratio: {text!r}")
+        num_text, den_text = parts[0].strip(), parts[1].strip()
+        try:
+            num = float(num_text)
+            den = float(den_text)
+        except ValueError as exc:
+            raise ValueError(f"bad ratio: {text!r}") from exc
+        if num <= 0 or den <= 0:
+            raise ValueError(f"ratio must be positive: {text!r}")
+        return num / den
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"bad magnification: {text!r}") from exc
+    if value <= 0:
+        raise ValueError(f"magnification must be positive, got {value}")
+    return value
+
+
+def parse_aperture(text: str) -> float:
+    """Parse an aperture expression like ``"f/4"``, ``"F/4.5"``,
+    ``"4"``, or ``"4.5"`` to a float.
+
+    Strips an optional leading ``f`` / ``F`` and ``/`` so both the
+    Z7 widget format (``f/4.5``) and bare numbers work. Raises
+    :class:`ValueError` on bad input.
+    """
+    cleaned = text.strip().lstrip("fF").lstrip("/")
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"bad aperture: {text!r}") from exc
+    if value <= 0:
+        raise ValueError(f"aperture must be positive, got {value}")
+    return value
+
+
 def estimate_dof_mm(
     magnification: float,
     aperture: float,

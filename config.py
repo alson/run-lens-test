@@ -60,6 +60,14 @@ EC_STEP_EV = 1.0 / 3.0
 PLATEAU_DETECT_THRESHOLD = 0.5  # ratio
 PLATEAU_DETECT_MIN_EV = 1.0     # don't fire on a single ⅓-stop bump
 
+# ---- Sample planner --------------------------------------------------------
+# Minimum rail positions for a usable sweep. The advisor's bell-curve
+# detector needs at least ~10 points across the captured range to land
+# a confident peak / truncation verdict at the widest aperture's narrow
+# DOF. If the planner's step size × jogged range yields fewer positions
+# than this, the runner refuses and prompts the user to re-jog wider.
+MIN_RAIL_POSITIONS = 10
+
 # ---- Camera startup ---------------------------------------------------------
 
 MIN_CONFIG_TREE_SIZE = 100
