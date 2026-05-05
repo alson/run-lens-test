@@ -385,7 +385,10 @@ class SessionRunner:
         step_size_mm = end_mm / (steps - 1)
 
         # Move rail back to position 0 with backlash compensation.
-        self.rail.move_and_wait(Direction.BACKWARD, end_mm, backlash=True)
+        # end_mm and step_size_mm may be negative (user jogged
+        # backward to END) — use the sign-aware helper so the rail
+        # gets a non-negative distance with the correct direction.
+        self._return_rail_to_zero(end_mm)
 
         apertures = aperture_sequence(
             self.camera.list_apertures(),
@@ -510,10 +513,19 @@ class SessionRunner:
             window=self.config.ROLLING_WINDOW,
             criteria=(self.config.DROOP_CRIT_A, self.config.DROOP_CRIT_B),
         )
+        # Sweep direction is the sign of step_size_mm. With a positive
+        # end_mm (user jogged forward) sweep direction is FORWARD; with
+        # negative (user jogged backward) it's BACKWARD. backlash=False
+        # is correct either way as long as we never reverse direction
+        # mid-sweep.
+        sweep_direction = (
+            Direction.FORWARD if step_size_mm >= 0 else Direction.BACKWARD
+        )
+        sweep_step_distance = abs(step_size_mm)
         for step_index in range(steps):
             if step_index > 0:
                 self.rail.move_and_wait(
-                    Direction.FORWARD, step_size_mm, backlash=False
+                    sweep_direction, sweep_step_distance, backlash=False
                 )
             position_mm = step_index * step_size_mm
             self._run_one_step(

@@ -140,7 +140,7 @@ def jog_loop(
                 write_status(position, f"{label} set")
             return position
         if key == PANEL_RELEASE_KEY:
-            position = _release_to_panel(
+            position, panel_pending = _release_to_panel(
                 controller=controller,
                 read_key=read_key,
                 write_status=write_status,
@@ -148,6 +148,8 @@ def jog_loop(
                 on_release=on_release,
                 on_reacquire=on_reacquire,
             )
+            if panel_pending is not None:
+                pending_key = panel_pending
             continue
         step = _step_for_key(key, keys)
         if step is None:
@@ -193,7 +195,7 @@ def _release_to_panel(
     label: str,
     on_release: Callable[[], None] | None = None,
     on_reacquire: Callable[[], None] | None = None,
-) -> float:
+) -> tuple[float, str | None]:
     """Drop USB control so the user can drive the rail with the
     StackShot's physical buttons (and, via ``on_release``, regain
     direct LCD/AF control of the camera). Returns the position the
@@ -212,7 +214,7 @@ def _release_to_panel(
         controller.release_to_panel()
     except NotImplementedError as exc:
         write_status(controller.get_position(), f"{label} (panel release not supported: {exc})")
-        return controller.get_position()
+        return controller.get_position(), None
     if on_release is not None:
         try:
             on_release()
@@ -229,6 +231,14 @@ def _release_to_panel(
         k = read_key()
         if k in ("\r", "\n"):
             break
+    # Immediate visual feedback BEFORE the slow reacquire (camera
+    # re-init can take ~2 s). Without this the user thinks ENTER
+    # didn't register and queues more keystrokes that leak into the
+    # next prompt.
+    write_status(
+        controller.get_position(),
+        f"{label} | reacquiring camera + rail…",
+    )
     if on_reacquire is not None:
         try:
             on_reacquire()
@@ -238,9 +248,26 @@ def _release_to_panel(
                 f"{label} (on_reacquire callback failed: {exc})",
             )
     controller.take_from_panel()
+    # Drain extra ENTERs the user queued during the slow reacquire,
+    # but if any non-ENTER key shows up forward it to the caller as
+    # a pending key (so e.g. `s`/`e`/`q` typed in eagerness still
+    # get processed on the next iteration). Best-effort: skip if
+    # read_key doesn't accept a timeout (legacy test fixtures).
+    pending: str | None = None
+    try:
+        while True:
+            k = read_key(0.0)
+            if k is None:
+                break
+            if k in ("\r", "\n"):
+                continue
+            pending = k
+            break
+    except TypeError:
+        pass
     position = controller.get_position()
     write_status(position, label)
-    return position
+    return position, pending
 
 
 # ---- Production wiring: termios + stdout -----------------------------------
