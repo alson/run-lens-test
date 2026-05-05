@@ -156,6 +156,39 @@ class TestLiveCollector:
         assert called_args[0] == tmp_path / "x.jpg"
         assert called_args[1] == tmp_path
 
+    def test_clear_samples_for_steps_drops_matching_rail_steps(
+        self, tmp_path: Path
+    ) -> None:
+        # Build a 3-step × 2-aperture dataset, then drop steps {1, 2}.
+        # Step 0 survives at both apertures; samples at steps 1 and 2
+        # are gone.
+        with LiveCollector(
+            tmp_path,
+            crop_fn=_fake_crop({"center": 1}),
+            max_workers=1,
+        ) as c:
+            for step in range(3):
+                for ap in (4.0, 8.0):
+                    c.record_shot(step, ap, tmp_path / f"x_{step}_{ap}.jpg")
+            c.wait_for_pending()
+            assert len(c.dataset.samples) == 6
+            c.clear_samples_for_steps([1, 2])
+            survivors = c.dataset.samples
+            assert len(survivors) == 2
+            assert {s.rail_step for s in survivors} == {0}
+            assert {s.aperture for s in survivors} == {4.0, 8.0}
+
+    def test_clear_samples_for_steps_empty_is_noop(self, tmp_path: Path) -> None:
+        with LiveCollector(
+            tmp_path,
+            crop_fn=_fake_crop({"center": 1}),
+            max_workers=1,
+        ) as c:
+            c.record_shot(0, 4.0, tmp_path / "x.jpg")
+            c.wait_for_pending()
+            c.clear_samples_for_steps([])
+            assert len(c.dataset.samples) == 1
+
     def test_crops_under_source_routes_per_aperture(self, tmp_path: Path) -> None:
         # In production the runner sets crops_under_source=True so the
         # cropper writes to <jpg.parent>/cropped/<crop>/<source>.

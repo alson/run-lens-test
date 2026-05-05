@@ -1261,10 +1261,30 @@ class SessionRunner:
         reshoot are *not* fed back into the droop detector — its
         windows are reset by the caller after this returns.
         """
+        # Step numbering in user-facing messages matches the
+        # progress bar's 1-based count.
         self._announce(
-            f"Reshooting steps {from_step}..{through_step} after droop "
+            f"Reshooting steps {from_step + 1}..{through_step + 1} after droop "
             "(overwriting under-exposed frames)..."
         )
+        # Drop the (already-cropped) under-exposed samples at the
+        # reshoot range from the in-memory collector dataset; the
+        # reshoot's record_shot calls will re-add fresh samples.
+        # Without this, the next range_check evaluate() sees both
+        # versions of every (step, aperture) — twice as many points
+        # at those steps, with the under-exposed values dragging the
+        # max/min ratio up so a genuinely flat curve no longer trips
+        # the OFF_TARGET threshold.
+        if self._sharpness_collector is not None:
+            try:
+                self._sharpness_collector.wait_for_pending()
+            except Exception:                            # noqa: BLE001
+                log.exception("sharpness wait_for_pending before reshoot failed")
+            clear = getattr(
+                self._sharpness_collector, "clear_samples_for_steps", None
+            )
+            if clear is not None:
+                clear(range(from_step, through_step + 1))
         # Move rail backward to from_step's position with backlash
         # compensation (we're reversing direction).
         self._move_to(from_position_mm, from_step * step_size_mm)

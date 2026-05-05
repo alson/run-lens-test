@@ -149,6 +149,27 @@ class LiveCollector:
         self._futures.append(fut)
         return fut
 
+    def clear_samples_for_steps(self, step_indices) -> None:
+        """Drop every accumulated sample whose ``rail_step`` is in
+        ``step_indices`` (any iterable).
+
+        Used by the runner before a droop-recovery reshoot: the
+        original under-exposed samples at those steps would otherwise
+        sit alongside the fresh reshoot samples, doubling the
+        per-step point count and turning genuinely flat curves into
+        noisy ones that fool the truncation detector. This is a
+        synchronous in-memory drop; in-flight crops still resolve
+        and may add new samples after this returns — call
+        :meth:`wait_for_pending` first if that matters.
+        """
+        targets = set(step_indices)
+        if not targets:
+            return
+        with self._lock:
+            self._dataset.samples[:] = [
+                s for s in self._dataset.samples if s.rail_step not in targets
+            ]
+
     def wait_for_pending(self) -> None:
         """Block until every ``record_shot()`` submitted so far has
         finished cropping. Subsequent ``record_shot()`` calls continue
