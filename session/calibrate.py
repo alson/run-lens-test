@@ -244,11 +244,17 @@ class Calibrator:
                 cfg.FEC_MIN_EV,
                 cfg.FEC_MAX_EV,
             )
+            # Saturation check uses *current* fec, not new_fec. Otherwise
+            # the very first shot at FEC=0 with a delta beyond
+            # FEC_MAX_EV — e.g. -1.7 EV → new_fec clamps to +1.0 —
+            # would be misread as "already at FEC_MAX" and trigger an
+            # ISO bump while skipping the actual ``set_fec(new_fec)``
+            # line below; FEC ends up stuck at 0 forever.
             fec_saturated_low = (
-                new_fec == cfg.FEC_MIN_EV and delta > cfg.TEST_SHOT_TOLERANCE_EV
+                fec == cfg.FEC_MIN_EV and delta > cfg.TEST_SHOT_TOLERANCE_EV
             )
             fec_saturated_high = (
-                new_fec == cfg.FEC_MAX_EV and delta < -cfg.TEST_SHOT_TOLERANCE_EV
+                fec == cfg.FEC_MAX_EV and delta < -cfg.TEST_SHOT_TOLERANCE_EV
             )
             if fec_saturated_high:
                 # Under-exposing at FEC_MAX — bump ISO by ⅓ stop.

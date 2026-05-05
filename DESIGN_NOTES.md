@@ -294,7 +294,121 @@ aperture's exposure isn't masked by another aperture's correct shots.
   empirical testing showed gphoto2 + SB-5000 commander gives us
   everything we need.
 
-## 5. What would be different if redoing the project
+## 5. On-rig discoveries (2026-05-05)
+
+Validated and refined on the rig over a full afternoon of integration
+testing. The session log of changes:
+
+### 5.1 Z7 needs USB 3.0+ cable
+
+A USB 2.0 cable enumerates the Z7 at 480 Mbps. Capture appears to
+succeed (shutter fires, flashes go off) but the post-capture file
+retrieval throws `PTP General Error / I/O problem` and wedges the
+gphoto2 USB session. The 12 MB JPEG bulk transfer simply can't
+sustain through a 480M link. Use a 5 Gbps+ cable; verify with
+`lsusb -t` showing the Z7 at `5000M`. Documented in the README
+troubleshooting table.
+
+### 5.2 Capture timing — batching + recycle subtraction
+
+Profiled with `tools/profile_capture.py`. With three separate
+`set_aperture` / `set_iso` / `set_fec` calls per shot, each
+`get_config → mutate → set_config → drain_events` round-trip costs
+~1.5–3 s on the Z7 — total ~6.6 s of PTP overhead per shot.
+Batched into a single `set_aperture_iso_fec` (one `get_config`,
+mutate three widgets, one `set_config`, one drain) it drops to
+~2.5 s. On a 5-aperture step the saving is ~20 s; on a 750-shot
+session it's ~17 minutes.
+
+The flash recycle wait (per-aperture `RANGE_EXTENSION[ap][1]`,
+3–6 s) is now subtracted by elapsed time since the previous
+shutter — `set_aperture_iso_fec` runs *during* the recycle window
+rather than on top of it. The recycle is keyed on the *previous*
+shot's aperture (small apertures = more flash power discharged =
+longer recycle), not the upcoming one, so the f/16 → next-step
+f/4.5 wait happens after the f/16 capture and is mostly absorbed
+by the rail move.
+
+### 5.3 BASELINE_REFERENCE_IMAGE
+
+Each session was previously calibrating against the first
+widest-aperture shot of the first lens config — fine for
+within-session comparability but lens-config-dependent for
+inter-session comparability (a session that opens with 105 mm + 1:1
++ extension tubes lands at a different baseline than one that
+opens with no extension, even though the wafer reflectance is the
+same). `BASELINE_REFERENCE_IMAGE` lets you point at one canonical
+JPEG; the runner reads its central-crop median once at session
+start and that becomes the absolute reference for every session.
+
+The median needs to be reachable for the rig. If the chosen
+reference is too bright for the current lens / extension /
+flash-distance combo, the calibrator can't close the gap and every
+sweep starts under-exposed. Pick a representative previous shot
+at a similar magnification.
+
+### 5.4 Calibrator FEC-saturation off-by-one (fixed mid-session)
+
+Real bug surfaced when calibration was 1.7 EV under target with
+FEC headroom available: the saturation check used `new_fec`
+(the clamped *target*) instead of `fec` (the current value).
+First shot at FEC=0, dim by 1.7 EV → `new_fec = clamp(+1.667, …)
+= +1.0 == FEC_MAX_EV` → misread as "FEC already at max" → ISO
+bumped instead of FEC set. Loop never escaped FEC=0; calibration
+exhausted retries with all 6 ISO bumps and gave up. Fixed
+2026-05-05; check uses *current* `fec`.
+
+### 5.5 Multiple shots per (rail step, aperture)
+
+JPEG-encoding noise on a single shot can mask a weak focus signal:
+on a 7-step sweep where the bell amplitude is small, file-size
+max/min landed below the OFF_TARGET threshold (1.15) even when the
+data was real. `SHOTS_PER_STEP_APERTURE = 3` captures three replicas
+per (step, aperture); the advisor and `SharpnessRangeChecker` call
+`CollectedDataset.aggregated()` to take a per-crop median across
+replicas before peak detection. Replica 0 keeps the legacy filename
+(`step_NNNN.jpg`) so existing offline-analysis tooling works
+unchanged; replicas 1, 2, … get `_b`, `_c`, … suffixes.
+
+### 5.6 Droop reshoot from earliest under-exposed step
+
+Droop pause originally just reset the rolling window and continued
+forward — but the under-exposed shots before the trip stayed in
+the dataset. Now on resume the runner finds the earliest step
+across all apertures whose EV ≤ the firing trip threshold, rewinds
+the rail there, and reshoots that step through the trigger step
+inclusive. The reshoot's EVs feed the droop detector again; if a
+flash you didn't catch on the first swap is still weak, droop
+re-fires and `_handle_droop` recurses into another reshoot. CSV
+stays clean across nesting: each `_reshoot_steps` start drops
+`phase ∈ {sweep, aborted, reshoot}` rows for its range so a nested
+reshoot's clean rows replace its parent's bad ones.
+
+### 5.7 Off-target detection + re-jog
+
+The `Verdict.OFF_TARGET` aperture verdict (no truncated *and* no
+`CropStatus.OK` crops) propagates as `RangeResult.all_off_target`
+when *every* aperture lands there. The runner alerts (ntfy +
+chirp), prompts `[ENTER] re-jog / [s] skip / [q] abort`, and on
+re-jog reruns the jog UI without re-calibrating; the prior sweep's
+shots.csv rows are dropped. Triggers when the rail span misses
+the focus zone or the wafer position lacks micro-detail — both
+concrete failure modes seen on the rig.
+
+### 5.8 Per-aperture cropped-output layout
+
+The original cropper wrote to `<lens>/cropped/<crop>/<source>`,
+and since every aperture's source files share the
+`step_NNNN.jpg` naming, only the *last* aperture's crops survived
+on disk (the in-memory dataset was unaffected, so the live
+advisor's decisions were correct, but offline analysis lost 4/5
+of the data). Now production wiring sets
+`crops_under_source=True` so crops land at
+`<lens>/<aperture>/cropped/<crop>/<source>`. Documented in §8.3.5
+of the implementation plan; matches the user's existing
+offline-analysis layout.
+
+## 6. What would be different if redoing the project
 
 - **Test the SB-5000 commander earlier.** The first half of the planning
   conversation assumed the user's existing SU-800 setup would work, and
