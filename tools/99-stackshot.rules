@@ -1,0 +1,27 @@
+# udev rule granting libusb access to the Cognisys StackShot's
+# FT232R bridge. With this rule, regular users can talk to the
+# StackShot via pyusb (FtdiTransport) without sudo.
+#
+# The matched device is the FT232R USB Serial converter
+# (idVendor=0x0403, idProduct=0x6001) — the same chip that lives
+# in many other USB-serial cables. ATTRS{serial} narrows the match
+# to the StackShot's serial number so other FT232R devices on the
+# same machine aren't affected.
+#
+# Install:
+#   sudo cp tools/99-stackshot.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger
+# then unplug+replug the StackShot.
+#
+# Group ``uucp`` is the Arch / Debian default for serial-device
+# access. Adjust if your distribution uses ``dialout`` or
+# ``plugdev`` instead. (Confirm with: ``grep dialout /etc/group``.)
+
+SUBSYSTEM=="usb", \
+    ATTRS{idVendor}=="0403", \
+    ATTRS{idProduct}=="6001", \
+    ATTRS{serial}=="A700C08T", \
+    MODE="0660", \
+    GROUP="uucp", \
+    TAG+="uaccess"

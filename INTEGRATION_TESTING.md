@@ -182,12 +182,31 @@ If Linux still gets 0 bytes back even with the same byte sequence that worked on
 - `cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` — default 16 ms, sometimes 1 ms is needed for short responses. Try `echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer`.
 - `dmesg -w` while sending — anything from `ftdi_sio` showing up?
 
-### Step 1.4 — Once the rig responds
+### Step 1.3a — Install the udev rule (one-time)
 
-Run our smoke-test:
+The production transport (`FtdiTransport` / pyusb) needs raw libusb
+access to the FT232R. Without a udev rule that means running every
+session under `sudo`. Install the bundled rule once:
 
 ```bash
-.venv/bin/python -m stackshot.controller --info --port /dev/ttyUSB0
+sudo cp tools/99-stackshot.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger
+```
+
+Then unplug + replug the StackShot. The rule sets `MODE=0660 GROUP=uucp`
+on the USB device node so users in `uucp` (you, per `id`) can claim
+the interface without root.
+
+If your distro uses `dialout` or `plugdev` instead of `uucp`, edit the
+rule's `GROUP=` line to match.
+
+### Step 1.4 — Once the rig responds
+
+Run our smoke-test (no `sudo` needed once the udev rule is installed):
+
+```bash
+.venv/bin/python -m stackshot.controller --info
 ```
 
 Expected: `software_id = 0xNN…`, `hardware_id = 0xNN…`, `position = +0.0000 mm`.
