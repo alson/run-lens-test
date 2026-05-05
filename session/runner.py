@@ -33,6 +33,7 @@ from notify.ntfy import (
     NtfyClient,
     Notification,
 )
+from notify.sound import play_alert
 from session.calibrate import (
     ApertureCalibration,
     CalibrationResult,
@@ -1020,6 +1021,16 @@ class SessionRunner:
                 f"{len(event.window_snapshot)} shots ≤ {event.threshold:+.1f} EV. "
                 f"Window: {event.window_snapshot!r}",
             )
+        # Local audible alert in addition to ntfy: the user is at
+        # the rig with their hands on the rail when this fires;
+        # waiting for a phone notification to wake them is too slow.
+        # Best-effort — paplay or alert.wav missing must not block.
+        wav_path = getattr(self.config, "ALERT_WAV", None)
+        if wav_path is not None:
+            try:
+                play_alert(wav_path)
+            except Exception:                            # noqa: BLE001
+                log.exception("alert sound failed")
         # Pause: user swaps batteries, presses ENTER.
         ok = self.confirm(
             f"\nBattery droop on {event.aperture}. "
