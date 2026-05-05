@@ -484,6 +484,73 @@ The data format is forward-compatible: subsample_factors stored in
 session.json today are exactly what Phase B will honour at capture
 time tomorrow.
 
+### 5.10 Sample-planner calibration: where the constants come from
+
+The planner's defaults (`POSITIONS_ACROSS_FWHM_DEFAULT = 5`,
+`POSITIONS_ACROSS_FWHM_HIGH_MAG = 8`, `HIGH_MAG_THRESHOLD = 1.5`,
+`DEFAULT_COC_MM = 0.030`, `MIN_RAIL_STEP_MM = 0.005`) are not
+arbitrary — every one was derived from real data in
+`analyse-lens-test/rail-coverage/output/scan-cache.json` (the
+2026-01-29 + 2026-02-18 sessions, 545 scenarios). The calibration
+notes live alongside the dataset in
+`analyse-lens-test/ANALYSIS_NOTES.md`; this section summarises
+which constants come from which evidence.
+
+**Circle of confusion (`DEFAULT_COC_MM = 0.030`).** Back-derived
+from the historical 25-position-per-scenario regime. At M=1, N=8
+the median observed FWHM was 12 rail positions out of 25 (so the
+sweep covered ~2 × FWHM). With `DOF = 2·c·N·(1+M)/M²` and that
+sweep ratio, c ≈ 30 µm reproduces the observed step size — which is
+also the standard FX sensor circle-of-confusion. The two values
+matching is a coincidence that lets us use the literature value
+without explicit calibration.
+
+**`POSITIONS_ACROSS_FWHM_DEFAULT = 5`.** A resampling experiment on
+the existing 25-position bell curves (Sigma 150 at 1:1, F5.6/F8/F11
+center crops; see `ANALYSIS_NOTES.md §3`) showed peak detection
+within 1.5 % of the fitted maximum at k = 8 sub-samples across the
+whole sweep, which translates to ~5 positions across FWHM. Going
+from k=8 to k=15 gave no further improvement; going from 25 to 50
+positions also gave no further improvement. So 5 positions across
+FWHM is enough at moderate magnifications.
+
+**`POSITIONS_ACROSS_FWHM_HIGH_MAG = 8` and `HIGH_MAG_THRESHOLD = 1.5`.**
+The same experiment with a 200 mm + 5T+6T at 2:1 / F8 scenario (a
+high-mag, narrow-peak case) showed clear loss at k < 15 — k=10 was
+4 % off the fitted peak; k=15 was within 1 %. At that scenario's
+FWHM, 15 sub-samples translate to ~8 across FWHM. We trigger at
+M ≥ 1.5 because the 1:1-to-1.6:1 magnification band was
+empirically the "sweet spot" in `rail-coverage/output/report.html`
+(58 % of scenarios in that band were "good", the highest of any
+band) and high-mag-specific behaviour kicks in just past it.
+
+**`MIN_RAIL_STEP_MM = 0.005`.** The Cognisys StackShot accepts
+arbitrary float distances over the wire but the leadscrew + motor
+assembly's mechanical resolution is ~2-5 µm. Below that, requested
+moves disappear into mechanical noise. At extreme regimes (e.g.
+M=3, widest f/1.4) the raw step recommendation drops below the
+floor; the planner clamps and sets `step_clamped=True` so the
+caller knows the bell will be under-sampled and there's no
+recourse without different hardware.
+
+**Aperture subsample factors.** DOF scales linearly with f-number,
+so at aperture N the bell is `N / N_min` times wider than at the
+widest aperture. Analysing every `floor(N / N_min)`-th captured
+step keeps the same bell-curve density at every aperture. The
+captured data has every aperture at every rail step (Phase B will
+add capture-time subsampling per §5.9); the per-aperture
+`subsample_factors` dict is what the analyser reads to honour the
+optimal density at analysis time.
+
+**Why "low-mag" and "small-aperture" bumps are NOT applied.** An
+earlier draft had `+5` positions at M < 0.4 and `+3` at N ≥ 11 on
+the assumption that broader, less-sharp bells benefit from more
+samples. The resampling experiment showed the opposite: broader
+bells are *more* tolerant of sparse sampling because the FWHM
+spans more rail positions even at the same step. Those bumps would
+have been counterproductive, so the planner has no per-band-hint
+beyond the high-mag transition.
+
 ## 6. What would be different if redoing the project
 
 - **Test the SB-5000 commander earlier.** The first half of the planning
