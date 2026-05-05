@@ -186,6 +186,24 @@ class StackShotController:
     def _write(self, cmd: Cmd, data: bytes = b"") -> Frame:
         return self._tx.request(build_request(cmd, Action.WRITE, data), cmd)
 
+    # ---- Panel control toggle --------------------------------------------
+
+    def release_to_panel(self) -> None:
+        """Hand the rail back to its front-panel buttons. Position
+        is preserved; the user can move the rail manually and a
+        subsequent :meth:`take_from_panel` + :meth:`get_position`
+        reads where they left it.
+
+        Only supported by transports that own the FTDI chip directly
+        (e.g. :class:`stackshot.transport.FtdiTransport`); raises
+        :class:`NotImplementedError` on the legacy serial path.
+        """
+        self._tx.release_to_panel()
+
+    def take_from_panel(self) -> None:
+        """Re-acquire USB control after a :meth:`release_to_panel`."""
+        self._tx.take_from_panel()
+
     # ---- Lifecycle --------------------------------------------------------
 
     def close(self) -> None:

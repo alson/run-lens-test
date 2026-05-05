@@ -56,19 +56,23 @@ def _scripted_reader(*chars: str):
 
 
 class TestStepForKey:
-    def test_a_is_back_fine(self, keys: JogKeyMap) -> None:
-        assert _step_for_key("a", keys) == pytest.approx(-0.1)
+    """Lowercase = coarse (1 mm), uppercase = fine (0.05 mm)."""
 
-    def test_d_is_forward_fine(self, keys: JogKeyMap) -> None:
-        assert _step_for_key("d", keys) == pytest.approx(+0.1)
+    def test_a_is_back_coarse(self, keys: JogKeyMap) -> None:
+        assert _step_for_key("a", keys) == pytest.approx(-1.0)
 
-    def test_uppercase_is_coarse(self, keys: JogKeyMap) -> None:
-        assert _step_for_key("A", keys) == pytest.approx(-1.0)
-        assert _step_for_key("D", keys) == pytest.approx(+1.0)
+    def test_d_is_forward_coarse(self, keys: JogKeyMap) -> None:
+        assert _step_for_key("d", keys) == pytest.approx(+1.0)
+
+    def test_uppercase_is_fine(self, keys: JogKeyMap) -> None:
+        assert _step_for_key("A", keys) == pytest.approx(-0.1)
+        assert _step_for_key("D", keys) == pytest.approx(+0.1)
 
     def test_unknown_key_is_none(self, keys: JogKeyMap) -> None:
         assert _step_for_key("x", keys) is None
         assert _step_for_key("\x1b", keys) is None  # ESC
+        # SPACE is a known key (panel-release toggle), not a movement.
+        assert _step_for_key(" ", keys) is None
 
 
 # ---- jog_loop -------------------------------------------------------------
@@ -113,7 +117,7 @@ class TestJogLoopMovement:
     def test_movement_keys_call_move_and_wait_with_correct_direction(
         self, controller, keys: JogKeyMap
     ) -> None:
-        # d (forward fine) → A (back coarse) → e (end)
+        # d (forward coarse) → A (back fine) → e (end)
         jog_loop(
             controller,
             read_key=_scripted_reader("d", "A", "e"),
@@ -122,11 +126,11 @@ class TestJogLoopMovement:
             set_key="e",
         )
         assert controller.move_and_wait.call_args_list == [
-            call(Direction.FORWARD, pytest.approx(0.1), backlash=True),
-            call(Direction.BACKWARD, pytest.approx(1.0), backlash=True),
+            call(Direction.FORWARD, pytest.approx(1.0), backlash=True),
+            call(Direction.BACKWARD, pytest.approx(0.1), backlash=True),
         ]
-        # Net position: +0.1 - 1.0 = -0.9 mm.
-        assert controller._pos == pytest.approx(-0.9)
+        # Net position: +1.0 - 0.1 = +0.9 mm.
+        assert controller._pos == pytest.approx(+0.9)
 
     def test_unknown_keys_are_ignored(
         self, controller, keys: JogKeyMap
@@ -198,3 +202,64 @@ class TestJogLoopInitialStatus:
         first = write_status.call_args_list[0]
         assert first.args[0] == pytest.approx(7.0)
         assert first.args[1] == "END"
+
+
+class TestJogLoopPanelRelease:
+    """SPACE drops control to the StackShot's front panel; ENTER
+    returns. Position read after re-acquire reflects whatever the
+    user did with the rail's physical buttons in between."""
+
+    def test_space_releases_then_enter_reacquires(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        # Simulate the user moving the rail forward 5 mm via the
+        # physical buttons while we were released.
+        def _take_from_panel():
+            controller._pos = 5.0
+
+        controller.take_from_panel.side_effect = _take_from_panel
+        write_status = MagicMock()
+        jog_loop(
+            controller,
+            read_key=_scripted_reader(" ", "\r", "e"),
+            write_status=write_status,
+            keys=keys,
+            set_key="e",
+            label="END",
+        )
+        controller.release_to_panel.assert_called_once()
+        controller.take_from_panel.assert_called_once()
+        # After re-acquire, position is the value the rail was left
+        # at (5.0 mm). The "END set" status row reflects that.
+        last = write_status.call_args_list[-1]
+        assert last.args[0] == pytest.approx(5.0)
+
+    def test_panel_release_falls_back_when_unsupported(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        # SerialTransport raises NotImplementedError; the jog loop
+        # must surface that gracefully and not crash.
+        controller.release_to_panel.side_effect = NotImplementedError("no")
+        write_status = MagicMock()
+        jog_loop(
+            controller,
+            read_key=_scripted_reader(" ", "e"),
+            write_status=write_status,
+            keys=keys,
+            set_key="e",
+        )
+        # take_from_panel never gets called (we bailed early).
+        controller.take_from_panel.assert_not_called()
+
+    def test_lf_also_resumes_keyboard(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        """`\\n` should be accepted as ENTER, not just `\\r`."""
+        jog_loop(
+            controller,
+            read_key=_scripted_reader(" ", "\n", "e"),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.take_from_panel.assert_called_once()

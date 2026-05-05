@@ -375,3 +375,58 @@ class TestImportError:
                 FtdiTransport()
         finally:
             transport_mod._PYUSB_AVAILABLE = original
+
+
+# ---- Panel release / re-acquire -------------------------------------------
+
+
+class TestPanelRelease:
+    def test_release_sends_bitmode_with_mask_0xF0(
+        self, transport, device
+    ) -> None:
+        transport.open()
+        # Reset call history so we're isolated to the release call.
+        device.ctrl_calls.clear()
+        transport.release_to_panel()
+        # Exactly one ctrl: SET_BITMODE wValue=0x20F0.
+        assert len(device.ctrl_calls) == 1
+        call = device.ctrl_calls[0]
+        assert call.bm_request_type == 0x40
+        assert call.request == 0x0B           # SET_BIT_MODE
+        assert call.value == 0x20F0           # mode 0x20, mask 0xF0
+
+    def test_take_sends_bitmode_with_mask_0xFF_and_settles(
+        self, transport, device
+    ) -> None:
+        transport.open()
+        device.ctrl_calls.clear()
+        sleeps_before = list(transport.sleeps)  # type: ignore[attr-defined]
+        transport.take_from_panel()
+        # Exactly one ctrl: SET_BITMODE wValue=0x20FF.
+        assert len(device.ctrl_calls) == 1
+        call = device.ctrl_calls[0]
+        assert call.request == 0x0B
+        assert call.value == 0x20FF
+        # Plus a 500 ms settle.
+        new_sleeps = transport.sleeps[len(sleeps_before):]  # type: ignore[attr-defined]
+        assert new_sleeps == [pytest.approx(0.5)]
+
+    def test_release_before_open_raises(self, transport) -> None:
+        with pytest.raises(RuntimeError, match="release_to_panel before open"):
+            transport.release_to_panel()
+
+    def test_take_before_open_raises(self, transport) -> None:
+        with pytest.raises(RuntimeError, match="take_from_panel before open"):
+            transport.take_from_panel()
+
+
+class TestSerialTransportRaisesOnPanelOps:
+    def test_release_raises_not_implemented(self) -> None:
+        from stackshot.transport import SerialTransport
+        with pytest.raises(NotImplementedError, match="libusb-direct"):
+            SerialTransport("/dev/null").release_to_panel()
+
+    def test_take_raises_not_implemented(self) -> None:
+        from stackshot.transport import SerialTransport
+        with pytest.raises(NotImplementedError, match="libusb-direct"):
+            SerialTransport("/dev/null").take_from_panel()

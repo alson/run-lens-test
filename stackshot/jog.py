@@ -40,17 +40,22 @@ def _step_for_key(key: str, keys: JogKeyMap) -> float | None:
     """Return the relative move (mm, signed) for a movement key, or
     ``None`` if the key isn't a movement key.
 
-    Lowercase = fine, uppercase = coarse. ``a`` = back, ``d`` = forward.
+    Lowercase = coarse (1 mm), uppercase = fine (0.05 mm).
+    ``a`` = back, ``d`` = forward.
     """
     if key == "a":
-        return -keys.fine_mm
-    if key == "d":
-        return +keys.fine_mm
-    if key == "A":
         return -keys.coarse_mm
-    if key == "D":
+    if key == "d":
         return +keys.coarse_mm
+    if key == "A":
+        return -keys.fine_mm
+    if key == "D":
+        return +keys.fine_mm
     return None
+
+
+# Hot-key for "release to front panel" inside :func:`jog_loop`.
+PANEL_RELEASE_KEY = " "
 
 
 # ---- Pure jog loop ---------------------------------------------------------
@@ -115,6 +120,14 @@ def jog_loop(
             else:
                 write_status(position, f"{label} set")
             return position
+        if key == PANEL_RELEASE_KEY:
+            position = _release_to_panel(
+                controller=controller,
+                read_key=read_key,
+                write_status=write_status,
+                label=label,
+            )
+            continue
         step = _step_for_key(key, keys)
         if step is None:
             # Unknown key — ignore. Tests can assert nothing happened.
@@ -123,6 +136,41 @@ def jog_loop(
         controller.move_and_wait(direction, abs(step), backlash=True)
         position = controller.get_position()
         write_status(position, label)
+
+
+def _release_to_panel(
+    *,
+    controller: StackShotController,
+    read_key: Callable[[], str],
+    write_status: Callable[[float, str], None],
+    label: str,
+) -> float:
+    """Drop USB control so the user can drive the rail with the
+    StackShot's physical buttons. Returns the position the user
+    left the rail at after pressing ENTER (returns to keyboard
+    control).
+
+    Falls back to a clear "not supported" message when the underlying
+    transport can't toggle bit-mode (e.g.
+    :class:`stackshot.transport.SerialTransport`).
+    """
+    try:
+        controller.release_to_panel()
+    except NotImplementedError as exc:
+        write_status(controller.get_position(), f"{label} (panel release not supported: {exc})")
+        return controller.get_position()
+    write_status(
+        controller.get_position(),
+        f"{label} | PANEL — use rail buttons; ENTER to resume keyboard",
+    )
+    while True:
+        k = read_key()
+        if k in ("\r", "\n"):
+            break
+    controller.take_from_panel()
+    position = controller.get_position()
+    write_status(position, label)
+    return position
 
 
 # ---- Production wiring: termios + stdout -----------------------------------
@@ -197,9 +245,15 @@ def jog_start_and_end(
     the chosen start). The END value returned is in mm relative to
     that origin.
     """
-    print("Jog rail to START. a/d=fine, A/D=coarse, s=set START, q=abort")
+    prompt = (
+        "  a/d=coarse(1mm)  A/D=fine(0.05mm)  SPACE=front-panel  "
+        "{set}=set {label}  q=abort"
+    )
+    print("Jog rail to START.")
+    print(prompt.format(set="s", label="START"))
     jog_interactive(controller, label="START", set_key="s", keys=keys)
-    print("Jog rail to END.   a/d=fine, A/D=coarse, e=set END,   q=abort")
+    print("\nJog rail to END.")
+    print(prompt.format(set="e", label="END"))
     end_mm = jog_interactive(controller, label="END", set_key="e", keys=keys)
     return JogResult(end_mm=end_mm)
 
@@ -209,13 +263,17 @@ def jog_start_and_end(
 def _cli() -> None:
     import argparse
 
-    from stackshot.controller import open_serial
+    from stackshot.controller import open_ftdi, open_serial
 
     parser = argparse.ArgumentParser(description="StackShot jog session")
-    parser.add_argument("--port", default="/dev/ttyUSB0")
+    parser.add_argument("--serial", default=None, metavar="PORT",
+                        help="legacy: open via pyserial at this device path")
     args = parser.parse_args()
 
-    controller = open_serial(args.port)
+    if args.serial:
+        controller = open_serial(args.serial)
+    else:
+        controller = open_ftdi()
     try:
         result = jog_start_and_end(controller)
         print(f"START = 0.000 mm")

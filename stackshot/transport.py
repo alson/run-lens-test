@@ -64,6 +64,23 @@ class Transport(Protocol):
 
     def close(self) -> None: ...
 
+    def release_to_panel(self) -> None: ...
+    """Hand control of the rail back to the StackShot's front-panel
+    buttons. After this call the LCD changes from "USB CONTROL" to a
+    normal idle screen and the user can move the rail with the
+    physical fwd/back buttons. Position is preserved.
+
+    Implementations on transports that don't have a way to release
+    panel control (e.g. :class:`SerialTransport`) raise
+    :class:`NotImplementedError`.
+    """
+
+    def take_from_panel(self) -> None: ...
+    """Reverse of :meth:`release_to_panel` — re-acquire USB control
+    of the rail. The LCD shows "USB CONTROL" again and the front
+    panel locks out. Position is preserved across the toggle.
+    """
+
 
 class SerialTransport:
     """Production transport over an FTDI serial bridge."""
@@ -131,6 +148,17 @@ class SerialTransport:
             buf.extend(chunk)
         return bytes(buf)
 
+    def release_to_panel(self) -> None:
+        raise NotImplementedError(
+            "panel release requires libusb-direct (FtdiTransport); "
+            "the kernel tty path can't issue FTDI SET_BITMODE"
+        )
+
+    def take_from_panel(self) -> None:
+        raise NotImplementedError(
+            "panel re-acquire requires libusb-direct (FtdiTransport)"
+        )
+
 
 # ---- Production transport: libusb-direct via pyusb -----------------------
 
@@ -151,6 +179,12 @@ _RESET_PURGE_TX = 0x0002
 # wValue for SIO_SET_BIT_MODE: top byte = mode, bottom byte = mask.
 # mode 0x20 = CBUS bit bang; mask 0xFF = all CBUS pins as outputs.
 _BITMODE_CBUS_BANG_ALL = 0x20FF
+
+# Mask 0xF0 leaves the bottom 4 CBUS pins as inputs (high-Z). The
+# StackShot's MCU watches one of those bottom pins; when the host
+# stops driving it the rail's MCU exits "USB CONTROL" mode and
+# re-enables the front-panel buttons. Per Form1.h:2311.
+_BITMODE_CBUS_RELEASE = 0x20F0
 
 # wValue for SIO_SET_BAUDRATE at 38400. FTDI-encoded divisor for the
 # FT232R; copied from the Zerene Stacker usbmon capture.
@@ -292,6 +326,41 @@ class FtdiTransport:
             timeout=int(self._timeout_s * 1000),
         )
         return check_response(self._read_one_frame(), expected_cmd)
+
+    # ---- panel control toggle -----------------------------------------
+
+    def release_to_panel(self) -> None:
+        """Drop bit-mode mask to 0xF0 so the StackShot's MCU sees the
+        host has let go of the bottom CBUS pins. Front panel resumes
+        responding to its physical buttons; LCD changes from
+        "USB CONTROL" back to a normal idle screen.
+
+        Position is retained on the rail across the toggle, so a
+        :meth:`take_from_panel` followed by ``CC_RAIL_POSITION_CURRENT``
+        reads the position the user left the rail at.
+
+        Note: the Cognisys C++ source also sends ``CC_CLOSE`` (0x110E)
+        before this point, but on the firmware version we tested
+        (1.0.09) that command returns ``COMM_ACTION_UNSUPPORTED_CMD``,
+        so the bit-mode change alone is the load-bearing step. We
+        omit ``CC_CLOSE`` rather than emit a frame the device can't
+        handle.
+        """
+        if self._dev is None:
+            raise RuntimeError("FtdiTransport.release_to_panel before open()")
+        self._ctrl_out(self._dev, _SIO_SET_BIT_MODE, _BITMODE_CBUS_RELEASE)
+
+    def take_from_panel(self) -> None:
+        """Re-acquire USB control: bit-mode 0x20FF + 500 ms settle.
+        After this call the LCD shows "USB CONTROL" again and the
+        rail responds to protocol commands.
+        """
+        if self._dev is None:
+            raise RuntimeError("FtdiTransport.take_from_panel before open()")
+        self._ctrl_out(self._dev, _SIO_SET_BIT_MODE, _BITMODE_CBUS_BANG_ALL)
+        self._sleep(self._bitmode_settle_s)
+
+    # ---- response read --------------------------------------------------
 
     def _read_one_frame(self) -> Frame:
         deadline = self._clock() + self._timeout_s
