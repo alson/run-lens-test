@@ -112,5 +112,5 @@ ALERT_WAV = Path("data/alert.wav")
 
 # ---- Notification -----------------------------------------------------------
 
-NTFY_TOPIC = "macro-lens-test-CHANGEME"
+NTFY_TOPIC = "macro-lens-H1wpeWs6Fxi1gudY"
 NTFY_BASE_URL = "https://ntfy.sh"

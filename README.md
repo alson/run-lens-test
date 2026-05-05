@@ -176,6 +176,7 @@ All tunable constants are at the top of `config.py`. Notable ones:
 | StackShot move never completes | Cable issue or rail jam | Check StackShot LCD for error; power-cycle StackShot. |
 | Lens-change reconnect fails 3 times | Camera USB state stuck | Full battery-pull camera recovery, then ENTER. |
 | Notifications not arriving on Mac | ntfy topic mismatch, or Mac not subscribed | Check `NTFY_TOPIC`; open ntfy app, verify subscription. |
+| ntfy entries arrive in the Mac app's history but no banner / sound | The macOS "ntfy" App-Store app is actually the iPad app via "Designed for iPad" / Mac Catalyst. It doesn't reliably hold a streaming subscription in the background and macOS doesn't expose it as a background activity. Reliable alternatives: (1) the iOS / Android apps (real APNs/FCM push); (2) the **web client** at `https://ntfy.sh/<topic>` in a pinned browser tab — entries arrive live and `paplay` on bumblebee gives you the audible chime at the rig regardless. macOS browser banners can be enabled per-site but are also unreliable for some users. |
 
 ## Project background
 
