@@ -49,6 +49,17 @@ EC_MIN_EV = -3.0
 EC_MAX_EV = +3.0
 EC_STEP_EV = 1.0 / 3.0
 
+# ---- Plateau detection (when ISO is actually useful) ----------------------
+# In AA flash mode, ISO doesn't change image brightness — it just shifts
+# the flash's auto-quench point. ISO only buys real brightness when the
+# flash is at its mechanical maximum (firing at full power, full duration,
+# can't put out more). The calibrator detects that condition by checking
+# whether luminosity tracks the cumulative FEC+EC bumps it asked for.
+# Cumulative response < threshold × cumulative request, after at least
+# min_ev of bumping, → plateau → ISO range-extend.
+PLATEAU_DETECT_THRESHOLD = 0.5  # ratio
+PLATEAU_DETECT_MIN_EV = 1.0     # don't fire on a single ⅓-stop bump
+
 # ---- Camera startup ---------------------------------------------------------
 
 MIN_CONFIG_TREE_SIZE = 100

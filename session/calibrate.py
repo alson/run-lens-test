@@ -178,6 +178,12 @@ class Calibrator:
         ec_min = float(getattr(cfg, "EC_MIN_EV", -3.0))
         ec_max = float(getattr(cfg, "EC_MAX_EV", +3.0))
         ec_step = float(getattr(cfg, "EC_STEP_EV", 1.0 / 3.0))
+        plateau_threshold = float(
+            getattr(cfg, "PLATEAU_DETECT_THRESHOLD", 0.5)
+        )
+        plateau_min_ev = float(
+            getattr(cfg, "PLATEAU_DETECT_MIN_EV", 1.0)
+        )
         self._camera.set_aperture(aperture)
         self._camera.set_iso(iso)
         self._camera.set_fec(fec)
@@ -191,6 +197,18 @@ class Calibrator:
         iso_bumped = False
         ec_used = False
         saturated = False
+        # Plateau tracker: cumulative positive FEC+EC bumps applied
+        # since the last reset, and the median we had when the
+        # tracker was reset. The flash physically maxes out when
+        # we keep asking for more output (FEC/EC up) and luminosity
+        # stops responding — that's the only condition under which
+        # ISO bump actually makes the image brighter (in AA flash
+        # mode, ISO normally just makes the flash quench sooner,
+        # leaving brightness unchanged). Anything below
+        # ``plateau_threshold`` of expected response over at least
+        # ``plateau_min_ev`` of cumulative bump is taken as plateau.
+        push_start_median: float | None = None
+        push_total_ev = 0.0
         for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
             dest = capture_dir / _calibration_filename(aperture, shot_index)
             self._camera.capture_to(dest)
@@ -239,6 +257,27 @@ class Calibrator:
                 session_id=session_id,
                 notes=f"calibration shot {shot_index}",
             )
+
+            # Plateau check (range-extend with ISO if the flash has
+            # mechanically maxed out, evidenced by luminosity not
+            # tracking the cumulative FEC+EC bumps we asked for).
+            if (
+                push_start_median is not None
+                and push_total_ev >= plateau_min_ev
+            ):
+                cumulative_response = ev_delta(median, push_start_median)
+                if cumulative_response < push_total_ev * plateau_threshold:
+                    bumped = next_iso(iso, ceiling=cfg.ISO_CEIL)
+                    if bumped == iso:
+                        saturated = True
+                        break
+                    iso = bumped
+                    iso_bumped = True
+                    self._camera.set_iso(iso)
+                    push_start_median = None
+                    push_total_ev = 0.0
+                    continue
+
             if abs(delta) <= cfg.TEST_SHOT_TOLERANCE_EV:
                 return ApertureCalibration(
                     aperture=aperture,
@@ -253,23 +292,19 @@ class Calibrator:
                     ec_used=ec_used,
                 ), baseline
 
-            # Lever priority: FEC first (most direct flash control;
-            # fine-tune lever in AA mode). When FEC saturates, EC
-            # extends headroom by another ec_max stops on each side
-            # — assumes camera custom function e3 is set to "Entire
-            # frame" so EC stacks additively with FEC. ISO is the
-            # last resort since it only acts as a range-extender in
-            # AA mode (the flash quenches sooner at higher ISO).
+            # Lever priority is FEC → EC. ISO is *not* in the
+            # cascade: in AA flash mode raising ISO without a
+            # mechanical-max plateau just makes the flash quench
+            # earlier, keeping image brightness unchanged. ISO is
+            # only useful as a range-extender, triggered exclusively
+            # by the plateau check above.
             new_fec = _clamp(
                 _snap(fec - delta, cfg.FEC_STEP_EV),
                 cfg.FEC_MIN_EV,
                 cfg.FEC_MAX_EV,
             )
-            # Saturation checks use *current* fec / ec, not new_fec.
-            # Otherwise a first shot far enough off that the requested
-            # correction exceeds FEC_MAX_EV would clamp to FEC_MAX,
-            # be misread as "already at max", trigger an ISO bump, and
-            # ``continue`` — leaving FEC stuck at 0 forever.
+            # Saturation uses *current* fec / ec, not new_fec — see
+            # commit history for the off-by-one this avoids.
             fec_saturated_low = (
                 fec == cfg.FEC_MIN_EV and delta > cfg.TEST_SHOT_TOLERANCE_EV
             )
@@ -277,8 +312,7 @@ class Calibrator:
                 fec == cfg.FEC_MAX_EV and delta < -cfg.TEST_SHOT_TOLERANCE_EV
             )
             if fec_saturated_high or fec_saturated_low:
-                # FEC tapped out. Try EC next; falls back to ISO.
-                # delta < 0 = under-exposed = need positive correction.
+                # FEC tapped out, fall back to EC.
                 new_ec = _clamp(_snap(ec - delta, ec_step), ec_min, ec_max)
                 ec_saturated_low = (
                     ec == ec_min and delta > cfg.TEST_SHOT_TOLERANCE_EV
@@ -286,28 +320,32 @@ class Calibrator:
                 ec_saturated_high = (
                     ec == ec_max and delta < -cfg.TEST_SHOT_TOLERANCE_EV
                 )
-                if not (ec_saturated_low or ec_saturated_high):
-                    ec = new_ec
-                    if hasattr(self._camera, "set_ec"):
-                        self._camera.set_ec(ec)
-                    ec_used = True
-                    continue
-                # Both FEC and EC are at their respective limits.
-                if fec_saturated_high or ec_saturated_high:
-                    # Under-exposing at FEC_MAX + EC_MAX — bump ISO.
-                    bumped = next_iso(iso, ceiling=cfg.ISO_CEIL)
-                    if bumped == iso:
-                        saturated = True
-                        break
-                    iso = bumped
-                    iso_bumped = True
-                    self._camera.set_iso(iso)
-                    continue
-                # Over-exposing at FEC_MIN + EC_MIN — ISO can't help.
-                saturated = True
-                break
-            fec = new_fec
-            self._camera.set_fec(fec)
+                if ec_saturated_low or ec_saturated_high:
+                    # Both FEC and EC at their respective limits with
+                    # no plateau detected during the cascade. The
+                    # flash *was* responding right up to the camera-
+                    # side compensation max; an ISO bump now would
+                    # just trigger earlier auto-quench. Accept.
+                    saturated = True
+                    break
+                bump_ev = abs(new_ec - ec)
+                ec = new_ec
+                if hasattr(self._camera, "set_ec"):
+                    self._camera.set_ec(ec)
+                ec_used = True
+            else:
+                bump_ev = abs(new_fec - fec)
+                fec = new_fec
+                self._camera.set_fec(fec)
+
+            # Track the bump for plateau detection. Only positive
+            # under-exposure-correction bumps accumulate; over-
+            # exposure correction (delta > 0, FEC/EC going down)
+            # would not benefit from ISO bump anyway.
+            if delta < -cfg.TEST_SHOT_TOLERANCE_EV and bump_ev > 0:
+                if push_start_median is None:
+                    push_start_median = last_median
+                push_total_ev += bump_ev
 
         return ApertureCalibration(
             aperture=aperture,

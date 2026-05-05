@@ -244,15 +244,17 @@ class TestClosedLoop:
         assert ap.ec_used is True
         assert ap.iso_bumped is False
 
-    def test_iso_only_bumps_after_fec_and_ec_both_saturate(
+    def test_iso_bumps_on_plateau_not_on_fec_ec_saturation(
         self, camera, cfg, tmp_path
     ) -> None:
-        # Force a deficit larger than FEC_MAX + EC_MAX combined so
-        # the lever cascade is fully exercised: FEC pushed to max,
-        # then EC pushed to max, then ISO finally bumps.
-        # baseline 100, medians stay very dim:
-        # FEC_MAX=+1, EC_MAX=+3 → combined +4 EV — still ~6 EV short
-        # of where we'd land if shots kept reading 6/100 (-6 EV).
+        # Constant medians = flash is mechanically maxed and the
+        # luminosity doesn't track the FEC/EC bumps the calibrator
+        # is asking for. Plateau detection should fire and the
+        # calibrator should bump ISO as a range-extender. (In AA
+        # flash mode, ISO bumping at FEC/EC saturation *without*
+        # plateau just causes earlier flash quench and image
+        # brightness stays the same — the user's physical insight,
+        # so the cascade no longer auto-bumps ISO at FEC+EC max.)
         medians = [6.0] * 8
         calib = make_calibrator(camera, cfg, medians=medians)
         result = calib.run(
@@ -263,9 +265,37 @@ class TestClosedLoop:
             baseline_median=100.0,
         )
         ap = result.per_aperture["f/4"]
-        assert ap.fec_ev == cfg.FEC_MAX_EV
-        assert ap.ec_ev == getattr(cfg, "EC_MAX_EV", 3.0)
         assert ap.iso_bumped is True
+
+    def test_no_iso_bump_when_flash_responds_through_full_cascade(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        # Medians track the FEC bumps faithfully (each step roughly
+        # doubles in linear-light terms) — flash responds. Even
+        # when both FEC and EC reach their camera-side limits without
+        # closing the gap, ISO must NOT bump: the flash was
+        # mechanically able to deliver every requested EV; an ISO
+        # bump would just shift the flash's auto-quench earlier and
+        # leave brightness unchanged.
+        # Shot 0 at median 6 (~-9 EV vs baseline 100) → FEC bumped
+        # to FEC_MAX=+1. Shot 1 at median 12 (~-6 EV) shows the
+        # flash *responded* (median doubled per +1 EV) → not plateau.
+        # FEC at MAX, fall back to EC; bump straight to EC_MAX=+3.
+        # Shot 2 hits baseline → tolerance hit. ec_used=True,
+        # iso_bumped=False (no plateau ever detected; the flash was
+        # responding stop-for-stop the whole way through).
+        medians = [6.0, 12.0, 100.0]
+        calib = make_calibrator(camera, cfg, medians=medians)
+        result = calib.run(
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            apertures=["f/4"],
+            baseline_median=100.0,
+        )
+        ap = result.per_aperture["f/4"]
+        assert ap.iso_bumped is False
+        assert ap.hit_tolerance is True
 
     def test_iso_bumps_when_fec_saturates_high(self, camera, cfg, tmp_path) -> None:
         # Lens is too dim: every shot is well below baseline (median

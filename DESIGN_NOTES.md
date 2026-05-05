@@ -347,6 +347,33 @@ flash-distance combo, the calibrator can't close the gap and every
 sweep starts under-exposed. Pick a representative previous shot
 at a similar magnification.
 
+### 5.4a Lever cascade: FEC → EC then plateau-triggered ISO
+
+Originally the calibrator's lever cascade was FEC → EC → ISO with
+ISO bumping unconditionally as soon as both FEC and EC reached
+their camera-side limits. That's wrong for AA flash: the flash's
+auto-quench is calibrated to the camera's (aperture, ISO, FEC/EC
+bias). Raising ISO without a *mechanical* flash plateau just
+makes the flash quench sooner — image brightness unchanged. ISO
+is purely a **range-extender**: it only buys real brightness when
+the flash is firing at its mechanical maximum (full power, can't
+fire harder, can't fire longer).
+
+Detection rule: track cumulative positive FEC+EC bumps applied
+since the last reset and the median we had at the start of that
+push. If after ≥ 1 EV of cumulative bumping the luminosity hasn't
+moved by at least 50% of the requested EV, the flash has plateaued
+and an ISO bump becomes useful. Otherwise (FEC+EC saturate while
+the flash *was* responding stop-for-stop), the calibrator accepts
+the result without an ISO bump — the flash had room, only the
+camera's bias dial ran out, so ISO would just shift the auto-
+quench earlier and gain nothing.
+
+Initial ISO per aperture stays in the existing
+``RANGE_EXTENSION`` table (e.g. f/11 → 200, f/16 → 400) — that's
+range-extension upfront for apertures the flash can't comfortably
+reach at base ISO.
+
 ### 5.4 Calibrator FEC-saturation off-by-one (fixed mid-session)
 
 Real bug surfaced when calibration was 1.7 EV under target with
