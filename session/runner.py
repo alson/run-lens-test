@@ -261,6 +261,10 @@ class SessionRunner:
     measurement) from the configured per-aperture flash recycle. The
     user is shooting thousands of frames; sleeping ``RECYCLE_S`` on
     top of work that already exceeds it adds hours."""
+    _last_capture_aperture: str | None = None
+    """Aperture of the previous capture. The flash recycle is keyed on
+    the *prior* shot's aperture (small apertures = more flash power
+    discharged = longer recycle), not the upcoming one."""
 
     # ---- public entry points ---------------------------------------------
 
@@ -394,9 +398,11 @@ class SessionRunner:
                 if lens_text is None:
                     return
                 slug = slugify_lens_config(lens_text)
+                # _run_one_lens_config records the slug into
+                # metadata itself (right before the lens-change
+                # prompt) so that aborting at the prompt still
+                # captures the completed work.
                 self._run_one_lens_config(slug)
-                if self.metadata is not None:
-                    self.metadata.lens_configs.append(slug)
         except (SessionAborted, KeyboardInterrupt):
             self._stop_rail_quietly()
             self.stop(aborted=True)
@@ -537,6 +543,14 @@ class SessionRunner:
         if forward_steps_done != 0:
             self._return_rail_to_zero(forward_steps_done * step_size_mm)
 
+        # Record this lens config in session metadata *before* the
+        # lens-change prompt — if the user types `q` to abort the
+        # session there, the work we just did still needs to show up
+        # in session.json.
+        if self.metadata is not None and slug not in self.metadata.lens_configs:
+            self.metadata.lens_configs.append(slug)
+            self._write_metadata()
+
         # Lens-change prompt.
         self._lens_change_recovery(slug)
 
@@ -618,10 +632,11 @@ class SessionRunner:
                 aperture_count=len(apertures),
             )
             self._set_capture_settings(aperture, cal)
-            self._wait_for_recycle(aperture)
+            self._wait_for_recycle()
             dest = self._sweep_destination(lens_dir, aperture, step_index)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self._last_capture_started_at = self.monotonic()
+            self._last_capture_aperture = aperture
             self.camera.capture_to(dest)
             self._record_sharpness(
                 step_index=step_index, aperture=aperture, dest=dest
@@ -863,10 +878,11 @@ class SessionRunner:
         for aperture in apertures:
             cal = calibration.per_aperture[aperture]
             self._set_capture_settings(aperture, cal)
-            self._wait_for_recycle(aperture)
+            self._wait_for_recycle()
             dest = file_factory(aperture)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self._last_capture_started_at = self.monotonic()
+            self._last_capture_aperture = aperture
             self.camera.capture_to(dest)
             self._record_sharpness(
                 step_index=step_index, aperture=aperture, dest=dest
@@ -1080,20 +1096,24 @@ class SessionRunner:
                 candidate = k
         return float(table[candidate][1])
 
-    def _wait_for_recycle(self, aperture: str) -> None:
-        """Sleep just long enough so the configured recycle delay has
-        elapsed since the previous shutter fire.
+    def _wait_for_recycle(self) -> None:
+        """Sleep just long enough so the *previous* aperture's recycle
+        delay has elapsed since that shutter fire.
 
         Called *before* the next ``capture_to`` so the time spent in
         ``_set_capture_settings`` (~2.5 s on the Z7) is counted
-        against the recycle budget. If the prior shot's downstream
-        work (measure / sharpness / range-check pause / rail move)
-        already exceeded the recycle, we don't wait at all. First
-        shot of the session is a no-op (no prior capture timestamp).
+        against the recycle budget. The recycle is keyed on the
+        previous shot's aperture — a small aperture (e.g. f/16)
+        forced the flash to discharge more power, so its recycle is
+        longer; that wait happens *after* the f/16 capture, before
+        whatever comes next. First shot of the session is a no-op.
         """
-        if self._last_capture_started_at is None:
+        if (
+            self._last_capture_started_at is None
+            or self._last_capture_aperture is None
+        ):
             return
-        recycle = self._recycle_for(aperture)
+        recycle = self._recycle_for(self._last_capture_aperture)
         elapsed = self.monotonic() - self._last_capture_started_at
         remaining = recycle - elapsed
         if remaining > 0:
@@ -1259,7 +1279,14 @@ def main() -> None:
         jog=_camera_jog,
         sharpness_collector_factory=_sharpness_factory,
     )
-    runner.run()
+    try:
+        runner.run()
+    except SessionAborted as e:
+        # User-initiated abort (e.g. `q` at the lens-change prompt).
+        # session.json and shots.csv have already been finalised by
+        # SessionRunner.stop(aborted=True); a stack trace at this
+        # point is noise.
+        log.info("session aborted: %s", e)
 
 
 if __name__ == "__main__":

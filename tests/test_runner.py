@@ -545,3 +545,47 @@ class TestLensChange:
         # change (>= 2). open_count tracks that.
         assert camera.open_count >= 2
         assert camera.healthy_count >= 2
+
+    def test_quit_at_lens_change_records_completed_config(
+        self, cfg, tmp_path
+    ) -> None:
+        # Regression test: a session that completes one lens config
+        # and is then aborted at the lens-change prompt (`q`) must
+        # still record that completed config in session.json. The
+        # prior behaviour was an empty lens_configs list because the
+        # append happened only after _run_one_lens_config returned.
+        from errors import SessionAborted
+        import json
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"lens": "test-lens", "steps": 2, "end_mm": 2.0},
+        )
+
+        # User accepts droop confirmations (none expected) but says
+        # 'q' (False) at the lens-change prompt -> SessionAborted.
+        confirm_calls = []
+
+        def _confirm(msg: str) -> bool:
+            confirm_calls.append(msg)
+            if "Power off camera" in msg:
+                return False
+            return True
+
+        runner.confirm = _confirm
+
+        def _prompt() -> str | None:
+            return "test-lens"
+
+        runner.prompt_lens_config = _prompt
+
+        with pytest.raises(SessionAborted):
+            runner.run()
+
+        meta = json.loads((runner.session_dir / "session.json").read_text())
+        assert meta["lens_configs"] == ["test-lens"]
+        assert meta["aborted"] is True
+        assert meta["ended_at"] is not None
