@@ -354,6 +354,24 @@ class TestClose:
         usb_module.util.release_interface.assert_called_once()
         usb_module.util.dispose_resources.assert_called_once()
 
+    def test_close_releases_panel_before_disposing(
+        self, transport, device,
+    ) -> None:
+        """close() must issue SET_BITMODE 0x20F0 before tearing down
+        the libusb handle. Otherwise the CBUS bit-mode stays at
+        0x20FF and the StackShot LCD remains in "USB CONTROL" mode
+        across program exit (and even across rail power cycles —
+        only USB disconnect clears it)."""
+        transport.open()
+        device.ctrl_calls.clear()
+        transport.close()
+        # First (and only) ctrl call after clear should be the
+        # release-to-panel SET_BITMODE.
+        assert device.ctrl_calls
+        first = device.ctrl_calls[0]
+        assert first.request == 0x0B
+        assert first.value == 0x20F0
+
     def test_close_is_idempotent(self, transport) -> None:
         transport.open()
         transport.close()

@@ -1079,6 +1079,35 @@ def main() -> None:
             max_workers=config.SHARPNESS_MAX_WORKERS,
         )
 
+    def _camera_jog(rail) -> JogResult:
+        """Drive the jog UI with camera release/reacquire wired into
+        the SPACE / ENTER panel toggle. While the rail is on its
+        front-panel buttons, close the gphoto2 session so the Z7's
+        LCD shows live view; on ENTER, re-open and continue.
+        """
+        def _release_camera() -> None:
+            log.info("releasing camera for live-view jog")
+            camera.close()
+
+        def _reacquire_camera() -> None:
+            log.info("reacquiring camera after live-view jog")
+            camera.open()
+            camera.verify_healthy(min_widgets=config.MIN_CONFIG_TREE_SIZE)
+            camera.apply_session_config(
+                iso=config.ISO_FLOOR,
+                shutter_candidates=config.SHUTTER_SPEED_CANDIDATES,
+                image_quality=config.IMAGE_QUALITY,
+                fec=0.0,
+            )
+
+        return JogResult(
+            end_mm=_jog(
+                rail,
+                on_release=_release_camera,
+                on_reacquire=_reacquire_camera,
+            ).end_mm,
+        )
+
     runner = SessionRunner(
         camera=camera,
         rail=rail,
@@ -1086,7 +1115,7 @@ def main() -> None:
         ntfy=ntfy,
         range_checker=range_checker,
         output_root=config.OUTPUT_ROOT,
-        jog=lambda r: JogResult(end_mm=_jog(r).end_mm),
+        jog=_camera_jog,
         sharpness_collector_factory=_sharpness_factory,
     )
     runner.run()

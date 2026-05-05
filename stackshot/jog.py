@@ -69,6 +69,8 @@ def jog_loop(
     keys: JogKeyMap | None = None,
     set_key: str = "s",
     label: str = "START",
+    on_release: Callable[[], None] | None = None,
+    on_reacquire: Callable[[], None] | None = None,
 ) -> float:
     """Run a single jog session and return the rail's final position.
 
@@ -97,6 +99,12 @@ def jog_loop(
     label :
         Free-text label passed through to ``write_status`` so the user
         sees ``START`` vs ``END`` in the prompt.
+    on_release / on_reacquire :
+        Optional callbacks invoked when the user toggles into / out
+        of front-panel mode (SPACE / ENTER). Used by the production
+        runner to also release the camera (close gphoto2) so the
+        camera's LCD shows live view while the user is positioning
+        the rail manually, then reacquire it after.
 
     Returns
     -------
@@ -137,6 +145,8 @@ def jog_loop(
                 read_key=read_key,
                 write_status=write_status,
                 label=label,
+                on_release=on_release,
+                on_reacquire=on_reacquire,
             )
             continue
         step = _step_for_key(key, keys)
@@ -181,11 +191,18 @@ def _release_to_panel(
     read_key: Callable[[], str],
     write_status: Callable[[float, str], None],
     label: str,
+    on_release: Callable[[], None] | None = None,
+    on_reacquire: Callable[[], None] | None = None,
 ) -> float:
     """Drop USB control so the user can drive the rail with the
-    StackShot's physical buttons. Returns the position the user
-    left the rail at after pressing ENTER (returns to keyboard
-    control).
+    StackShot's physical buttons (and, via ``on_release``, regain
+    direct LCD/AF control of the camera). Returns the position the
+    user left the rail at after pressing ENTER.
+
+    ``on_release`` runs after the rail is released (typically closes
+    the gphoto2 session so the camera's LCD shows live view).
+    ``on_reacquire`` runs before the rail is taken back from the
+    panel (typically re-opens the gphoto2 session).
 
     Falls back to a clear "not supported" message when the underlying
     transport can't toggle bit-mode (e.g.
@@ -196,14 +213,30 @@ def _release_to_panel(
     except NotImplementedError as exc:
         write_status(controller.get_position(), f"{label} (panel release not supported: {exc})")
         return controller.get_position()
+    if on_release is not None:
+        try:
+            on_release()
+        except Exception as exc:                     # noqa: BLE001
+            write_status(
+                controller.get_position(),
+                f"{label} | PANEL (on_release callback failed: {exc})",
+            )
     write_status(
         controller.get_position(),
-        f"{label} | PANEL — use rail buttons; ENTER to resume keyboard",
+        f"{label} | PANEL — rail buttons + camera live view; ENTER to resume",
     )
     while True:
         k = read_key()
         if k in ("\r", "\n"):
             break
+    if on_reacquire is not None:
+        try:
+            on_reacquire()
+        except Exception as exc:                     # noqa: BLE001
+            write_status(
+                controller.get_position(),
+                f"{label} (on_reacquire callback failed: {exc})",
+            )
     controller.take_from_panel()
     position = controller.get_position()
     write_status(position, label)
@@ -285,6 +318,8 @@ def jog_interactive(
     label: str,
     set_key: str,
     keys: JogKeyMap | None = None,
+    on_release: Callable[[], None] | None = None,
+    on_reacquire: Callable[[], None] | None = None,
 ) -> float:
     """Production wrapper: cbreak-mode stdin + stdout status line."""
     with cbreak_stdin():
@@ -296,6 +331,8 @@ def jog_interactive(
                 keys=keys,
                 set_key=set_key,
                 label=label,
+                on_release=on_release,
+                on_reacquire=on_reacquire,
             )
         finally:
             sys.stdout.write("\n")
@@ -312,23 +349,37 @@ def jog_start_and_end(
     controller: StackShotController,
     *,
     keys: JogKeyMap | None = None,
+    on_release: Callable[[], None] | None = None,
+    on_reacquire: Callable[[], None] | None = None,
 ) -> JogResult:
     """Convenience: walk the user through the START then END jog.
 
     On START the rail is zeroed (so further positions are relative to
     the chosen start). The END value returned is in mm relative to
     that origin.
+
+    Optional ``on_release`` / ``on_reacquire`` callbacks are forwarded
+    into the SPACE / ENTER panel-release toggle. The production runner
+    uses them to also close / reopen the gphoto2 camera session so
+    the camera's LCD shows live view while the rail is in front-panel
+    mode.
     """
     prompt = (
-        "  a/d=coarse(1mm)  A/D=fine(0.05mm)  SPACE=front-panel  "
+        "  a/d=coarse(1mm)  A/D=fine(0.05mm)  SPACE=front-panel+camera  "
         "{set}=set {label}  q=abort"
     )
     print("Jog rail to START.")
     print(prompt.format(set="s", label="START"))
-    jog_interactive(controller, label="START", set_key="s", keys=keys)
+    jog_interactive(
+        controller, label="START", set_key="s", keys=keys,
+        on_release=on_release, on_reacquire=on_reacquire,
+    )
     print("\nJog rail to END.")
     print(prompt.format(set="e", label="END"))
-    end_mm = jog_interactive(controller, label="END", set_key="e", keys=keys)
+    end_mm = jog_interactive(
+        controller, label="END", set_key="e", keys=keys,
+        on_release=on_release, on_reacquire=on_reacquire,
+    )
     return JogResult(end_mm=end_mm)
 
 

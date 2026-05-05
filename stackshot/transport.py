@@ -274,6 +274,21 @@ class FtdiTransport:
         if self._dev is None:
             return
         try:
+            # Release the front panel before relinquishing the libusb
+            # handle. The CBUS bit-mode lives on the FT232R chip
+            # itself (USB-powered) so it persists across StackShot
+            # power cycles — the only way to clear it is either to
+            # send the release command, or to disconnect USB. Without
+            # this call, the rail's LCD stays in "USB CONTROL" mode
+            # after the program exits and the front-panel buttons
+            # remain locked out.
+            try:
+                self._ctrl_out(
+                    self._dev, _SIO_SET_BIT_MODE, _BITMODE_CBUS_RELEASE,
+                )
+            except Exception:                        # noqa: BLE001
+                # Best-effort; never let cleanup block disposal.
+                pass
             self._usb.util.release_interface(self._dev, 0)
             self._usb.util.dispose_resources(self._dev)
         finally:
