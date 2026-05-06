@@ -411,6 +411,17 @@ class TestSetEC:
         nikon.set_ec(1.333)
         ec.set_value.assert_called_with("1.333")
 
+    def test_two_third_uses_truncated_label(self, nikon, camera, gp) -> None:
+        # 2/3 = 0.666… The Z7 widget label is the truncated "0.666",
+        # not the rounded "0.667"; the previous formatter produced
+        # the latter and silently fell back to a whole-stop EC.
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(0.667)
+        ec.set_value.assert_called_with("0.666")
+        nikon.set_ec(-1.667)
+        ec.set_value.assert_called_with("-1.666")
+
     def test_zero(self, nikon, camera, gp) -> None:
         gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
         ec = self._wire_radio_widget(camera)

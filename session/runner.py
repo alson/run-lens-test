@@ -1831,20 +1831,30 @@ class SessionRunner:
     # ---- Helpers --------------------------------------------------------
 
     def _set_capture_settings(self, aperture: str, cal) -> None:
-        """Configure aperture / ISO / FEC for the next capture.
+        """Configure aperture / ISO / FEC / EC for the next capture.
 
         Uses the camera's batched setter when available (one PTP
         round-trip; saves several seconds per shot on the Z7) and
-        falls back to three individual setters otherwise — the
-        FakeCamera in the runner tests stays a drop-in.
+        falls back to individual setters otherwise — the FakeCamera
+        in the runner tests stays a drop-in.
+
+        EC is set explicitly per-shot so different apertures' calibrated
+        EC values are honoured during the sweep. Without this, sweep
+        shots inherit whichever EC the camera was last left at (e.g.
+        the calibrator's final aperture's EC, often 0), which makes
+        any aperture that calibrated with non-zero EC fire ~that EV
+        darker during the sweep and trip droop on every shot.
         """
         batched = getattr(self.camera, "set_aperture_iso_fec", None)
         if batched is not None:
             batched(aperture=aperture, iso=cal.iso, fec=cal.fec_ev)
-            return
-        self.camera.set_aperture(aperture)
-        self.camera.set_iso(cal.iso)
-        self.camera.set_fec(cal.fec_ev)
+        else:
+            self.camera.set_aperture(aperture)
+            self.camera.set_iso(cal.iso)
+            self.camera.set_fec(cal.fec_ev)
+        set_ec = getattr(self.camera, "set_ec", None)
+        if set_ec is not None:
+            set_ec(getattr(cal, "ec_ev", 0.0))
 
     def _measure(self, jpg_path: Path) -> float:
         if self.measure_path is not None:

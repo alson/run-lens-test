@@ -51,21 +51,27 @@ def _format_ec_label(ev: float) -> str:
     """Z7 widget label for an EC value in EV (⅓-stop grid).
 
     The Z7 EC widget reports its choices as **unsigned numeric**
-    strings on positives and decimal thirds: ``"0"``, ``"1"``,
-    ``"3"``, ``"1.333"``, ``"-1"``, ``"-1.333"``. NOT the
-    human-readable ``"+1"`` / ``"+1 1/3"`` format.
-
-    Examples: ``0.0 → "0"``, ``+1.0 → "1"``, ``+1.333 → "1.333"``,
-    ``-1.667 → "-1.667"``.
+    strings, with ⅓-stop fractions truncated to three decimals:
+    ``"0"``, ``"1"``, ``"3"``, ``"1.333"``, ``"-1"``, ``"-1.666"``.
+    Note the truncation: 2/3 → ``"0.666"`` (NOT ``"0.667"``);
+    formatting with ``f"{2/3:.3f}"`` rounds up and produces a label
+    that's not in the choice list, so we hard-code the two
+    truncated thirds.
     """
     if abs(ev) < 1e-9:
         return "0"
     sign = "-" if ev < 0 else ""
     a = abs(ev)
-    third = round(a * 3) / 3
-    if abs(third - round(third)) < 1e-3:
-        return f"{sign}{int(round(third))}"
-    return f"{sign}{third:.3f}"
+    whole = int(a)
+    third_idx = round((a - whole) * 3)  # 0, 1, 2, or 3
+    if third_idx == 3:
+        whole += 1
+        third_idx = 0
+    if third_idx == 0:
+        return f"{sign}{whole}"
+    if third_idx == 1:
+        return f"{sign}{whole}.333"
+    return f"{sign}{whole}.666"
 
 
 def _is_question_mark(value: object) -> bool:
