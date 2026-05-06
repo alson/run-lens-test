@@ -977,3 +977,35 @@ Two UX additions to the sweep progress bar:
    average. Reshoots aren't anticipated by the grid math, so the
    ETA runs slightly optimistic after a droop recovery —
    acceptable for guidance purposes.
+
+### 6.18 F16-only-truncated entries surfaced in the lens-config menu
+
+The rail-coverage analyser's reshoot list (see
+`analyse-lens-test/ANALYSIS_NOTES.md` and
+`reshoot-plan-2026-05.md`) tags six lens configs as
+**F16-only-truncated**: F4-F11 sweeps are all complete with on-target
+peaks, only F16 is truncated. Since the user has stated F16 is the
+least important aperture, those six configs are optional to reshoot.
+
+The plan-file `Status` column carries this as
+`reshoot (F16-only)`. The lens-config picker in `ui/prompts.py`
+surfaces it in two ways:
+
+1. **Marker**: `[F16-opt]` instead of the empty leading whitespace
+   used for normal entries. The done marker (`[done]`, set when a
+   completed slug is in `completed`) takes precedence when both
+   apply.
+2. **Sort order**: F16-only entries sink to the bottom of their
+   group via a stable partition. Group order is preserved; within
+   each bucket (normal vs F16-only) the original plan order is
+   preserved.
+
+Detection is a case-insensitive substring match on `f16-only` in
+the loaded `PlanEntry.status`, so future plan files can use
+`reshoot (F16-only)`, `(F16-only)`, or `F16-only optional`
+interchangeably without code changes.
+
+Picking an F16-only entry from the menu does not change session
+behaviour — the runner shoots all apertures as usual. The marker
+is purely informational so the user can defer those configs when
+time is tight.
