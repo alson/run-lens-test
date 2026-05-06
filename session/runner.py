@@ -605,6 +605,7 @@ class SessionRunner:
             )
         finally:
             try:
+                self._announce("Closing sharpness pipeline (draining crops)...")
                 self._sharpness_collector.shutdown(wait=True)
             except Exception:                        # noqa: BLE001
                 # Cropping errors must not mask a session error or
@@ -793,6 +794,7 @@ class SessionRunner:
 
             forward_steps_done = steps - 1
             if self.range_checker is not None:
+                self._announce("Range check (waiting on sharpness crops)...")
                 try:
                     forward_steps_done = self._run_range_check_and_extend(
                         lens_dir=lens_dir,
@@ -827,6 +829,7 @@ class SessionRunner:
         # may have moved into negative territory if the extension was
         # on the 'near' side).
         if forward_steps_done != 0:
+            self._announce("Returning rail to start...")
             self._return_rail_to_zero(forward_steps_done * step_size_mm)
 
         # Record this lens config in session metadata *before* the
@@ -1342,6 +1345,7 @@ class SessionRunner:
         phase: Phase,
         droop: DroopDetector | None = None,
         progress_ctx: tuple[int, int, int] | None = None,
+        progress_step_display: int | None = None,
     ) -> tuple[float, DroopEvent | None]:
         """Capture all configured replicas at one (step, aperture).
 
@@ -1379,11 +1383,21 @@ class SessionRunner:
         cal_reference = cal.final_median or self.baseline_median or 1.0
         droop_evs: list[float] = []
         droop_event: DroopEvent | None = None
+        is_reshoot = phase == Phase.RESHOOT
+        phase_label = "RESHOOT" if is_reshoot else "step"
+        bar_step_index = (
+            progress_step_display
+            if progress_step_display is not None
+            else step_index
+        )
+        # ETA only meaningful during the planned sweep; reshoot is
+        # off-script and adds shots the grid math doesn't account for.
         for replica in range(n):
             if progress_ctx is not None:
-                self._eta_record_shot()
+                if not is_reshoot:
+                    self._eta_record_shot()
                 self._progress(
-                    step_index=step_index,
+                    step_index=bar_step_index,
                     step_count=step_count,
                     position_mm=position_mm,
                     aperture=aperture,
@@ -1391,6 +1405,8 @@ class SessionRunner:
                     aperture_count=ap_count,
                     replica_index=replica,
                     replica_count=n,
+                    phase_label=phase_label,
+                    show_eta=not is_reshoot,
                 )
             self._wait_for_recycle()
             dest = self._sweep_destination(
@@ -1758,6 +1774,7 @@ class SessionRunner:
         sweep_direction = (
             Direction.FORWARD if step_size_mm >= 0 else Direction.BACKWARD
         )
+        reshoot_step_count = through_step - from_step + 1
         for step_index in range(from_step, through_step + 1):
             if step_index > from_step:
                 self.rail.move_and_wait(
@@ -1765,7 +1782,7 @@ class SessionRunner:
                 )
             position_mm = step_index * step_size_mm
             skip_remainder = False
-            for aperture in apertures:
+            for ap_index, aperture in enumerate(apertures):
                 if skip_remainder:
                     # An inner reshoot already covered this step.
                     continue
@@ -1774,6 +1791,10 @@ class SessionRunner:
                     # sweep skipped it, so reshoot mirrors that.
                     continue
                 cal = calibration.per_aperture[aperture]
+                # progress_ctx uses reshoot-local step indexing so the
+                # bar fills across the reshoot range, not the sweep
+                # range. _capture_one labels these "RESHOOT" and
+                # suppresses the ETA (reshoots are off-script).
                 ev, event = self._capture_one(
                     lens_dir=lens_dir,
                     slug=slug,
@@ -1783,6 +1804,10 @@ class SessionRunner:
                     cal=cal,
                     phase=Phase.RESHOOT,
                     droop=droop,
+                    progress_ctx=(
+                        reshoot_step_count, ap_index, len(apertures),
+                    ),
+                    progress_step_display=step_index - from_step,
                 )
                 if event is not None:
                     covered = self._handle_droop(
@@ -1801,6 +1826,10 @@ class SessionRunner:
                         # through this step; stop hitting it again
                         # and let the outer for-loop move forward.
                         skip_remainder = True
+        # Newline after the reshoot's in-place progress bar so the
+        # next sweep update doesn't write back over the final reshoot
+        # line on the same row.
+        self._progress_done()
 
     @staticmethod
     def _safe_int(value) -> int | None:
@@ -2261,6 +2290,8 @@ class SessionRunner:
         aperture_count: int,
         replica_index: int | None = None,
         replica_count: int | None = None,
+        phase_label: str = "step",
+        show_eta: bool = True,
     ) -> None:
         """Single-line progress display, updated in place via \\r.
 
@@ -2288,7 +2319,7 @@ class SessionRunner:
         filled = int(round(fraction * bar_width))
         bar = "█" * filled + "░" * (bar_width - filled)
         line = (
-            f"\r[{bar}] step {step_index + 1}/{step_count}  "
+            f"\r[{bar}] {phase_label} {step_index + 1}/{step_count}  "
             f"pos {position_mm:+7.2f} mm  "
             f"ap {aperture} ({aperture_index + 1}/{aperture_count})"
         )
@@ -2296,7 +2327,8 @@ class SessionRunner:
             line += f"  rep {replica_index + 1}/{replica_count}"
         avg_interval = self._eta_avg_interval_s
         if (
-            avg_interval is not None
+            show_eta
+            and avg_interval is not None
             and replica_index is not None
             and replica_count
             and self._eta_sweep_step_count
