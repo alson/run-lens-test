@@ -265,6 +265,14 @@ class SessionRunner:
         default_factory=lambda: prompt_off_target
     )
     jog: JogStartEnd | None = None
+    jog_freeform: Callable[[object], float] | None = None
+    """Optional interactive freeform jog (no start/end set, just move
+    the rail freely until the user is satisfied). Used by
+    :meth:`_offer_jog_pause` to let the user verify focus/framing
+    before the FEC sanity check and before each lens-config prompt
+    — the StackShot retains its rail position across program crashes
+    and lens swaps, so the rail is often nowhere useful when the
+    runner first starts. ``None`` disables the pause prompt entirely."""
     droop_detector: DroopDetector | None = None
     crop_box: CropBox | None = None
     sharpness_collector_factory: SharpnessCollectorFactory = field(
@@ -382,6 +390,14 @@ class SessionRunner:
         if self.output_root is not None:
             self._completed_slugs = completed_slugs(self.output_root)
 
+        # Offer the user a freeform jog before the FEC sanity check.
+        # The StackShot retains its rail position across crashes and
+        # lens swaps, so the rail (and target) is often nowhere
+        # sensible right after launch. Letting the user verify focus
+        # / framing here means the sanity check fires on a real
+        # subject crop, not a defocused background.
+        self._offer_jog_pause(where="before FEC sanity check")
+
         # FEC sanity check (skip if the camera doesn't expose it —
         # e.g. fakes used in tests; production NikonZ7 always has it).
         sanity_check = getattr(self.camera, "fec_sanity_check", None)
@@ -469,6 +485,12 @@ class SessionRunner:
         self.start()
         try:
             while True:
+                # Allow a freeform jog before the user picks the next
+                # lens config — useful at first-launch to clear a
+                # stale rail position from a previous crashed run, and
+                # to release the StackShot from USB-control mode if
+                # needed (jog SPACE key releases panel).
+                self._offer_jog_pause(where="before lens-config selection")
                 if self._plan_entries:
                     picked = self.prompt_lens_config_from_plan(
                         self._plan_entries, self._completed_slugs
@@ -2053,6 +2075,42 @@ class SessionRunner:
             f"(vs {unsampled_total} unsampled — saves {saved_pct:.0f} %)"
         )
 
+    def _offer_jog_pause(self, *, where: str) -> None:
+        """Optional interactive freeform jog at non-jog-and-plan
+        moments — session start (before FEC sanity check) and
+        before each lens-config prompt.
+
+        ``self.jog_freeform`` is the injected freeform-jog callable;
+        ``None`` disables the pause prompt entirely (test runners and
+        any deployment that prefers strict prompts can leave it
+        unset). The user types: empty/ENTER → continue, ``j`` → enter
+        jog mode (then re-prompt on exit), ``q`` → abort the session.
+        """
+        if self.jog_freeform is None:
+            return
+        while True:
+            try:
+                ans = input(
+                    f"\n[ENTER] continue ({where}), "
+                    "[j] jog rail (verify focus / framing), "
+                    "[q] abort: "
+                ).strip().lower()
+            except EOFError:
+                return
+            if ans == "" or ans == "y":
+                return
+            if ans == "q":
+                raise SessionAborted(f"user aborted at {where}")
+            if ans == "j":
+                try:
+                    self.jog_freeform(self.rail)
+                except SessionAborted:
+                    raise
+                except Exception:                            # noqa: BLE001
+                    log.exception("freeform jog raised")
+                continue
+            print(f"  unrecognised input {ans!r}", flush=True)
+
     def _announce(self, message: str) -> None:
         """Print a stage indicator on its own line + flush.
 
@@ -2257,6 +2315,7 @@ def main() -> None:
     from sharpness.range_check import SharpnessRangeChecker
     from stackshot.controller import open_ftdi as open_stackshot
     from stackshot.jog import jog_start_and_end as _jog
+    from stackshot.jog import jog_interactive as _jog_interactive
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -2314,6 +2373,36 @@ def main() -> None:
             ).end_mm,
         )
 
+    def _freeform_jog(rail) -> float:
+        """Single-position freeform jog used by _offer_jog_pause to
+        let the user verify focus / framing or release the
+        StackShot from USB-control mode (SPACE → panel-control,
+        ENTER → re-acquire). Same camera release/reacquire wiring
+        as the start/end jog so live view works during the SPACE
+        pause."""
+        def _release_camera() -> None:
+            log.info("releasing camera for live-view jog")
+            camera.close()
+
+        def _reacquire_camera() -> None:
+            log.info("reacquiring camera after live-view jog")
+            camera.open()
+            camera.verify_healthy(min_widgets=config.MIN_CONFIG_TREE_SIZE)
+            camera.apply_session_config(
+                iso=config.ISO_FLOOR,
+                shutter_candidates=config.SHUTTER_SPEED_CANDIDATES,
+                image_quality=config.IMAGE_QUALITY,
+                fec=0.0,
+            )
+
+        return _jog_interactive(
+            rail,
+            label="Verify focus / framing — press 'e' when done",
+            set_key="e",
+            on_release=_release_camera,
+            on_reacquire=_reacquire_camera,
+        )
+
     runner = SessionRunner(
         camera=camera,
         rail=rail,
@@ -2322,6 +2411,7 @@ def main() -> None:
         range_checker=range_checker,
         output_root=config.OUTPUT_ROOT,
         jog=_camera_jog,
+        jog_freeform=_freeform_jog,
         sharpness_collector_factory=_sharpness_factory,
     )
     try:

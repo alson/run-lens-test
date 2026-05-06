@@ -579,6 +579,72 @@ class TestRecycleWait:
 # ---- Droop pause + resume --------------------------------------------------
 
 
+class TestOfferJogPause:
+    """Optional freeform jog pause at session start and before each
+    lens-config prompt — lets the user verify focus / release the
+    StackShot from USB-control mode."""
+
+    def _runner(self, cfg, tmp_path):
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        return make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 5,
+            inputs={"lens": "L", "steps": 2, "end_mm": 2.0},
+        )
+
+    def test_no_op_when_jog_freeform_unset(self, cfg, tmp_path) -> None:
+        runner = self._runner(cfg, tmp_path)
+        runner.jog_freeform = None
+        # Doesn't read input, doesn't call jog. Returns immediately.
+        runner._offer_jog_pause(where="x")
+
+    def test_enter_continues(self, cfg, tmp_path, monkeypatch) -> None:
+        runner = self._runner(cfg, tmp_path)
+        called = []
+        runner.jog_freeform = lambda r: called.append(r)
+        monkeypatch.setattr("builtins.input", lambda _msg: "")
+        runner._offer_jog_pause(where="x")
+        assert called == []  # ENTER → no jog
+
+    def test_q_aborts(self, cfg, tmp_path, monkeypatch) -> None:
+        from errors import SessionAborted
+        runner = self._runner(cfg, tmp_path)
+        runner.jog_freeform = lambda r: None
+        monkeypatch.setattr("builtins.input", lambda _msg: "q")
+        with pytest.raises(SessionAborted):
+            runner._offer_jog_pause(where="testing")
+
+    def test_j_jogs_then_continues_on_enter(
+        self, cfg, tmp_path, monkeypatch,
+    ) -> None:
+        runner = self._runner(cfg, tmp_path)
+        called = []
+        runner.jog_freeform = lambda r: called.append(r)
+        responses = iter(["j", ""])
+        monkeypatch.setattr(
+            "builtins.input", lambda _msg: next(responses)
+        )
+        runner._offer_jog_pause(where="x")
+        assert called == [runner.rail]  # jog called once
+
+    def test_jog_exception_does_not_propagate(
+        self, cfg, tmp_path, monkeypatch,
+    ) -> None:
+        runner = self._runner(cfg, tmp_path)
+
+        def failing_jog(_r) -> float:
+            raise RuntimeError("rail unplugged")
+
+        runner.jog_freeform = failing_jog
+        responses = iter(["j", ""])
+        monkeypatch.setattr(
+            "builtins.input", lambda _msg: next(responses)
+        )
+        # Should swallow the runtime error and re-prompt.
+        runner._offer_jog_pause(where="x")
+
+
 class TestETA:
     """Unit tests for the ETA EWMA + remaining-shots calculator."""
 
