@@ -714,16 +714,36 @@ class TestETA:
         clock = iter([0.0, 5.0, 200.0, 205.0])
         runner.monotonic = lambda: next(clock)
 
-        runner._eta_record_shot()         # t=0, no prior
-        runner._eta_record_shot()         # t=5, interval 5 → EWMA=5
-        ewma_after_first = runner._eta_interval_ewma
-        assert ewma_after_first == pytest.approx(5.0)
+        runner._eta_record_shot()         # t=0, no prior interval
+        assert runner._eta_avg_interval_s is None
+        runner._eta_record_shot()         # t=5, interval 5 → avg=5
+        assert runner._eta_avg_interval_s == pytest.approx(5.0)
 
         runner._eta_record_shot()         # t=200, interval 195 → outlier, skip
-        assert runner._eta_interval_ewma == pytest.approx(5.0)  # unchanged
+        assert runner._eta_avg_interval_s == pytest.approx(5.0)  # unchanged
 
-        runner._eta_record_shot()         # t=205, interval 5 → EWMA blends
-        assert 4.5 < runner._eta_interval_ewma < 5.5
+        runner._eta_record_shot()         # t=205, interval 5 → avg=(5+5)/2=5
+        assert runner._eta_avg_interval_s == pytest.approx(5.0)
+
+    def test_cumulative_mean_blends_intervals_steadily(self, cfg, tmp_path) -> None:
+        # An EWMA(α=0.2) over [3, 7, 3, 7, 3, 7, ...] visibly oscillates
+        # shot-to-shot. The cumulative mean settles toward the true
+        # average (5) and stops oscillating after a handful of shots.
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1}, apertures=["f/4"], step_count=2,
+        )
+        intervals = [3, 7] * 6  # 12 shots
+        # Build clock samples: t=0 then cumulative sums.
+        ts = [0.0]
+        for d in intervals:
+            ts.append(ts[-1] + d)
+        clock = iter(ts)
+        runner.monotonic = lambda: next(clock)
+        for _ in range(len(ts)):
+            runner._eta_record_shot()
+        # 12 intervals: 6× 3s + 6× 7s = 60s total → mean 5.0
+        assert runner._eta_avg_interval_s == pytest.approx(5.0)
 
     def test_invalidate_clears_last_shot_at(self, cfg, tmp_path) -> None:
         runner = self._runner(
@@ -735,11 +755,32 @@ class TestETA:
         runner._eta_record_shot()
         runner._eta_record_shot()
         runner._eta_invalidate()
-        # Next record after invalidate should NOT update EWMA from the
-        # huge bridging interval.
-        prior = runner._eta_interval_ewma
+        # Next record after invalidate should NOT update average from
+        # the huge bridging interval — the prior shots' data is kept.
+        prior = runner._eta_avg_interval_s
         runner._eta_record_shot()
-        assert runner._eta_interval_ewma == pytest.approx(prior)
+        assert runner._eta_avg_interval_s == pytest.approx(prior)
+
+    def test_sweep_start_resets_lens_average(self, cfg, tmp_path) -> None:
+        # Per-lens average must NOT carry state from one config to
+        # the next — a different aperture / recycle table means
+        # different intervals.
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1}, apertures=["f/4"], step_count=2,
+        )
+        clock = iter([0.0, 5.0, 10.0])
+        runner.monotonic = lambda: next(clock)
+        runner._eta_record_shot()
+        runner._eta_record_shot()
+        runner._eta_record_shot()
+        assert runner._eta_avg_interval_s == pytest.approx(5.0)
+
+        # Simulate sweep-start reset
+        runner._eta_lens_interval_sum = 0.0
+        runner._eta_lens_interval_count = 0
+        runner._eta_last_shot_at = None
+        assert runner._eta_avg_interval_s is None
 
     def test_format_eta_minutes(self, cfg, tmp_path) -> None:
         runner = self._runner(

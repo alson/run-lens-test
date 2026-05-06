@@ -309,13 +309,17 @@ class SessionRunner:
     top of work that already exceeds it adds hours."""
     _eta_last_shot_at: float | None = None
     """monotonic() of the start of the previous sweep shot, used to
-    measure inter-shot intervals for the ETA EWMA. ``None`` after a
-    user prompt to invalidate the bridging interval (so a 5 min
-    battery swap doesn't poison the average)."""
-    _eta_interval_ewma: float | None = None
-    """Exponentially-weighted moving average of inter-shot intervals
-    in seconds. Updated per sweep replica; ``None`` until enough
-    intervals have been collected."""
+    measure inter-shot intervals for the ETA. ``None`` after a user
+    prompt to invalidate the bridging interval (so a 5 min battery
+    swap doesn't poison the average)."""
+    _eta_lens_interval_sum: float = 0.0
+    """Cumulative sum (seconds) of valid in-flight inter-shot
+    intervals collected since the start of the current lens config.
+    Reset to 0 at the start of every sweep — see the docstring on
+    :meth:`_eta_record_shot` for why a per-lens cumulative mean
+    beats a fast-decaying EWMA in this rig's interval distribution."""
+    _eta_lens_interval_count: int = 0
+    """Count of valid intervals contributing to ``_eta_lens_interval_sum``."""
     _eta_sweep_apertures: tuple[str, ...] = ()
     """Cached aperture sequence for the current sweep — needed to
     count remaining shots across the subsample grid."""
@@ -775,7 +779,8 @@ class SessionRunner:
             # calibration intervals are not representative.
             self._eta_sweep_apertures = tuple(apertures)
             self._eta_sweep_step_count = steps
-            self._eta_interval_ewma = None
+            self._eta_lens_interval_sum = 0.0
+            self._eta_lens_interval_count = 0
             self._eta_last_shot_at = None
             self._run_sweep(
                 lens_dir=lens_dir,
@@ -2167,24 +2172,47 @@ class SessionRunner:
     legitimate gap and well below any user-prompt pause."""
 
     def _eta_record_shot(self) -> None:
-        """Update the inter-shot EWMA. Call right before each capture."""
+        """Accumulate one inter-shot interval into the running mean.
+
+        We use a cumulative mean over the current lens config rather
+        than an EWMA because the per-shot interval distribution on
+        this rig is bimodal (short intra-replica intervals vs longer
+        post-flash recycle / aperture-change intervals), and the
+        sweep cycles through both deterministically. A fast-decaying
+        EWMA (α = 0.2 was the prior setting) over-weights whichever
+        type of interval came in last, making the displayed ETA
+        oscillate by ~25 % between consecutive shots even though the
+        underlying schedule is steady. The cumulative mean averages
+        both interval types in proportion to how often they actually
+        occur, which is what the user wants for "how long until
+        done?".
+
+        The sum and count both reset at the start of each sweep
+        (i.e. on every new lens config), so the average reflects the
+        current setup's pace rather than carrying state from a
+        previous config with different recycle settings.
+        """
         now = self.monotonic()
         if self._eta_last_shot_at is not None:
             interval = now - self._eta_last_shot_at
             if 0 < interval < self._ETA_OUTLIER_S:
-                if self._eta_interval_ewma is None:
-                    self._eta_interval_ewma = interval
-                else:
-                    alpha = 0.2
-                    self._eta_interval_ewma = (
-                        alpha * interval
-                        + (1 - alpha) * self._eta_interval_ewma
-                    )
+                self._eta_lens_interval_sum += interval
+                self._eta_lens_interval_count += 1
         self._eta_last_shot_at = now
+
+    @property
+    def _eta_avg_interval_s(self) -> float | None:
+        """Mean inter-shot interval in seconds for the current lens
+        config, or ``None`` when no in-flight interval has been
+        collected yet."""
+        if self._eta_lens_interval_count <= 0:
+            return None
+        return self._eta_lens_interval_sum / self._eta_lens_interval_count
 
     def _eta_invalidate(self) -> None:
         """Discard the next interval — call after every user prompt
-        so a battery-swap pause doesn't poison the average."""
+        so a battery-swap pause doesn't poison the average. Sum and
+        count are preserved (the prior shots' data stays valid)."""
         self._eta_last_shot_at = None
 
     def _eta_remaining_shots(
@@ -2266,8 +2294,9 @@ class SessionRunner:
         )
         if replica_index is not None and replica_count:
             line += f"  rep {replica_index + 1}/{replica_count}"
+        avg_interval = self._eta_avg_interval_s
         if (
-            self._eta_interval_ewma is not None
+            avg_interval is not None
             and replica_index is not None
             and replica_count
             and self._eta_sweep_step_count
@@ -2278,7 +2307,7 @@ class SessionRunner:
                 replica_index=replica_index,
                 replica_count=replica_count,
             )
-            line += f"  eta {self._format_eta(remaining * self._eta_interval_ewma)}"
+            line += f"  eta {self._format_eta(remaining * avg_interval)}"
         sys.stdout.write(line + "\x1b[K")
         sys.stdout.flush()
 
