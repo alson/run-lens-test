@@ -225,8 +225,12 @@ class SharpnessRangeChecker(RangeChecker):
     def _summarise(recs: dict[float, Recommendation]) -> str:
         if not recs:
             return "no apertures in dataset"
+        # Per-aperture summary uses Recommendation.summary() so the
+        # persisted notes pick up per-crop detail when interesting:
+        # "(N off-target crops ignored)" when valid corners disagreed
+        # with centre, "[N invalid crops: top-left 4%, ...]" when
+        # corners fell off the wafer. Keeps the happy path terse and
+        # the failure-path informative.
         return "; ".join(
-            f"f/{ap:g}: {r.verdict.value} ({r.direction.value}, "
-            f"{r.extra_steps} steps)"
-            for ap, r in sorted(recs.items())
+            recs[ap].summary() for ap in sorted(recs.keys())
         )
