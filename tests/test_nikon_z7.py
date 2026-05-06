@@ -131,7 +131,8 @@ class TestApplySessionConfig:
     def test_sets_all_present_widgets(self, nikon, camera) -> None:
         # Build one big tree with all the widgets the wrapper touches.
         # Order matches the wrapper's get_config call sequence — VR
-        # scan happens between autofocus and flashexposurecompensation.
+        # scan happens between autofocus and flashexposurecompensation;
+        # EC is the final reset.
         widgets = {
             "capturetarget": make_widget(
                 "capturetarget", "Memory card", choices=["Internal RAM", "Memory card"]
@@ -148,6 +149,9 @@ class TestApplySessionConfig:
             "flashexposurecompensation": make_widget(
                 "flashexposurecompensation", 1.0
             ),
+            "exposurecompensation": make_widget(
+                "exposurecompensation", "3", choices=["-1", "0", "1", "3"],
+            ),
         }
         # Each get_config call must return a fresh tree because the
         # wrapper does get_config -> mutate -> set_config per setter.
@@ -155,8 +159,8 @@ class TestApplySessionConfig:
             make_widget("main", children=[w]) for w in widgets.values()
         ]
         nikon.apply_session_config()
-        # set_config called once per widget present (including VR).
-        assert camera.set_config.call_count == 7
+        # set_config called once per widget present (including VR + EC).
+        assert camera.set_config.call_count == 8
         widgets["capturetarget"].set_value.assert_called_with("Internal RAM")
         widgets["imagequality"].set_value.assert_called_with("JPEG Fine")
         widgets["iso"].set_value.assert_called_with("100")
@@ -164,6 +168,7 @@ class TestApplySessionConfig:
         widgets["autofocus"].set_value.assert_called_with("Off")
         widgets["vr"].set_value.assert_called_with("Off")
         widgets["flashexposurecompensation"].set_value.assert_called_with(0.0)
+        widgets["exposurecompensation"].set_value.assert_called_with("0")
 
     def test_skips_missing_widgets(self, nikon, camera) -> None:
         # Empty tree: every widget lookup returns None.

@@ -173,6 +173,7 @@ class NikonZ7:
         capture_target: str = "Internal RAM",
         autofocus: str = "Off",
         fec: float = 0.0,
+        ec: float = 0.0,
         aperture: str | None = None,
     ) -> None:
         """Push the canonical per-session settings.
@@ -180,6 +181,11 @@ class NikonZ7:
         Called after :meth:`open` and after every lens-change
         reconnect. Skips any setting whose widget isn't present (Z7
         firmware variants).
+
+        EC is explicitly reset alongside FEC so a session never
+        inherits a leftover positive EC from the camera's prior
+        state — that bias would otherwise corrupt the FEC sanity
+        check baseline and every calibration cascade in the session.
         """
         self._set_radio("capturetarget", [capture_target])
         self._set_radio("imagequality", [image_quality])
@@ -190,6 +196,7 @@ class NikonZ7:
         self._set_radio("autofocus", [autofocus])
         self._disable_vr()
         self._set_range("flashexposurecompensation", float(fec))
+        self.set_ec(float(ec))
 
     def _disable_vr(self) -> None:
         """Best-effort VR disable across Z7 firmware variants.
