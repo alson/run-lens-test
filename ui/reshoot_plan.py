@@ -32,7 +32,9 @@ class PlanEntry:
 
 
 _GROUP_RE = re.compile(r"^##\s+(Group\s+\d+\b.*?)\s*$")
-_EST_RE = re.compile(r"\s*\(est\.?\)\s*$", re.IGNORECASE)
+# Match the trailing parenthetical that flags an estimate, allowing
+# free-form annotations inside (e.g. ``(est.)``, ``(est., F_eff=49)``).
+_EST_RE = re.compile(r"\s*\(est\b[^)]*\)\s*$", re.IGNORECASE)
 
 
 def load_plan(path: Path | str) -> list[PlanEntry]:

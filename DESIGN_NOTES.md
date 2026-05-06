@@ -1009,3 +1009,47 @@ Picking an F16-only entry from the menu does not change session
 behaviour — the runner shoots all apertures as usual. The marker
 is purely informational so the user can defer those configs when
 time is tight.
+
+### 6.19 IF-macro magnification estimates use the wrong focal length
+
+The reshoot plan and the magnification prompt suggestion compute
+estimated magnifications via `1 + L_tube / F_nominal`, using the
+focal length printed on the lens barrel. For internal-focus (IF)
+macro designs that's wrong by a large factor at close focus. The
+Z MC 105 mm f/2.8 VR S drops to ~49 mm effective focal length at
+its native 1:1 (per photomacrography.net optical-bench measure).
+So a "1 + 61/105 = 1.58×" estimate for "Z MC 105 + 61 mm tube"
+underestimates the true magnification when the lens is also at
+close focus — the F_eff-based estimate is `1 + 61/49 ≈ 2.25×`.
+
+Two consequences:
+
+1. **Bellows-factor light loss prediction**
+   (`memory/z_lens_extension_bellows.md`). The thin-lens upper
+   bound for ΔEV uses the same F. Empirically the calibrator
+   absorbs much of the predicted loss inside the AA loop, so the
+   prediction is just an upper bound either way; whether you use
+   F=105 or F=49 changes that bound but the calibrator-visible
+   bias stays around +1 EV with the 61 mm tube.
+
+2. **DOF / rail-step estimate** in `sharpness/planner.py`. DOF
+   formula is `2·c·N·(1+M)/M²`; over-estimating M shrinks DOF and
+   shrinks the rail step. The user's Z MC 105 + 61 mm tube
+   session entered M=1.58 and got a 0.017 mm step, ~71 positions
+   over a 1.23 mm range. At true M≈2.25 the real DOF is ~1.7×
+   narrower and the step density is correspondingly *higher* than
+   ideal — over-sampling, not under-sampling, so peak detection
+   still works. The safe error direction.
+
+The reshoot plan's `(est.)` values for IF lenses are documented
+as lower bounds with the F_eff-corrected numbers attached as a
+note. Calling out the Z 24-120 and Viltrox 85 as also-IF without
+a measured F_eff is intentional — the plan uses the nominal
+estimates as a lower bound but flags them in the file header.
+
+Future improvement (not implemented): a per-lens F_eff lookup
+table baked into the planner, keyed off the slug, that picks the
+right F based on which focus distance the user reports. The
+current setup is "user types the magnification and the planner
+trusts it", which works fine as long as the menu entries don't
+mislead.

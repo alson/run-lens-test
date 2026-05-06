@@ -33,8 +33,11 @@ class TestRealPlan:
         assert e.group.startswith("Group 1")
         assert e.lens_config.startswith("NIKKOR Z MC 105mm")
         assert e.estimated is True
-        assert e.magnification == pytest.approx(1.58)
-        assert "(est.)" in e.magnification_text
+        # Z MC 105 + 61 mm tube: F_eff at 1:1 ≈ 49 mm, so the
+        # F_eff-corrected estimate is ≈ 1 + 61/49 ≈ 2.25.
+        assert e.magnification == pytest.approx(2.25)
+        assert e.magnification_text.startswith("(est") is False  # has digits before
+        assert "est" in e.magnification_text.lower()
 
     def test_groups_are_both_present(self, real_plan: list[PlanEntry]) -> None:
         groups = {e.group for e in real_plan}

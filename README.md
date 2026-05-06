@@ -119,6 +119,18 @@ The program will:
    `2:1`) or float form (`0.5`, `1.0`). The runner uses this plus the
    lens's widest aperture to compute the rail step size from a thin-lens
    DOF model — you no longer pick a step count manually.
+
+   **Internal-focus macro caveat**: lens barrel focal length is the
+   *infinity* focal length. Modern IF macros (e.g. the Z MC 105 mm
+   f/2.8 VR S, which drops to ~49 mm at 1:1) shorten F substantially
+   at close focus. When you stack an external extension tube, the
+   true magnification at the lens's own minimum focus is
+   `1 + L_tube / F_eff_at_close_focus`, not `1 + L_tube / F_nominal`.
+   The reshoot-plan menu's `(est.)` magnifications use the nominal
+   F and underestimate the real value. Over-estimating M makes the
+   planner pick a smaller rail step, which over-samples the bell —
+   the safe error direction — but if you want a tighter rail range,
+   enter the F_eff-corrected value.
 7. Drop you into a jog session: use `a`/`d` to step the rail back/forward
    in fine increments, `A`/`D` for coarse, `s` to mark the start position,
    `e` to mark the end, `q` to abort. The current position is shown live.
