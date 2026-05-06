@@ -327,14 +327,27 @@ try:
             with Image.open(p) as im:
                 box = crop_box(*im.size, 0.20, 0.20, 0.0, 0.15)
         return measure_crop(p, box).p50
+    import math
     base, low = cam.fec_sanity_check(measure=measure, capture_dir='/tmp')
-    print(f'FEC=0 median {base:.1f}, FEC=-2 median {low:.1f}, ratio {low/base:.2f}')
+    drop_ev = math.log2((base/255)**2.2 / (low/255)**2.2)
+    print(f'FEC=0 median {base:.1f}, FEC=-2 median {low:.1f}, drop {drop_ev:+.2f} EV')
 finally:
     cam.close()
 "
 ```
 
-Expected: ratio < 0.5 (the FEC=-2 shot is at most half the brightness of FEC=0). If ratio > 0.5, you've likely got the SU-800 mounted by mistake — it doesn't propagate FEC on the Z7. Swap to the SB-5000 commander.
+Expected: scene-light EV drop ≥ 1.0 between FEC=0 and FEC=-2 (gamma-linearised
+medians, threshold `FEC_SANITY_MIN_DROP_EV` in `config.py`). A perfectly
+responding rig delivers close to the requested -2.0 EV; the threshold is half
+that to leave margin for ambient-light fill at the central crop. If the drop
+is < 1.0 EV, you've likely got the SU-800 mounted by mistake — it doesn't
+propagate FEC on the Z7 — or one of the remotes isn't in remote mode. Swap
+to the SB-5000 commander / fix the remote mode.
+
+(Older versions used a raw pixel-ratio threshold of 0.5, which corresponds to a
+2.20 EV drop in scene light at γ=2.2 — *tighter* than the requested -2.0 EV
+and so falsely failed perfectly-responding rigs. The EV-based check above
+replaces it.)
 
 ---
 
@@ -590,7 +603,7 @@ If the rail keeps moving after Ctrl-C: the StackShot didn't acknowledge `CC_RAIL
 - [x] `python -m stackshot.jog` lets you set START / END (step 2)
 - [x] `python -m camera.nikon_z7 --health` reports ≥100 widgets, M mode (step 3.1)
 - [x] `python -m camera.nikon_z7 --capture` writes a JPEG (step 3.2)
-- [x] FEC sanity check ratio < 0.5 (step 3.3)
+- [x] FEC sanity check drop ≥ 1.0 EV (step 3.3)
 - [x] `python -m notify.ntfy --test` delivers (step 4)
 - [x] `python -m session.runner` runs one full lens config end-to-end (step 5)
 - [x] Battery-droop pause + reshoot from earliest under-exposed step (step 6)

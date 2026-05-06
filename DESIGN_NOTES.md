@@ -778,3 +778,202 @@ hit FEC=0 + ISO < ceiling and still report `hit_tolerance=False`
 — it gives up before pushing FEC to +1 EV. Worth a follow-up to
 confirm the calibrator escalates fully through FEC max → ISO
 ceiling before declaring failure.
+
+### 6.9 set_ec silent no-op on positive / fractional EC (bug)
+
+The Z7 EC widget reports its choices as **unsigned numeric thirds**
+(e.g. `"0"`, `"1"`, `"3"`, `"1.333"`, `"-1.333"`), with the 1/3 and
+2/3 fractions truncated rather than rounded:
+
+```
+Choice: 16 0.333
+Choice: 17 0.666     ← truncated, NOT "0.667"
+Choice: 18 1
+```
+
+The original `_format_ec_label` emitted the human-readable
+`"+1"` / `"+1 1/3"` form, which the Z7 widget's choice list does
+*not* contain. `set_ec` looked up the formatted label and silently
+returned without doing anything when no match was found — no error,
+no log line. Negative integer labels (`"-1"`, `"-3"`) happened to
+match by coincidence; everything else silently failed.
+
+Symptom: the calibrator's cascade reported "EC=+3" but EXIF on
+saved JPEGs showed `ExposureCompensation: 0`. The cascade then
+fell back to ISO bumps which, in AA flash mode, just make the
+flash quench earlier and don't actually brighten the scene unless
+the flash is at mechanical max. So calibration plateaued
+inexplicably at f/4.5 with an apparent EV gap that never closed.
+
+The 2/3-stop rounding discrepancy was a separate landmine: even
+after fixing the format to use unsigned decimals, formatting
+`2/3 ≈ 0.6667` with `:.3f` produces `"0.667"` (rounded up) but the
+widget label is `"0.666"` (truncated). The whole-stop rounded
+fallback then silently set EC=1.0 instead of EC=0.667. The fixed
+formatter hard-codes `.333` / `.666` for the two third-stops.
+
+`set_ec` now raises `CameraStateError` if neither the requested
+nor the rounded fallback label is in the widget's choice list, so
+future widget-format drift fails loudly. Coverage:
+`tests/test_nikon_z7.py::TestSetEC`.
+
+### 6.10 EC must be reset and re-applied per aperture
+
+Two related runner bugs surfaced after the EC label fix:
+
+1. `apply_session_config` reset FEC=0 at session start and on
+   lens-change reconnect, but never touched EC. A session
+   inherited whatever EC the camera was last left at — typically 0,
+   but if any standalone tool or prior cascade had left positive EC
+   the sanity-check baseline was that much brighter and the rig's
+   true FEC response got mis-measured. Fixed: `apply_session_config`
+   takes an `ec=0.0` kwarg and calls `set_ec` after `set_fec`.
+
+2. `_set_capture_settings` (the per-shot wrapper) configured
+   aperture / ISO / FEC but never set EC. After the calibrator
+   converged f/4.5 on EC=+0.667 and f/16 on EC=0, the camera was
+   left at EC=0 from the final calibrated aperture, so when the
+   sweep started at f/4.5 every shot fired ~0.7 EV darker than
+   calibration and triggered severe droop on the first frame.
+   Fixed: the wrapper calls `set_ec(cal.ec_ev)` per shot.
+
+Both bugs were latent for as long as the calibrator landed on
+EC=0 across all apertures (the typical case before the rig drifted
+into needing positive bias on the widest stop).
+
+### 6.11 FEC sanity check: pixel-ratio threshold was too tight
+
+The `fec_sanity_check` threshold was `low_median / baseline_median
+≤ 0.5` in pixel units. With γ=2.2, pixel-ratio 0.5 corresponds to
+a 2.20 EV drop in scene light, **tighter than the requested -2.0
+EV drop itself**. So a perfectly-responding rig that delivered
+exactly the requested -2.0 EV (pixel ratio 0.547) falsely failed.
+
+Symptom: 148 → 78 medians, ratio 0.527 (= -2.02 EV in linear
+light, i.e. perfect FEC response). Earlier sessions only passed
+because the central crop happened to over-respond by ~0.84 EV
+(less ambient fill, brighter spec at the crop position).
+
+Fixed by switching to gamma-linearised EV math: `drop_ev =
+log2(linear(baseline) / linear(low))`, threshold `min_drop_ev=1.0`.
+Half the requested -2 EV drop, leaves margin for ambient-light
+fill at the central crop while still catching a totally
+non-responsive setup (drop ≈ 0).
+
+### 6.12 Focus mode is readonly via gphoto2 on Z lenses
+
+Z lenses are focus-by-wire and the camera body's focus mode (set
+via the Fn1 + sub-command-dial combination on the Z7) isn't
+writable over PTP. gphoto2 exposes `focusmode` as `Readonly: 1` —
+we can only *observe* whether it's `Manual` / `AF-S` / `AF-C` /
+`AF-F`.
+
+The `autofocus` widget (`/main/settings/autofocus`) is writable
+and the runner sets it `Off`, but that only suppresses AF
+triggering on shutter — the lens focus mode itself can still drift
+under AF-S. So `verify_healthy` now refuses to start the session
+unless `focusmode == "Manual"`, with a CameraStateError pointing
+the user at the body-side focus-mode toggle.
+
+### 6.13 close() must tolerate a powered-off camera
+
+Lens-change recovery instructs the user to power off the camera,
+swap the lens, pull the battery, reinsert, power back on, *then*
+press ENTER. By that point the camera is gone from USB. The
+runner's old `close()` did `try: camera.exit() finally: handle =
+None` — the `finally` cleared the handle but `GPhoto2Error -52
+("Could not find the requested device on the USB port")`
+propagated out of the function and killed the session. Fixed:
+`close()` catches `GPhoto2Error`, logs at info, and proceeds to
+`_camera = None` so the subsequent `open()` runs cleanly against
+the freshly-powered-on camera.
+
+### 6.14 Optional freeform jog at session start
+
+The StackShot retains its rail position across program crashes
+and across lens swaps, so the rail (and target focus) is often
+nowhere useful when a fresh runner launches. Two consequences:
+
+1. The FEC sanity check fired against a defocused central crop,
+   producing flaky ratios that drifted near the threshold edge.
+2. After a previous crash, the StackShot can be left in
+   USB-control mode — the panel buttons are inert until a process
+   releases USB, but there's no way to release without entering
+   the jog UI.
+
+Added `jog_freeform` injection + `_offer_jog_pause(where)` helper
+called at two new points: right before the FEC sanity check, and
+at the top of each lens-config prompt iteration. Prompts
+`[ENTER] continue, [j] jog rail, [q] abort:`; pressing `j` enters
+the freeform jog (which already releases the camera for live view
+via SPACE → on_release callback) and re-prompts on exit. Default
+`None` = no-op, so existing test fixtures stay backward-compatible.
+
+### 6.15 Rig flash headroom envelope (commander +1.7 EV)
+
+Measured 2026-05-06 with the macro rig in the user's standard
+configuration (Z7 + Z MC 105 + 61 mm extension, SB-5000 commander
+in AA mode with +1.7 EV group bias on A & B, one SB-800 in each).
+FEC and EC each track linearly until the SB-800s hit mechanical
+full-dump (~6 s recycle, blinking ready light); below that they
+stack additively (`FEC=-1 + EC=+1 ≈ FEC=0 + EC=0` to within
+0.04 EV). Mechanical max lands at:
+
+* **f/4.5**: > +3.5 EV above (FEC=0, EC=0) baseline. The cascade
+  max (FEC=+1, EC=+3) doesn't quite reach it — JPEG starts
+  highlight-clipping (~p50=237, 2.4% clip) before the flash runs
+  out of headroom. Confirmed by 3.8 s recycle and *no* underexposure
+  blink at this corner.
+* **f/8**: ≈ +2.6 EV. Cascade hits this at FEC=+1, EC=+2; adding
+  EC=+3 produces zero further output (p50 stays at 183-184).
+  Confirmed full-dump regime by user (6 s recycle, blinking).
+
+ISO 400 vs ISO 100 at f/8 confirms the limit is **flash physical
+output**, not AA-loop / commander metering saturation: at ISO 400
+the same FEC=+1 + EC=+2 reaches +3.00 EV (vs +2.64 at ISO 100),
+because at higher ISO the AA target needs less photon output and
+the SB-800 has 2 more stops of mechanical headroom. Below the cap
+ISO 100 and ISO 400 are identical (FEC=+1 + EC=+1 → p50=158 at
+both ISOs) — the textbook signature of an output limit.
+
+Implication for calibration: the existing plateau-detect → ISO
+range-extend mechanism is doing the right thing; ISO is the only
+lever that genuinely adds light to the sensor when the flash is
+mechanically maxed.
+
+The +1.7 EV commander bias uses ~half the apparent f/8 envelope.
+Removing it (or reducing it) would give the calibrator ~1.7 EV
+more cascade headroom at every aperture. Worth re-evaluating if
+sessions repeatedly fail to reach baseline at smaller apertures.
+
+### 6.16 Per-replica droop short-circuit
+
+Originally `_capture_one` captured all N replicas and pushed only
+the median to the droop detector. With `SHOTS_PER_STEP_APERTURE=3`,
+a single severely under-exposed replica still wasted two more
+shots before the failure was even evident — particularly painful
+on the severe criterion (1 of 10 ≤ -2 EV) which fires on a single
+replica. `_capture_one` now pushes per-replica and breaks the loop
+on the first trip event, returning `(median_ev, droop_event)` so
+the caller can react.
+
+### 6.17 Sweep progress: replica counter + per-lens-config ETA
+
+Two UX additions to the sweep progress bar:
+
+1. **Replica counter**: `rep N/M` appended when
+   `SHOTS_PER_STEP_APERTURE > 1` so the bar advances during the
+   3-replica burst at each (step, aperture) instead of looking
+   frozen for several seconds.
+2. **ETA**: tail-end `eta M:SS` (or `H:MM:SS`) computed from
+   `remaining_shots × interval_average`. `remaining_shots` walks
+   the (step, aperture, replica) grid forward from the current
+   position honouring per-aperture subsample factors. The EWMA was
+   later replaced by a cumulative mean per lens config (see commit
+   cba4b83); cumulative is more stable across the sweep's natural
+   rhythm of fast (subsample-skipped) and slow (full-aperture)
+   steps. Battery-droop pauses invalidate the next interval via
+   `_eta_invalidate()` so a multi-minute swap doesn't poison the
+   average. Reshoots aren't anticipated by the grid math, so the
+   ETA runs slightly optimistic after a droop recovery —
+   acceptable for guidance purposes.

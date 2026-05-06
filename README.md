@@ -53,23 +53,29 @@ Read this section before each test session.
    may persist from a previous session.
 3. Set the **mode dial to M** (or U2 if U2 is configured for M). Do not use
    anything else — the program checks `expprogram == M` and aborts otherwise.
-4. Confirm custom function **e3 = "Entire frame"** (not the default "Background
+4. Set the **focus mode to Manual** (Fn1 button + sub-command-dial on the Z7).
+   AF-S / AF-C / AF-F can refocus between captures and ruin the focus-bracketed
+   sweep. The focus-mode widget is read-only over PTP on Z lenses (focus-by-
+   wire), so the runner can only detect the wrong state and abort — it can't
+   set MF for you. Setting `autofocus = Off` in software only suppresses
+   AF-on-shutter; it doesn't change the lens focus mode.
+5. Confirm custom function **e3 = "Entire frame"** (not the default "Background
    only"). The calibrator uses camera EC as a fallback when FEC saturates,
    relying on EC stacking with FEC for flash output. With e3 = "Background
    only" the EC fallback wouldn't reach the flash, leaving you 3 EV less
    headroom in the closed loop.
-5. Mount the **SB-5000 on the hot shoe in commander mode**, master output `--`,
+6. Mount the **SB-5000 on the hot shoe in commander mode**, master output `--`,
    group A in `A` (auto aperture) mode, group FEC = 0.
-6. Switch on the remote flashes (SB-800 + SB-5000), check ready light.
-7. **Power on the camera.** Wait for the rear screen to show live view.
-8. Half-press the shutter to confirm the camera is awake.
-9. **Now connect the USB cable from the camera to the laptop.** Plugging in
-   before power-on tends to make the camera enumerate as a minimal MTP
-   device and the program will refuse to start.
+7. Switch on the remote flashes (SB-800 + SB-5000), check ready light.
+8. **Power on the camera.** Wait for the rear screen to show live view.
+9. Half-press the shutter to confirm the camera is awake.
+10. **Now connect the USB cable from the camera to the laptop.** Plugging in
+    before power-on tends to make the camera enumerate as a minimal MTP
+    device and the program will refuse to start.
 
 If at any point the program reports "config tree too small — battery-pull
 recovery needed", that means the camera dropped into the minimal-MTP state
-and you need to repeat steps 1–9.
+and you need to repeat steps 1–10.
 
 ### Rig prep
 
@@ -100,21 +106,28 @@ python -m session.runner
 The program will:
 
 1. Open the StackShot and camera.
-2. Validate camera state (M mode, full config tree, FEC sanity test).
-3. Prompt for the first lens configuration as a free-text line.
-4. Prompt for the **magnification** in ratio (`1:1`, `1.5:1`, `1:1.5`,
+2. Offer a freeform jog before the FEC sanity check (`[ENTER]`
+   continue, `j` jog, `q` abort). Useful if the rail is at a stale
+   position from a previous run, the wafer is out of focus, or the
+   StackShot was left in USB-control mode after a crash and you
+   need to release the panel buttons.
+3. Validate camera state (M mode, focus mode = Manual, full config
+   tree, FEC sanity test).
+4. Offer the same freeform jog pause before the lens-config prompt.
+5. Prompt for the first lens configuration as a free-text line.
+6. Prompt for the **magnification** in ratio (`1:1`, `1.5:1`, `1:1.5`,
    `2:1`) or float form (`0.5`, `1.0`). The runner uses this plus the
    lens's widest aperture to compute the rail step size from a thin-lens
    DOF model — you no longer pick a step count manually.
-5. Drop you into a jog session: use `a`/`d` to step the rail back/forward
+7. Drop you into a jog session: use `a`/`d` to step the rail back/forward
    in fine increments, `A`/`D` for coarse, `s` to mark the start position,
    `e` to mark the end, `q` to abort. The current position is shown live.
    The runner prints the planned rail step + position count once you've
    set END; if the jogged range yields fewer than `MIN_RAIL_POSITIONS`
    (default 10) positions, you'll be prompted to re-jog wider.
-6. Run FEC calibration at step 0 (one test shot per aperture, possibly more).
-7. Run the rail sweep.
-8. Notify on completion and prompt for the next lens config.
+8. Run FEC calibration at step 0 (one test shot per aperture, possibly more).
+9. Run the rail sweep.
+10. Notify on completion and prompt for the next lens config.
 
 ### Lens change procedure
 
@@ -286,7 +299,8 @@ All tunable constants are at the top of `config.py`. Notable ones:
 | "Config tree too small" at startup | Camera came up in minimal-MTP mode | Battery-pull recovery (camera prep §1–8). |
 | `PTP General Error` / `I/O problem` on capture (camera fires but file transfer fails) | USB 2.0 cable on the Z7; can't sustain 12 MB bulk transfer | Use a USB 3.0+ cable. Confirm with `lsusb -t` shows the Z7 at `5000M`, not `480M`. |
 | "Camera not in M mode" | Mode dial wrong, or U2 bank reset | Set dial to M. |
-| FEC sanity check fails | SU-800 mounted instead of SB-5000, or lens cap on | Check commander; confirm flashes fire. |
+| "focusmode is 'AF-S'" (or AF-C / AF-F) | Lens focus mode isn't Manual | Set MF on the body (Fn1 + sub-command-dial on the Z7). The widget is read-only over PTP; the runner can detect but not fix it. |
+| FEC sanity check fails (drop < 1 EV) | SU-800 mounted instead of SB-5000, lens cap on, or remotes not in remote mode | Check commander; confirm flashes fire; press `j` at the pre-sanity-check pause to jog the rail onto a focused subject before re-running. |
 | All test shots have similar luminance | Crop is on a saturated highlight, or ambient overwhelming flash | Verify overlay JPEG; close room blinds; check wafer position. |
 | Rail moves but no captures arrive | gphoto2 USB session corrupted | Stop program, unplug-replug camera USB, rerun. |
 | StackShot move never completes | Cable issue or rail jam | Check StackShot LCD for error; power-cycle StackShot. |
