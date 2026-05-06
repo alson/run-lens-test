@@ -326,8 +326,21 @@ class TestFECSanityCheck:
 
     def test_passes_when_low_is_dim(self, nikon, camera, gp, tmp_path) -> None:
         self._wire_capture_to(nikon, camera, gp, tmp_path)
-        # FEC=0 → 200, FEC=-2 → 50; ratio 0.25, well below 0.5.
+        # FEC=0 → 200, FEC=-2 → 50; γ=2.2 drop = 4.5 EV, well above 1.0.
         medians = iter([200.0, 50.0])
+        nikon.fec_sanity_check(
+            capture_dir=tmp_path,
+            measure=lambda _p: next(medians),
+        )
+
+    def test_passes_at_realistic_minus_two_ev_response(
+        self, nikon, camera, gp, tmp_path,
+    ) -> None:
+        # Real rig delivering exactly the requested -2 EV: pixel-ratio
+        # 0.527 (the case the old min_ratio=0.5 falsely failed).
+        # 148 → 78 = (78/148)^2.2 in linear ≈ 0.247 = -2.02 EV — passes.
+        self._wire_capture_to(nikon, camera, gp, tmp_path)
+        medians = iter([148.0, 78.0])
         nikon.fec_sanity_check(
             capture_dir=tmp_path,
             measure=lambda _p: next(medians),
@@ -335,7 +348,7 @@ class TestFECSanityCheck:
 
     def test_fails_when_low_is_too_bright(self, nikon, camera, gp, tmp_path) -> None:
         self._wire_capture_to(nikon, camera, gp, tmp_path)
-        # FEC=-2 only barely darker — ratio 0.95 > 0.5.
+        # FEC=-2 only barely darker — drop ≈ 0.16 EV, far below 1.0.
         medians = iter([200.0, 190.0])
         with pytest.raises(FECSanityError, match="SU-800"):
             nikon.fec_sanity_check(

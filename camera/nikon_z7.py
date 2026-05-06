@@ -10,6 +10,7 @@ so unit tests don't need a real camera.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from pathlib import Path
@@ -150,6 +151,19 @@ class NikonZ7:
             raise CameraStateError(
                 f"expprogram is {ep_value!r}; mode dial must be on M "
                 "(or U2 if U2 is configured for M)."
+            )
+        # Focus mode must be Manual. The widget is readonly via gphoto2
+        # (Z lenses are focus-by-wire and the camera body's focus mode
+        # isn't writable over PTP), so we can only detect the wrong
+        # state and tell the user to fix it on the camera. autofocus=
+        # Off doesn't fully suppress AF-S behaviour during capture.
+        fm_value = self._read_property_with_qm_tolerance("focusmode")
+        if fm_value and fm_value != "Manual":
+            raise CameraStateError(
+                f"focusmode is {fm_value!r}; set the camera to Manual "
+                "Focus before starting (focus-mode button + dial). "
+                "AF-S/AF-C will refocus on each capture and ruin the "
+                "focus-bracketed sweep."
             )
 
     def _read_property_with_qm_tolerance(self, name: str) -> str:
@@ -451,21 +465,32 @@ class NikonZ7:
         *,
         baseline_fec: float = 0.0,
         low_fec: float = -2.0,
-        min_ratio: float = 0.5,
+        min_drop_ev: float = 1.0,
+        gamma: float = 2.2,
         capture_dir: Path | None = None,
         measure: Callable[[Path], float] | None = None,
     ) -> tuple[float, float]:
         """Take two test shots and confirm FEC reaches the flash.
 
-        Captures one frame at ``baseline_fec`` and one at ``low_fec``.
-        ``measure(path)`` returns each frame's central-crop median
-        (callers pass an :func:`exposure.analyse.measure_crop` adapter).
+        Captures one frame at ``baseline_fec`` and one at ``low_fec``,
+        gamma-linearises the central-crop medians, and computes the
+        scene-light EV drop between them. Raises
+        :class:`FECSanityError` if the measured drop is less than
+        ``min_drop_ev``.
 
-        Raises :class:`FECSanityError` if
-        ``low_median / baseline_median > min_ratio`` (i.e. the −2 EV
-        shot wasn't visibly darker, which means FEC isn't reaching the
-        flash — most likely the SU-800 is mounted instead of the
-        SB-5000 commander).
+        The check is meant to detect "FEC has no effect" failure modes
+        (e.g. SU-800 mounted instead of SB-5000 commander, or the
+        flashes not in remote mode). At ``low_fec=-2.0`` the rig
+        should drop by close to 2 EV; the default ``min_drop_ev=1.0``
+        is half the requested drop, leaving generous margin for
+        ambient-light fill at the central crop while still catching
+        a totally-non-responsive setup (which would show drop ≈ 0).
+
+        The earlier pixel-ratio threshold (``min_ratio=0.5``) was
+        intrinsically tighter than the requested drop: pixel ratio
+        0.5 corresponds to a 2.20 EV drop in scene light at γ=2.2,
+        so a perfectly responding rig that delivers exactly the
+        requested -2.0 EV (pixel ratio 0.547) would falsely fail.
 
         Returns ``(baseline_median, low_median)``.
         """
@@ -490,13 +515,21 @@ class NikonZ7:
             raise FECSanityError(
                 "baseline FEC=0 shot has zero median; flash may not have fired"
             )
-        ratio = low_median / baseline_median
-        if ratio > min_ratio:
+        if low_median <= 0:
             raise FECSanityError(
-                f"FEC={low_fec:+.1f} median ({low_median:.1f}) is not "
-                f"sufficiently darker than FEC=0 ({baseline_median:.1f}); "
-                f"ratio {ratio:.2f} > {min_ratio:.2f}. Most likely the "
-                "SU-800 is mounted instead of the SB-5000 commander."
+                f"FEC={low_fec:+.1f} shot has zero median; flash may not have fired"
+            )
+        # Linearise via gamma and compute drop in EV.
+        baseline_lin = (baseline_median / 255.0) ** gamma
+        low_lin = (low_median / 255.0) ** gamma
+        drop_ev = math.log2(baseline_lin / low_lin)
+        if drop_ev < min_drop_ev:
+            raise FECSanityError(
+                f"FEC={low_fec:+.1f} dropped scene exposure by only "
+                f"{drop_ev:+.2f} EV (medians {baseline_median:.0f} → "
+                f"{low_median:.0f}); expected at least {min_drop_ev:.1f} EV. "
+                "Most likely the SU-800 is mounted instead of the SB-5000 "
+                "commander, or the flashes are not in remote mode."
             )
         return baseline_median, low_median
 

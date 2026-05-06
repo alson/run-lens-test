@@ -85,7 +85,13 @@ MIN_CONFIG_TREE_SIZE = 100
 IMAGE_QUALITY = "JPEG Fine"
 SHUTTER_SPEED_CANDIDATES = ("1/200", "0.0050s", "0.005s")
 FEC_SANITY_LOW_EV = -2.0
-FEC_SANITY_MIN_RATIO = 0.5  # FEC=-2 median must be ≤ 50% of FEC=0 median
+FEC_SANITY_MIN_DROP_EV = 1.0
+"""Minimum scene-light EV drop expected between FEC=0 and FEC=-2.0
+shots, computed from the gamma-linearised central-crop medians.
+Default 1.0 leaves generous margin for ambient-light fill at the
+central crop while still catching a totally non-responsive setup
+(SU-800 mounted instead of SB-5000 commander, or flashes not in
+remote mode), which would show drop ≈ 0."""
 
 # ---- Calibration baseline ----------------------------------------------------
 

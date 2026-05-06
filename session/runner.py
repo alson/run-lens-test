@@ -392,8 +392,8 @@ class SessionRunner:
                     low_fec=getattr(
                         self.config, "FEC_SANITY_LOW_EV", -2.0
                     ),
-                    min_ratio=getattr(
-                        self.config, "FEC_SANITY_MIN_RATIO", 0.5
+                    min_drop_ev=getattr(
+                        self.config, "FEC_SANITY_MIN_DROP_EV", 1.0
                     ),
                     capture_dir=self.session_dir,
                     measure=self._measure,
