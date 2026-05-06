@@ -937,6 +937,58 @@ class TestDroopPause:
         # consumed exactly — assert no leftover medians:
         assert camera.history  # smoke check that captures happened
 
+    def test_severe_trip_on_first_replica_skips_remaining_replicas(
+        self, cfg, tmp_path
+    ) -> None:
+        # SHOTS_PER_STEP_APERTURE=3. Replica 0 at step 1 is severely
+        # under-exposed (median 25 → ≈-4.4 EV) → severe criterion
+        # trips on the very first push. Replicas 1 and 2 must NOT be
+        # captured: the runner should short-circuit at the first
+        # trip, prompt for batteries, and only then re-shoot.
+        cfg.SHOTS_PER_STEP_APERTURE = 3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # Single aperture, 3-step sweep.
+        # Step 0: 3 replicas at 100 (clean).
+        # Step 1: replica 0 = 25 (severe trip, no more replicas).
+        # _handle_droop: earliest=1, current=1 → no reshoot, just
+        #   prompt + reset. Inner loop sets aborted=True. f/4 was
+        #   the only aperture.
+        # Step 2: 3 replicas at 100 (clean).
+        medians = [
+            100.0,                     # cal f/4
+            # Step 0 (3 replicas):
+            100.0, 100.0, 100.0,
+            # Step 1 (only replica 0 captured before trip):
+            25.0,
+            # Step 2 (clean again, 3 replicas):
+            100.0, 100.0, 100.0,
+        ]
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 3, "end_mm": 2.0},
+        )
+        runner.confirm = lambda _msg: True   # ENTER on droop prompt
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        # Step 1 sweep rows: only replica 0 was captured before trip
+        # short-circuited the rest.
+        step1_sweep = [
+            r for r in rows
+            if r["phase"] == "sweep" and int(r["rail_step"]) == 1
+        ]
+        assert len(step1_sweep) == 1
+        # Total capture events for the session:
+        # 1 cal + 3 step 0 + 1 step 1 (short-circuit) + 3 step 2 = 8.
+        capture_count = sum(1 for k, _ in camera.history if k == "capture")
+        assert capture_count == 8
+
     def test_resume_reshoots_from_first_underexposed_step(
         self, cfg, tmp_path
     ) -> None:

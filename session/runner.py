@@ -887,7 +887,7 @@ class SessionRunner:
                 aperture_index=ap_index,
                 aperture_count=len(apertures),
             )
-            ev = self._capture_one(
+            ev, event = self._capture_one(
                 lens_dir=lens_dir,
                 slug=slug,
                 step_index=step_index,
@@ -895,8 +895,8 @@ class SessionRunner:
                 aperture=aperture,
                 cal=cal,
                 phase=Phase.SWEEP,
+                droop=droop,
             )
-            event = droop.push(aperture, ev, step_index=step_index)
             if event is not None:
                 current_step_reshot = self._handle_droop(
                     event,
@@ -1300,14 +1300,25 @@ class SessionRunner:
         aperture: str,
         cal: ApertureCalibration,
         phase: Phase,
-    ) -> float:
+        droop: DroopDetector | None = None,
+    ) -> tuple[float, DroopEvent | None]:
         """Capture all configured replicas at one (step, aperture).
 
-        Returns the **median** EV delta across replicas — that's what
-        the droop detector pushes against, so a single noisy frame
-        doesn't trip the criterion. Each replica is independently
-        saved to disk, recorded in the sharpness collector with its
-        own ``replica_index``, and logged in shots.csv.
+        Returns ``(median_ev, droop_event)``:
+        * ``median_ev`` is the median EV delta across the replicas
+          actually captured (one or more — possibly fewer than N if
+          we short-circuited on a droop trip).
+        * ``droop_event`` is non-``None`` when ``droop`` was passed
+          and a replica's push tripped a criterion. The caller
+          should hand it to :meth:`_handle_droop` and stop further
+          captures at this (step, aperture).
+
+        Pushing per-replica matters: a single severely under-exposed
+        replica trips the severe criterion immediately (1 of last 10
+        ≤ -2 EV). Without per-replica pushes the runner would take
+        all N replicas, compute the median, and only then push —
+        wasting two more shots after the failure was already
+        evident.
 
         ``SHOTS_PER_STEP_APERTURE`` controls the replica count
         (default 1 for legacy behaviour).
@@ -1325,6 +1336,7 @@ class SessionRunner:
         # for the droop push.
         cal_reference = cal.final_median or self.baseline_median or 1.0
         droop_evs: list[float] = []
+        droop_event: DroopEvent | None = None
         for replica in range(n):
             self._wait_for_recycle()
             dest = self._sweep_destination(
@@ -1355,8 +1367,15 @@ class SessionRunner:
                 phase=phase,
             )
             droop_evs.append(ev_to_cal)
+            if droop is not None:
+                droop_event = droop.push(
+                    aperture, ev_to_cal, step_index=step_index
+                )
+                if droop_event is not None:
+                    break  # short-circuit: stop taking more replicas
         droop_evs.sort()
-        return droop_evs[len(droop_evs) // 2]  # median
+        median_ev = droop_evs[len(droop_evs) // 2]
+        return median_ev, droop_event
 
     def _handle_droop(
         self,
@@ -1699,7 +1718,7 @@ class SessionRunner:
                     # sweep skipped it, so reshoot mirrors that.
                     continue
                 cal = calibration.per_aperture[aperture]
-                ev = self._capture_one(
+                ev, event = self._capture_one(
                     lens_dir=lens_dir,
                     slug=slug,
                     step_index=step_index,
@@ -1707,8 +1726,8 @@ class SessionRunner:
                     aperture=aperture,
                     cal=cal,
                     phase=Phase.RESHOOT,
+                    droop=droop,
                 )
-                event = droop.push(aperture, ev, step_index=step_index)
                 if event is not None:
                     covered = self._handle_droop(
                         event,
