@@ -613,6 +613,39 @@ factors fan out further (f/16: 5) for ~30 % savings. Plan
 announcement now prints the per-aperture breakdown + savings
 percentage so the user can sanity-check before committing.
 
+### 5.11 Droop detector: session-level pooling + loosened criteria
+
+Original design was per-aperture: each aperture had its own rolling
+window, isolated from the others. Two trip criteria fired
+independently per aperture (3 of last 10 ≤ -0.7 EV; 2 of last 10
+≤ -2.0 EV).
+
+The user flagged this as too insensitive. Real flash droop tends
+to spread across consecutive captures regardless of aperture —
+two adjacent shots at f/5.6 and f/8 both ≤ -0.7 EV is already
+strong evidence of droop, but per-aperture pooling missed it
+because neither aperture had been pushed against twice.
+
+Refactored to **session-level**: a single rolling window across
+all apertures. Criteria loosened:
+* Severe (1 of last 10 ≤ -2 EV) — fires immediately on any single
+  catastrophically dim shot. Catches "flash refused to fire / hit
+  mechanical-min" failure modes.
+* Moderate (2 of last 10 ≤ -0.7 EV) — was 3 of 10. Combined with
+  pooling, a moderate trip now fires on the second moderate shot
+  in the sweep regardless of which aperture it landed at.
+
+Backwards-compat preserved: `window_for(aperture)` and
+`window_entries_for(aperture)` filter the session-level deque by
+aperture, returning what callers used to get from the
+per-aperture deque. New `session_window_entries()` exposes the
+unfiltered pooled view.
+
+`earliest_underexposed_step(threshold)` still works correctly —
+it iterates the session-level window and finds the lowest
+step_index whose ev_value ≤ threshold, which is exactly what the
+runner's reshoot rewind needs.
+
 ## 6. What would be different if redoing the project
 
 - **Test the SB-5000 commander earlier.** The first half of the planning

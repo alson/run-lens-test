@@ -60,8 +60,8 @@ def cfg():
         TEST_SHOT_TOLERANCE_EV=1 / 3,
         TEST_SHOT_MAX_RETRIES=3,
         ROLLING_WINDOW=5,
-        DROOP_CRIT_A=(3, -0.7),
-        DROOP_CRIT_B=(2, -2.0),
+        DROOP_CRIT_A=(1, -2.0),  # severe single-shot trip
+        DROOP_CRIT_B=(2, -0.7),  # moderate cumulative trip
         MIN_CONFIG_TREE_SIZE=100,
         IMAGE_QUALITY="JPEG Fine",
         SHUTTER_SPEED_CANDIDATES=("1/200",),
@@ -697,31 +697,33 @@ class TestSubsampling:
         assert int(f8_sweep[0]["rail_step"]) == 0
 
     def test_reshoot_honours_factors(self, cfg, tmp_path) -> None:
-        # Droop trips at step 4 f/4; reshoot covers steps 1..4.
-        # f/4 (factor 1) reshot at every step in range = 4 frames.
-        # f/8 (factor 2) reshot only at steps 2 and 4 = 2 frames.
+        # Droop trips at step 4 f/4 (2nd moderate ≤ -0.7); earliest
+        # under-exposed = step 3 (1st moderate). Reshoot covers
+        # steps 3..4.
+        # f/4 (factor 1) reshot at every step in range = 2 frames (3, 4).
+        # f/8 (factor 2): step 3 % 2 = 1 → skip; step 4 % 2 = 0 →
+        # captured. = 1 reshoot frame.
         camera = FakeCamera(apertures=["f/4", "f/8"])
         rail = FakeRail()
-        # Medians: 1 cal + sweep + reshoot.
-        # Sweep: f/4 every step (5 steps) + f/8 every 2nd step (3 steps).
-        # f/4 medians: step 0=100, 1=100, 2=100, 3=25, 4=25 (last 2 are -2 EV → trip on step 4)
-        # f/8 medians: step 0=100, 2=100, 4=100
-        # The aperture loop order is f/4 first, f/8 second per aperture_sequence.
-        # Step 4: f/4 captured (median 25), droop pushes ev=-2 EV. Window has
-        # f/4 step 0=0, 1=0, 2=0, 3=-2, 4=-2 → 2 of 5 ≤ -2 → trip.
-        # earliest underexposed step = 3 (first -2 EV). Reshoot covers 3..4.
-        # f/4 reshoot steps 3, 4 (factor 1 → both qualify).
-        # f/8 reshoot: step 3 % 2 = 1 (skip), step 4 % 2 = 0 (capture).
-        # So 2 f/4 + 1 f/8 reshoot rows.
         medians = [
-            100.0,                     # calibration baseline (f/4 step 0)
-            100.0,                     # cal f/8 step 0
-            100.0, 100.0,              # step 0: f/4, f/8
-            100.0,                     # step 1 f/4
-            100.0, 100.0,              # step 2: f/4, f/8
-            25.0,                      # step 3 f/4 (under-exposed)
-            25.0, 100.0,               # step 4: f/4 (TRIP), f/8
-            100.0, 100.0, 100.0,       # reshoot fillers
+            # Calibration:
+            100.0,                     # cal f/4 (sets baseline)
+            100.0,                     # cal f/8
+            # Sweep step 0: f/4 + f/8 both fire.
+            100.0, 100.0,
+            # Sweep step 1: f/4 only (f/8 step%2 != 0 → skipped).
+            100.0,
+            # Sweep step 2: f/4 + f/8.
+            100.0, 100.0,
+            # Sweep step 3: f/4 = 70 (1st moderate); f/8 skipped.
+            70.0,
+            # Sweep step 4: f/4 = 70 (2nd moderate → trip). f/8 not
+            # reached because the inner loop returns when reshoot
+            # covers the current step.
+            70.0,
+            # Outer reshoot at steps 3..4:
+            100.0,                     # reshoot step 3 f/4 (f/8 skipped)
+            100.0, 100.0,              # reshoot step 4: f/4, f/8
         ]
         runner = make_runner(
             camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
@@ -812,12 +814,13 @@ class TestDroopPause:
     ) -> None:
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
-        # Baseline 100 (calibration). Sweep: two -2 EV shots in a row
-        # at f/4 trip criterion B.
-        # ev_delta(median, 100) ≤ -2 EV requires median ≤ ~31.
+        # Baseline 100 (calibration). Sweep step 0 dim enough to trip
+        # the SEVERE criterion (1 shot ≤ -2 EV) — median 25 → ≈ -4.4 EV.
+        # The reshoot wraps up immediately (current=earliest=0) and
+        # the droop window is reset; sweep continues clean at step 1.
         medians = [100.0,                 # calibration baseline
-                   25.0, 25.0,            # two sweep shots that trip B
-                   100.0]                 # remaining shot after resume
+                   25.0,                  # step 0 sweep — severe → trip
+                   100.0]                 # step 1 sweep — clean
         confirm_calls: list[str] = []
 
         runner = make_runner(
@@ -852,6 +855,8 @@ class TestDroopPause:
 
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
+        # One severe shot (≤ -2 EV) trips the severe criterion in
+        # one push; user says q → SessionAborted.
         medians = [100.0, 25.0, 25.0]
 
         runner = make_runner(
@@ -879,40 +884,32 @@ class TestDroopPause:
     def test_droop_during_reshoot_triggers_nested_reshoot(
         self, cfg, tmp_path
     ) -> None:
-        # First droop trip at step 3 → reshoot covers steps 1..3.
-        # The reshoot at step 2 is *also* under-exposed (the user
-        # missed a flash), so droop fires a second time → nested
-        # reshoot covers steps 1..2. After that all replicas are
-        # healthy; outer reshoot continues past step 2 (skipped via
-        # skip_remainder) and covers step 3 with healthy data.
-        # Then sweep continues normally with step 4.
+        # Sweep produces moderate under-exposures (median 70 →
+        # ≈ -1.1 EV) at steps 1 and 3. Trip on step 3 (2nd ≤ -0.7
+        # → moderate criterion) → reshoot covers steps 1..3.
+        # The reshoot at steps 2 and 3 is *also* moderately
+        # under-exposed (the user missed a flash), so droop fires
+        # again on the 2nd reshoot trip-shot → nested reshoot for
+        # steps 2..3. Nested captures land clean. Outer reshoot's
+        # skip_remainder kicks in for the rest of step 3, sweep
+        # continues normally at step 4.
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         medians = [
             100.0,    # calibration baseline
             100.0,    # step 0 sweep ok
-            30.0,     # step 1 sweep — first under-exposed (~-3.8 EV)
+            70.0,     # step 1 sweep — 1st moderate (~-1.1 EV)
             100.0,    # step 2 sweep ok
-            25.0,     # step 3 sweep — 2nd ≤ -2 EV → trip
-            # First reshoot at steps 1..3:
-            100.0,    # reshoot step 1 ok
-            25.0,     # reshoot step 2 — STILL under-exposed → 2nd ≤ -2 EV
-            # Wait — at this point droop fires again. The reshoot
-            # window has step 2 (-1.7) and step 1 (0). One sample ≤
-            # -2 EV but criterion B needs 2; criterion A needs 3 ≤
-            # -0.7. step 2 alone (-3.8) only fires criterion A if
-            # there are 2 more, so this won't trigger yet. Add one
-            # more bad capture.
-            # Actually trip condition: criterion B (2 of 10 ≤ -2 EV).
-            # Window so far: [step1=0, step2=-3.8 EV] (1 ≤ -2). Need
-            # another ≤ -2. Force step 3 reshoot to be bad:
-            25.0,     # reshoot step 3 — also -3.8 EV → criterion B fires
-            # Now nested reshoot covers steps 1..3 again.
-            # All clean this time:
-            100.0, 100.0, 100.0,
-            # outer reshoot continues at step 3+1 = 4 (sweep), then 5..
-            # but sweep_steps = 5 so:
-            100.0,    # sweep step 4 (outer for-loop continues)
+            70.0,     # step 3 sweep — 2nd moderate → trip
+            # First (outer) reshoot at steps 1..3:
+            100.0,    # reshoot step 1 ok (resets droop window after trip)
+            70.0,     # reshoot step 2 — still moderate (1st in fresh window)
+            70.0,     # reshoot step 3 — 2nd moderate → NESTED trip
+            # Nested reshoot at steps 2..3:
+            100.0,    # nested reshoot step 2 ok
+            100.0,    # nested reshoot step 3 ok
+            # Outer for-loop continues at step 4:
+            100.0,    # sweep step 4
         ]
 
         runner = make_runner(
@@ -943,20 +940,21 @@ class TestDroopPause:
     def test_resume_reshoots_from_first_underexposed_step(
         self, cfg, tmp_path
     ) -> None:
-        # 5-step single-aperture sweep. Step 1 is the first
-        # under-exposed shot (median 30 → ≈ -3.8 EV). Step 3 is the
-        # second sample ≤ -2 EV which trips criterion B. On resume
-        # the runner should rewind to step 1 and reshoot steps
-        # 1..3 inclusive (the trigger step). Step 0 is fine, so
-        # reshoot doesn't touch it.
+        # 5-step single-aperture sweep. Steps 1 and 3 are moderately
+        # under-exposed (median 70 → ≈ -1.1 EV — below criterion B's
+        # -0.7 threshold but above criterion A's -2). Step 3's push
+        # is the 2nd ≤ -0.7 in the rolling window → moderate trip.
+        # On resume the runner should rewind to step 1 (first
+        # under-exposed) and reshoot steps 1..3 inclusive. Step 0 is
+        # fine, so reshoot doesn't touch it.
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         medians = [
             100.0,    # calibration baseline
             100.0,    # step 0 sweep  (ev = 0)
-            30.0,     # step 1 sweep  (ev ≈ -3.8) — first under-exposed
+            70.0,     # step 1 sweep  (ev ≈ -1.1) — first under-exposed
             100.0,    # step 2 sweep
-            25.0,     # step 3 sweep  (ev ≈ -4.4) — 2nd ≤ -2 EV → trip
+            70.0,     # step 3 sweep  (ev ≈ -1.1) — 2nd ≤ -0.7 → trip
             100.0,    # reshoot step 1
             100.0,    # reshoot step 2
             100.0,    # reshoot step 3

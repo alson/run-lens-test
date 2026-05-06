@@ -138,8 +138,14 @@ a plateau-driven ISO bump to settle."""
 # ---- Droop detector ---------------------------------------------------------
 
 ROLLING_WINDOW = 10
-DROOP_CRIT_A = (3, -0.7)   # 3 of last 10 ≤ -0.7 EV
-DROOP_CRIT_B = (2, -2.0)   # 2 of last 10 ≤ -2.0 EV
+# Droop trip criteria — evaluated in order; whichever fires first
+# wins. The detector pools pushes session-wide (across every
+# aperture in the sweep), so consecutive under-exposed shots at
+# *different* apertures still trip the moderate criterion. Severe
+# fires on a single shot — typical "flash refused to fire / hit
+# its mechanical-min" failure mode.
+DROOP_CRIT_A = (1, -2.0)   # 1 severe shot ≤ -2 EV — fire immediately
+DROOP_CRIT_B = (2, -0.7)   # 2 of last 10 ≤ -0.7 EV — gradual drift
 
 # ---- Range-too-narrow auto-extension ---------------------------------------
 
