@@ -50,21 +50,22 @@ VR_OFF_CHOICES: tuple[str, ...] = ("Off", "OFF", "off", "Disabled", "0")
 def _format_ec_label(ev: float) -> str:
     """Z7 widget label for an EC value in EV (⅓-stop grid).
 
-    Examples: ``0.0 → "0"``, ``+1.0 → "+1"``, ``+1.333 → "+1 1/3"``,
-    ``-1.667 → "-1 2/3"``.
+    The Z7 EC widget reports its choices as **unsigned numeric**
+    strings on positives and decimal thirds: ``"0"``, ``"1"``,
+    ``"3"``, ``"1.333"``, ``"-1"``, ``"-1.333"``. NOT the
+    human-readable ``"+1"`` / ``"+1 1/3"`` format.
+
+    Examples: ``0.0 → "0"``, ``+1.0 → "1"``, ``+1.333 → "1.333"``,
+    ``-1.667 → "-1.667"``.
     """
     if abs(ev) < 1e-9:
         return "0"
-    sign = "+" if ev > 0 else "-"
+    sign = "-" if ev < 0 else ""
     a = abs(ev)
-    whole = int(a)
-    frac_third = round((a - whole) * 3)
-    if frac_third == 3:
-        whole += 1
-        frac_third = 0
-    if frac_third == 0:
-        return f"{sign}{whole}"
-    return f"{sign}{whole} {frac_third}/3"
+    third = round(a * 3) / 3
+    if abs(third - round(third)) < 1e-3:
+        return f"{sign}{int(round(third))}"
+    return f"{sign}{third:.3f}"
 
 
 def _is_question_mark(value: object) -> bool:
@@ -258,10 +259,14 @@ class NikonZ7:
     def set_ec(self, ev: float) -> None:
         """Set camera exposure compensation (in EV).
 
-        Some Z7 firmware exposes EC as a radio widget with string
-        choices like ``"+1"`` / ``"+1 1/3"`` / ``"-2"``; others as a
-        range. Try the radio path first (looking up the closest
-        ⅓-stop label) and fall back to the range setter."""
+        The Z7 exposes EC as a radio widget with unsigned numeric
+        choices (``"0"``, ``"1"``, ``"1.333"``, ``"-1"``); some
+        firmware variants may use a range widget. Try range first,
+        otherwise look up the matching ⅓-stop label and raise
+        :class:`CameraStateError` if neither the requested label
+        nor the rounded fallback is in the widget's choice list —
+        a silent no-op here previously masked a calibrator bug
+        where every positive EC bump was being dropped."""
         cfg = self.camera.get_config()
         widget = find(cfg, "exposurecompensation")
         if widget is None:
@@ -276,18 +281,19 @@ class NikonZ7:
             self.camera.set_config(cfg)
             self.drain_events()
             return
-        # Radio: look up the closest ⅓-stop label. Z7 conventions:
-        # whole stops as "+1" / "-2"; thirds as "+1 1/3", "-1 2/3";
-        # zero as "0".
         choices = widget_choices(widget)
         label = _format_ec_label(ev)
         if label not in choices:
-            # Try whole-stop fallback (round to nearest integer).
             label = _format_ec_label(round(ev))
-        if label in choices:
-            widget.set_value(label)
-            self.camera.set_config(cfg)
-            self.drain_events()
+        if label not in choices:
+            raise CameraStateError(
+                f"EC label {_format_ec_label(ev)!r} (or rounded "
+                f"{_format_ec_label(round(ev))!r}) not in "
+                f"'exposurecompensation' choices {choices[:8]!r}…"
+            )
+        widget.set_value(label)
+        self.camera.set_config(cfg)
+        self.drain_events()
 
     def set_aperture_iso_fec(
         self, *, aperture: str, iso: str | int, fec: float

@@ -365,6 +365,90 @@ class TestFECSanityCheck:
         ]
 
 
+# ---- set_ec ----------------------------------------------------------------
+
+
+# Z7 EC widget choices, verified against gphoto2 on the rig.
+# Note: positives have NO leading "+" — the previous label format
+# ("+1", "+1 1/3") silently failed to match.
+_Z7_EC_CHOICES = (
+    [f"-{n}" for n in (5, 4.666, 4.333, 4, 3.666, 3.333, 3,
+                       2.666, 2.333, 2, 1.666, 1.333, 1)]
+    + ["-0.666", "-0.333", "0", "0.333", "0.666"]
+    + [str(n) for n in (1, 1.333, 1.666, 2, 2.333, 2.666, 3,
+                        3.333, 3.666, 4, 4.333, 4.666, 5)]
+)
+
+
+class TestSetEC:
+    """Regression coverage for the silent-no-op bug where EC labels
+    formatted with a leading ``"+"`` (or as ``"X 1/3"``) didn't match
+    the Z7 widget's actual choice strings (unsigned decimal thirds)."""
+
+    def _wire_radio_widget(self, camera, value="0"):
+        ec_widget = make_widget(
+            "exposurecompensation", value, choices=list(_Z7_EC_CHOICES),
+        )
+        ec_widget.get_type.return_value = "RADIO_SENTINEL"
+        root = make_widget("main", children=[ec_widget])
+        camera.get_config.return_value = root
+        return ec_widget
+
+    def test_positive_whole_stop(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(3.0)
+        ec.set_value.assert_called_with("3")
+
+    def test_positive_third_stop(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(1.333)
+        ec.set_value.assert_called_with("1.333")
+
+    def test_zero(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(0.0)
+        ec.set_value.assert_called_with("0")
+
+    def test_negative_whole_stop(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(-2.0)
+        ec.set_value.assert_called_with("-2")
+
+    def test_negative_third_stop(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec = self._wire_radio_widget(camera)
+        nikon.set_ec(-1.333)
+        ec.set_value.assert_called_with("-1.333")
+
+    def test_unmatchable_label_raises(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec_widget = make_widget(
+            "exposurecompensation", "0", choices=["0"],  # only "0"
+        )
+        ec_widget.get_type.return_value = "RADIO_SENTINEL"
+        camera.get_config.return_value = make_widget(
+            "main", children=[ec_widget]
+        )
+        with pytest.raises(CameraStateError, match="exposurecompensation"):
+            nikon.set_ec(3.0)
+        # Critically, no silent set_value call.
+        ec_widget.set_value.assert_not_called()
+
+    def test_range_widget_path(self, nikon, camera, gp) -> None:
+        gp.GP_WIDGET_RANGE = "RANGE_SENTINEL"
+        ec_widget = make_widget("exposurecompensation", 0.0)
+        ec_widget.get_type.return_value = "RANGE_SENTINEL"
+        camera.get_config.return_value = make_widget(
+            "main", children=[ec_widget]
+        )
+        nikon.set_ec(2.0)
+        ec_widget.set_value.assert_called_with(2.0)
+
+
 # ---- list_apertures --------------------------------------------------------
 
 
