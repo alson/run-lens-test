@@ -879,14 +879,6 @@ class SessionRunner:
                 # Off this aperture's subsample grid — silent skip.
                 continue
             cal = calibration.per_aperture[aperture]
-            self._progress(
-                step_index=step_index,
-                step_count=step_count,
-                position_mm=position_mm,
-                aperture=aperture,
-                aperture_index=ap_index,
-                aperture_count=len(apertures),
-            )
             ev, event = self._capture_one(
                 lens_dir=lens_dir,
                 slug=slug,
@@ -896,6 +888,7 @@ class SessionRunner:
                 cal=cal,
                 phase=Phase.SWEEP,
                 droop=droop,
+                progress_ctx=(step_count, ap_index, len(apertures)),
             )
             if event is not None:
                 current_step_reshot = self._handle_droop(
@@ -1301,6 +1294,7 @@ class SessionRunner:
         cal: ApertureCalibration,
         phase: Phase,
         droop: DroopDetector | None = None,
+        progress_ctx: tuple[int, int, int] | None = None,
     ) -> tuple[float, DroopEvent | None]:
         """Capture all configured replicas at one (step, aperture).
 
@@ -1325,6 +1319,7 @@ class SessionRunner:
         """
         n = max(1, int(getattr(self.config, "SHOTS_PER_STEP_APERTURE", 1)))
         self._set_capture_settings(aperture, cal)
+        step_count, ap_index, ap_count = progress_ctx or (0, 0, 0)
         # The droop detector wants EV relative to the *per-aperture
         # calibration target* (cal.final_median), not relative to the
         # session-wide reference baseline. Calibration may have
@@ -1338,6 +1333,17 @@ class SessionRunner:
         droop_evs: list[float] = []
         droop_event: DroopEvent | None = None
         for replica in range(n):
+            if progress_ctx is not None:
+                self._progress(
+                    step_index=step_index,
+                    step_count=step_count,
+                    position_mm=position_mm,
+                    aperture=aperture,
+                    aperture_index=ap_index,
+                    aperture_count=ap_count,
+                    replica_index=replica,
+                    replica_count=n,
+                )
             self._wait_for_recycle()
             dest = self._sweep_destination(
                 lens_dir, aperture, step_index, replica=replica
@@ -2080,28 +2086,42 @@ class SessionRunner:
         aperture: str,
         aperture_index: int,
         aperture_count: int,
+        replica_index: int | None = None,
+        replica_count: int | None = None,
     ) -> None:
         """Single-line progress display, updated in place via \\r.
 
-        Format: ``[████░░░░] step 3/10  pos +1.20mm  ap f/8 (3/5)``.
-        Cleared by :meth:`_progress_done` (which writes a newline) at
-        the end of the sweep so subsequent print() calls don't
-        overwrite it. No-op if stdout isn't a TTY (lets pipe-to-file
-        users still get the per-shot CSV without garbled output)."""
+        Format without replicas:
+            ``[████░░░░] step 3/10  pos +1.20mm  ap f/8 (3/5)``
+        With replicas:
+            ``[████░░░░] step 3/10  pos +1.20mm  ap f/8 (3/5)  rep 2/3``
+
+        Replica progress refines the bar fraction so it advances
+        smoothly between replicas instead of jumping per (step,
+        aperture). Cleared by :meth:`_progress_done`. No-op if
+        stdout isn't a TTY."""
         if not sys.stdout.isatty():
             return
         bar_width = 20
         # +1 because step_index is 0-based and we want progress to
         # increment AS the step starts, not just after.
-        fraction = (step_index + (aperture_index + 1) / aperture_count) / step_count
+        if replica_index is not None and replica_count:
+            ap_progress = (
+                aperture_index + (replica_index + 1) / replica_count
+            ) / aperture_count
+        else:
+            ap_progress = (aperture_index + 1) / aperture_count
+        fraction = (step_index + ap_progress) / step_count
         filled = int(round(fraction * bar_width))
         bar = "█" * filled + "░" * (bar_width - filled)
-        sys.stdout.write(
+        line = (
             f"\r[{bar}] step {step_index + 1}/{step_count}  "
             f"pos {position_mm:+7.2f} mm  "
             f"ap {aperture} ({aperture_index + 1}/{aperture_count})"
-            "\x1b[K"
         )
+        if replica_index is not None and replica_count:
+            line += f"  rep {replica_index + 1}/{replica_count}"
+        sys.stdout.write(line + "\x1b[K")
         sys.stdout.flush()
 
     def _progress_done(self) -> None:
