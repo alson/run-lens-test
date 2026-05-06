@@ -10,11 +10,14 @@ so unit tests don't need a real camera.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
 from pathlib import Path
 from typing import Callable, Sequence
+
+log = logging.getLogger(__name__)
 
 import gphoto2 as gphoto2_module
 
@@ -115,11 +118,23 @@ class NikonZ7:
         self._camera = camera
 
     def close(self) -> None:
-        if self._camera is not None:
-            try:
-                self._camera.exit()
-            finally:
-                self._camera = None
+        """Release the camera handle.
+
+        Tolerates the camera already being gone from USB — that's the
+        normal case during lens-change recovery, where the user is
+        instructed to power the camera off before pressing ENTER.
+        ``self._camera.exit()`` then raises GPhoto2Error -52 ("Could
+        not find the requested device on the USB port"); we log it
+        and clear the handle so subsequent ``open()`` can run a clean
+        reconnect."""
+        if self._camera is None:
+            return
+        try:
+            self._camera.exit()
+        except self._gp.GPhoto2Error as exc:                # noqa: BLE001
+            log.info("camera.exit() failed (likely powered off): %s", exc)
+        finally:
+            self._camera = None
 
     @property
     def camera(self):
