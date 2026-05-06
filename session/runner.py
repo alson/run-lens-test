@@ -299,6 +299,20 @@ class SessionRunner:
     measurement) from the configured per-aperture flash recycle. The
     user is shooting thousands of frames; sleeping ``RECYCLE_S`` on
     top of work that already exceeds it adds hours."""
+    _eta_last_shot_at: float | None = None
+    """monotonic() of the start of the previous sweep shot, used to
+    measure inter-shot intervals for the ETA EWMA. ``None`` after a
+    user prompt to invalidate the bridging interval (so a 5 min
+    battery swap doesn't poison the average)."""
+    _eta_interval_ewma: float | None = None
+    """Exponentially-weighted moving average of inter-shot intervals
+    in seconds. Updated per sweep replica; ``None`` until enough
+    intervals have been collected."""
+    _eta_sweep_apertures: tuple[str, ...] = ()
+    """Cached aperture sequence for the current sweep — needed to
+    count remaining shots across the subsample grid."""
+    _eta_sweep_step_count: int = 0
+    """Cached step count for the current sweep."""
     _last_capture_aperture: str | None = None
     """Aperture of the previous capture. The flash recycle is keyed on
     the *prior* shot's aperture (small apertures = more flash power
@@ -735,6 +749,12 @@ class SessionRunner:
             self._announce(
                 f"Sweeping {slug}: {steps} steps × {len(apertures)} apertures..."
             )
+            # Reset ETA tracking for the new sweep — earlier
+            # calibration intervals are not representative.
+            self._eta_sweep_apertures = tuple(apertures)
+            self._eta_sweep_step_count = steps
+            self._eta_interval_ewma = None
+            self._eta_last_shot_at = None
             self._run_sweep(
                 lens_dir=lens_dir,
                 slug=slug,
@@ -1334,6 +1354,7 @@ class SessionRunner:
         droop_event: DroopEvent | None = None
         for replica in range(n):
             if progress_ctx is not None:
+                self._eta_record_shot()
                 self._progress(
                     step_index=step_index,
                     step_count=step_count,
@@ -1428,6 +1449,8 @@ class SessionRunner:
         )
         if not ok:
             raise SessionAborted("user aborted at droop pause")
+        # Don't let the multi-minute battery swap poison the ETA EWMA.
+        self._eta_invalidate()
         # Find the earliest step (across all apertures) whose EV ≤
         # the firing trip threshold. That's the first under-exposed
         # shot we trust the user wants to overwrite with a fresh
@@ -2077,6 +2100,70 @@ class SessionRunner:
                 flush=True,
             )
 
+    # ---- ETA bookkeeping ----------------------------------------------------
+
+    _ETA_OUTLIER_S = 30.0
+    """Intervals longer than this are dropped from the EWMA. Real
+    inter-shot intervals on this rig top out around 7 s (small
+    aperture + recycle + replica). 30 s is comfortably above any
+    legitimate gap and well below any user-prompt pause."""
+
+    def _eta_record_shot(self) -> None:
+        """Update the inter-shot EWMA. Call right before each capture."""
+        now = self.monotonic()
+        if self._eta_last_shot_at is not None:
+            interval = now - self._eta_last_shot_at
+            if 0 < interval < self._ETA_OUTLIER_S:
+                if self._eta_interval_ewma is None:
+                    self._eta_interval_ewma = interval
+                else:
+                    alpha = 0.2
+                    self._eta_interval_ewma = (
+                        alpha * interval
+                        + (1 - alpha) * self._eta_interval_ewma
+                    )
+        self._eta_last_shot_at = now
+
+    def _eta_invalidate(self) -> None:
+        """Discard the next interval — call after every user prompt
+        so a battery-swap pause doesn't poison the average."""
+        self._eta_last_shot_at = None
+
+    def _eta_remaining_shots(
+        self, *, step_index: int, aperture_index: int, replica_index: int,
+        replica_count: int,
+    ) -> int:
+        """Count sweep shots still to take, given the current position
+        in the (step, aperture, replica) grid. Honours subsample
+        factors so a wide-DOF aperture with factor 4 only contributes
+        every fourth step."""
+        apertures = self._eta_sweep_apertures
+        step_count = self._eta_sweep_step_count
+        if not apertures or step_count <= 0:
+            return 0
+        factors = self._subsample_factors
+        remaining = 0
+        # Remaining replicas of the current (step, aperture).
+        remaining += max(0, replica_count - replica_index - 1)
+        # Remaining apertures of the current step.
+        for j, ap in enumerate(apertures):
+            if j <= aperture_index:
+                continue
+            if step_index % factors.get(ap, 1) == 0:
+                remaining += replica_count
+        # All future steps in full.
+        for s in range(step_index + 1, step_count):
+            for ap in apertures:
+                if s % factors.get(ap, 1) == 0:
+                    remaining += replica_count
+        return remaining
+
+    def _format_eta(self, seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        if seconds < 3600:
+            return f"{seconds // 60}:{seconds % 60:02d}"
+        return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
     def _progress(
         self,
         *,
@@ -2121,6 +2208,19 @@ class SessionRunner:
         )
         if replica_index is not None and replica_count:
             line += f"  rep {replica_index + 1}/{replica_count}"
+        if (
+            self._eta_interval_ewma is not None
+            and replica_index is not None
+            and replica_count
+            and self._eta_sweep_step_count
+        ):
+            remaining = self._eta_remaining_shots(
+                step_index=step_index,
+                aperture_index=aperture_index,
+                replica_index=replica_index,
+                replica_count=replica_count,
+            )
+            line += f"  eta {self._format_eta(remaining * self._eta_interval_ewma)}"
         sys.stdout.write(line + "\x1b[K")
         sys.stdout.flush()
 

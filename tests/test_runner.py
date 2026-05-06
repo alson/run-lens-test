@@ -529,18 +529,17 @@ class TestRecycleWait:
 
     def test_first_shot_does_not_wait(self, cfg, tmp_path) -> None:
         # First sweep shot has no prior capture timestamp -> _wait_for_recycle
-        # returns immediately. Each shot consumes 1 monotonic() call (to
-        # stamp _last_capture_started_at) plus 1 for _wait_for_recycle from
-        # the second shot onward. With recycle=3.0s for f/4 in cfg and a
-        # 100-second gap, no sleep should happen at all.
+        # returns immediately. Each shot consumes one monotonic() call for
+        # the ETA EWMA, one for the recycle wait (from shot 2 on), and one
+        # to stamp _last_capture_started_at. With recycle=3.0s for f/4 in
+        # cfg and a 100-second gap, no sleep should happen at all.
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
-            # _wait_for_recycle reads monotonic on the 2nd sweep shot;
-            # _last_capture_started_at was stamped at t=0 on shot 1.
-            # With t=100 on the wait, elapsed=100 >> recycle=3.
             monotonic_seq=[
+                0.0,    # shot 1 ETA record
                 0.0,    # shot 1 stamp
-                100.0,  # shot 2 wait read
+                100.0,  # shot 2 ETA record
+                100.0,  # shot 2 wait read (elapsed=100 >> 3 → no sleep)
                 100.0,  # shot 2 stamp
             ],
         )
@@ -553,9 +552,11 @@ class TestRecycleWait:
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
             monotonic_seq=[
-                0.0,   # shot 1 stamp
-                1.0,   # shot 2 wait read -> remaining = 3 - 1 = 2
-                1.0,   # shot 2 stamp
+                0.0,    # shot 1 ETA record
+                0.0,    # shot 1 stamp
+                1.0,    # shot 2 ETA record
+                1.0,    # shot 2 wait read → remaining = 3 - 1 = 2
+                1.0,    # shot 2 stamp
             ],
         )
         assert sleeps == [pytest.approx(2.0)]
@@ -565,15 +566,123 @@ class TestRecycleWait:
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
             monotonic_seq=[
-                0.0,
-                5.0,
-                5.0,
+                0.0,    # shot 1 ETA record
+                0.0,    # shot 1 stamp
+                5.0,    # shot 2 ETA record
+                5.0,    # shot 2 wait read
+                5.0,    # shot 2 stamp
             ],
         )
         assert sleeps == []
 
 
 # ---- Droop pause + resume --------------------------------------------------
+
+
+class TestETA:
+    """Unit tests for the ETA EWMA + remaining-shots calculator."""
+
+    def _runner(self, cfg, tmp_path, *, factors, apertures, step_count):
+        camera = FakeCamera(apertures=apertures)
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 200,
+            inputs={"lens": "L", "steps": step_count, "end_mm": 2.0},
+        )
+        runner._subsample_factors = dict(factors)
+        runner._eta_sweep_apertures = tuple(apertures)
+        runner._eta_sweep_step_count = step_count
+        return runner
+
+    def test_remaining_with_no_subsampling(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1, "f/8": 1},
+            apertures=["f/4", "f/8"],
+            step_count=10,
+        )
+        # At (step=0, ap=f/4 [idx 0], replica=0) of 3 replicas:
+        # Remaining replicas of current (0, f/4): 2
+        # Remaining apertures of step 0 (f/8 only): 1 × 3 = 3
+        # All future steps (steps 1..9 = 9 steps × 2 apertures × 3 replicas) = 54
+        # Total: 2 + 3 + 54 = 59
+        assert runner._eta_remaining_shots(
+            step_index=0, aperture_index=0, replica_index=0, replica_count=3,
+        ) == 59
+
+    def test_remaining_honours_subsample_factors(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1, "f/16": 4},
+            apertures=["f/4", "f/16"],
+            step_count=8,
+        )
+        # At (step=0, ap=f/4 [idx 0], replica=0) of 1 replica:
+        # remaining replicas of (0, f/4): 0
+        # remaining ap of step 0: f/16 fires at step 0 (0 % 4 == 0): 1
+        # future steps 1..7: f/4 fires every step (7), f/16 fires
+        #   only at step 4 (1) → 8
+        # Total: 0 + 1 + 8 = 9
+        assert runner._eta_remaining_shots(
+            step_index=0, aperture_index=0, replica_index=0, replica_count=1,
+        ) == 9
+
+    def test_remaining_at_last_position(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1},
+            apertures=["f/4"],
+            step_count=5,
+        )
+        # Last replica of last aperture of last step → nothing remains.
+        assert runner._eta_remaining_shots(
+            step_index=4, aperture_index=0, replica_index=2, replica_count=3,
+        ) == 0
+
+    def test_record_skips_outlier_intervals(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1}, apertures=["f/4"], step_count=2,
+        )
+        clock = iter([0.0, 5.0, 200.0, 205.0])
+        runner.monotonic = lambda: next(clock)
+
+        runner._eta_record_shot()         # t=0, no prior
+        runner._eta_record_shot()         # t=5, interval 5 → EWMA=5
+        ewma_after_first = runner._eta_interval_ewma
+        assert ewma_after_first == pytest.approx(5.0)
+
+        runner._eta_record_shot()         # t=200, interval 195 → outlier, skip
+        assert runner._eta_interval_ewma == pytest.approx(5.0)  # unchanged
+
+        runner._eta_record_shot()         # t=205, interval 5 → EWMA blends
+        assert 4.5 < runner._eta_interval_ewma < 5.5
+
+    def test_invalidate_clears_last_shot_at(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1}, apertures=["f/4"], step_count=2,
+        )
+        clock = iter([0.0, 5.0, 1000.0])
+        runner.monotonic = lambda: next(clock)
+        runner._eta_record_shot()
+        runner._eta_record_shot()
+        runner._eta_invalidate()
+        # Next record after invalidate should NOT update EWMA from the
+        # huge bridging interval.
+        prior = runner._eta_interval_ewma
+        runner._eta_record_shot()
+        assert runner._eta_interval_ewma == pytest.approx(prior)
+
+    def test_format_eta_minutes(self, cfg, tmp_path) -> None:
+        runner = self._runner(
+            cfg, tmp_path,
+            factors={"f/4": 1}, apertures=["f/4"], step_count=2,
+        )
+        assert runner._format_eta(45) == "0:45"
+        assert runner._format_eta(125) == "2:05"
+        assert runner._format_eta(3725) == "1:02:05"
 
 
 class TestCalibrationFailure:
