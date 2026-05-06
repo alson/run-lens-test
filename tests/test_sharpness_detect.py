@@ -311,11 +311,15 @@ class TestAnalyzeCrop:
 
 class TestAnalyzeCropsForAperture:
     def test_runs_cross_compare_then_per_crop(self) -> None:
+        # Cross-compare flags any valid crop whose peak < factor × best.
+        # With the default factor of 0.25, "bottom-right" needs to peak
+        # well below 25 % of BELL's max to be flagged — 0.20 lands at
+        # peak ratio ≈ 0.20, below 0.25.
         crop_sizes = {
             "center": BELL,
             "left-edge": BELL,
             "top-left": [70] * len(BELL),  # off-target by flat
-            "bottom-right": [int(b * 0.5) for b in BELL],  # off-target by cross
+            "bottom-right": [int(b * 0.20) for b in BELL],  # off-target by cross
         }
         results = analyze_crops_for_aperture(crop_sizes)
         by_name = {r.crop_name: r for r in results}

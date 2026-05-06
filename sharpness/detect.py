@@ -60,7 +60,21 @@ __all__ = [
 # zone" of 2 rail steps is one rail position of buffer.
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_FLAT_RATIO = 1.15
-DEFAULT_OFF_TARGET_FACTOR = 0.65
+# Cross-compare cutoff: a crop's peak file size below
+# ``factor × best_peak`` is flagged ``OFF_TARGET`` (i.e. "not even on
+# the wafer"). 0.65 was inherited from the offline rail-coverage
+# analyser, where the wafer often didn't cover the corners; in the
+# live shooting context the wafer fills the frame at >1:1 mag, so
+# corners are real measurements and only legitimate field-curvature
+# / corner-softness signal. 0.65 false-positived essentially every
+# corner on real rig data (per the post-session multi-crop recheck
+# of 2026-05-06_175727 and 2026-05-06_200150 — corners with valid
+# bell shapes peaked at 30-60 % of centre and were all flagged).
+# 0.25 sits below the lowest legitimate corner peak ratio observed
+# on this rig while still catching crops with peaks materially
+# below the dynamic-range floor (windows landing on low-contrast
+# background).
+DEFAULT_OFF_TARGET_FACTOR = 0.25
 # Minimum per-crop dynamic range ``(max - min) / max`` for the crop to
 # count as valid for its aperture's verdict. Below this we assume the
 # crop window fell off the wafer onto low-contrast background. Default
