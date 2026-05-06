@@ -2371,6 +2371,7 @@ def main() -> None:
             max_workers=config.SHARPNESS_MAX_WORKERS,
             crops_under_source=True,
             cropped_dirname=config.SHARPNESS_CROPPED_DIRNAME,
+            executor_kind="process",
         )
 
     def _camera_jog(rail) -> JogResult:

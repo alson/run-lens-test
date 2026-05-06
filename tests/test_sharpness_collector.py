@@ -31,6 +31,15 @@ def _fake_crop(sizes: dict[str, int]):
     return fn
 
 
+def picklable_fake_crop(source: Path, out_dir: Path) -> CropResult:
+    """Top-level (picklable) fake crop for ProcessPool tests.
+
+    Returns a fixed minimal sizes dict so the process-pool wiring
+    can be exercised without Pillow / disk I/O. Lambdas / closures
+    don't pickle, so the process-pool path needs a real function."""
+    return CropResult(source=source, sizes={"center": 1})
+
+
 # --- ShotSample / CollectedDataset ----------------------------------------
 
 
@@ -263,6 +272,49 @@ class TestLiveCollector:
             f4 / "cropped",
             f8 / "cropped",
         ])
+
+
+class TestProcessPoolExecutor:
+    """Smoke coverage for the ``executor_kind="process"`` path. The
+    fake crop function must be top-level (picklable); see
+    ``picklable_fake_crop`` above."""
+
+    def test_records_samples(self, tmp_path: Path) -> None:
+        # 3 shots, real ProcessPoolExecutor, picklable crop fn.
+        # The pool pre-warms at construction, so this exercises the
+        # warm-up + submit + done-callback merge path.
+        with LiveCollector(
+            tmp_path,
+            crop_fn=picklable_fake_crop,
+            max_workers=2,
+            executor_kind="process",
+        ) as c:
+            for i in range(3):
+                # Real file paths — picklable; the fake crop function
+                # ignores them.
+                src = tmp_path / f"shot_{i}.jpg"
+                src.write_bytes(b"x")
+                c.record_shot(i, 4.5, src)
+        ds = c.dataset
+        assert len(ds.samples) == 3
+        assert all(s.sizes == {"center": 1} for s in ds.samples)
+        assert sorted(s.rail_step for s in ds.samples) == [0, 1, 2]
+
+    def test_surfaces_worker_exceptions(self, tmp_path: Path) -> None:
+        # picklable_fake_crop never errors; we use a sentinel input
+        # that the worker will trip on. Easiest path: pass a Path that
+        # the worker reads (it doesn't, but if we want a real failure,
+        # use crop_image_file with a missing file instead).
+        from sharpness.cropper import crop_image_file
+        c = LiveCollector(
+            tmp_path,
+            crop_fn=crop_image_file,
+            max_workers=1,
+            executor_kind="process",
+        )
+        c.record_shot(0, 4.5, tmp_path / "does_not_exist.jpg")
+        with pytest.raises(RuntimeError, match="cropping task"):
+            c.shutdown(wait=True)
 
 
 class TestWaitForPending:

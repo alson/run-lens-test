@@ -25,10 +25,15 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import (
+    Executor,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+)
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 from sharpness.cropper import CropResult, crop_image_file
 
@@ -128,6 +133,28 @@ class CollectedDataset:
 CropFn = Callable[[Path, Path], CropResult]
 
 
+def _noop() -> None:
+    """Trivial work item submitted at pool construction to pay the
+    process-spawn cost up front."""
+
+
+def _crop_worker(
+    rail_step: int,
+    aperture: float,
+    jpg_path: Path,
+    out_path: Path,
+    replica_index: int,
+    crop_fn: CropFn,
+) -> tuple[int, float, int, CropResult]:
+    """Module-level worker — picklable for ProcessPoolExecutor.
+
+    Returns the values the main process needs to assemble a
+    :class:`ShotSample`. Errors propagate via Future.exception() and
+    are picked up by the done-callback in :meth:`LiveCollector`."""
+    result = crop_fn(jpg_path, out_path)
+    return rail_step, aperture, replica_index, result
+
+
 class LiveCollector:
     """Thread-pool-backed wrapper around the cropper.
 
@@ -150,6 +177,7 @@ class LiveCollector:
         crop_fn: CropFn | None = None,
         crops_under_source: bool = False,
         cropped_dirname: str = "cropped",
+        executor_kind: Literal["thread", "process"] = "thread",
     ) -> None:
         """``out_dir`` is the default crop output directory.
 
@@ -161,11 +189,35 @@ class LiveCollector:
         and a sweep at f/8 don't share a ``cropped/center/`` folder
         and overwrite each other (every aperture's source files
         share the ``step_NNNN.jpg`` filename convention).
-        """
+
+        ``executor_kind`` selects the worker pool.
+        - ``"thread"`` (default): :class:`ThreadPoolExecutor`. Works
+          with non-picklable test fakes (lambdas, closures). PIL's
+          libjpeg releases the GIL during decode/encode so threads
+          do scale, but only up to ~3× past 4 workers because Python
+          overhead between encodes serialises on the GIL.
+        - ``"process"``: :class:`ProcessPoolExecutor`. True parallel
+          libjpeg encode across cores. Production default. The
+          worker function and ``crop_fn`` must be picklable —
+          ``crop_image_file`` is, but lambda fakes used in tests
+          aren't. Workers are pre-warmed at construction so the
+          fork/spawn cost doesn't land on the first shot."""
         self._out_dir = Path(out_dir)
         self._crops_under_source = crops_under_source
         self._cropped_dirname = cropped_dirname
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor: Executor
+        if executor_kind == "process":
+            self._executor = ProcessPoolExecutor(max_workers=max_workers)
+            # Pre-warm: submit a tiny no-op per worker so the fork/spawn
+            # cost is paid before the first real shot lands. Without
+            # this, the first N shots each pay their own startup tax.
+            warm = [
+                self._executor.submit(_noop) for _ in range(max_workers)
+            ]
+            for f in warm:
+                f.result()
+        else:
+            self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._futures: deque[Future[None]] = deque()
         self._lock = threading.Lock()
         self._dataset = CollectedDataset()
@@ -200,15 +252,45 @@ class LiveCollector:
         """
         if self._shutdown_called:
             raise RuntimeError("record_shot called after shutdown")
+        jpg_path = Path(jpg_path)
+        out_path = (
+            jpg_path.parent / self._cropped_dirname
+            if self._crops_under_source
+            else self._out_dir
+        )
         fut = self._executor.submit(
-            self._process,
+            _crop_worker,
             rail_step,
             aperture,
-            Path(jpg_path),
+            jpg_path,
+            out_path,
             replica_index,
+            self._crop_fn,
         )
+        fut.add_done_callback(self._on_shot_done)
         self._futures.append(fut)
         return fut
+
+    def _on_shot_done(self, fut: Future) -> None:
+        """Future-completion callback: merge the worker result into
+        the dataset under the lock. Errors get appended to
+        ``self._errors`` so :meth:`shutdown` and
+        :meth:`wait_for_pending` can re-raise them. Runs in the
+        executor's result-receiving thread for either pool kind."""
+        exc = fut.exception()
+        if exc is not None:
+            with self._lock:
+                self._errors.append(exc)
+            return
+        rail_step, aperture, replica_index, result = fut.result()
+        sample = ShotSample(
+            rail_step=rail_step,
+            aperture=aperture,
+            sizes=result.sizes,
+            replica_index=replica_index,
+        )
+        with self._lock:
+            self._dataset.samples.append(sample)
 
     def clear_samples_for_steps(self, step_indices) -> None:
         """Drop every accumulated sample whose ``rail_step`` is in
@@ -292,36 +374,6 @@ class LiveCollector:
     def snapshot(self) -> CollectedDataset:
         """Alias of ``dataset`` — clearer at call sites."""
         return self.dataset
-
-    # -- worker ------------------------------------------------------------
-
-    def _process(
-        self,
-        rail_step: int,
-        aperture: float,
-        jpg_path: Path,
-        replica_index: int = 0,
-    ) -> None:
-        out = (
-            jpg_path.parent / self._cropped_dirname
-            if self._crops_under_source
-            else self._out_dir
-        )
-        try:
-            result = self._crop_fn(jpg_path, out)
-        except BaseException as exc:  # noqa: BLE001 — re-raise via shutdown
-            with self._lock:
-                self._errors.append(exc)
-            raise
-        sample = ShotSample(
-            rail_step=rail_step,
-            aperture=aperture,
-            sizes=result.sizes,
-            replica_index=replica_index,
-        )
-        with self._lock:
-            self._dataset.samples.append(sample)
-
 
 def collect_from_dir(
     paths: Iterable[tuple[int, float, Path]],
