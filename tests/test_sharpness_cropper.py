@@ -1,14 +1,16 @@
 """Tests for sharpness.cropper.
 
-The pure ``crop_to_bytes`` is exercised with synthetic in-memory images;
-``crop_image_file`` is exercised once end-to-end with a real Pillow JPEG
-to confirm the box→file→size pipeline holds together.
+``crop_to_bytes`` operates on a decoded ndarray (BGR, uint8 — the
+turbojpeg native layout). ``crop_image_file`` is exercised
+end-to-end with a real JPEG round-trip to confirm the
+decode → slice → encode → file pipeline holds together.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -17,7 +19,19 @@ from sharpness.cropper import (
     crop_image_file,
     crop_to_bytes,
 )
-from sharpness.crops import CROP_NAMES, CropBox, all_crop_boxes
+from sharpness.crops import CROP_NAMES, CropBox
+
+
+# --- helpers ---------------------------------------------------------------
+
+
+def _flat_bgr(w: int, h: int, value: int = 128) -> np.ndarray:
+    return np.full((h, w, 3), value, dtype=np.uint8)
+
+
+def _noisy_bgr(w: int, h: int, seed: int = 42) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, size=(h, w, 3), dtype="uint8")
 
 
 # --- pure crop_to_bytes ----------------------------------------------------
@@ -25,49 +39,48 @@ from sharpness.crops import CROP_NAMES, CropBox, all_crop_boxes
 
 class TestCropToBytes:
     def test_returns_jpeg_bytes(self) -> None:
-        img = Image.new("RGB", (1000, 1000), color=(128, 128, 128))
+        img = _flat_bgr(1000, 1000)
         out = crop_to_bytes(img, CropBox(0, 0, 100, 100))
         assert out[:3] == b"\xff\xd8\xff"  # JPEG SOI marker
 
     def test_uniform_image_compresses_small(self) -> None:
-        img = Image.new("RGB", (1000, 1000), color=(128, 128, 128))
+        img = _flat_bgr(1000, 1000)
         small = crop_to_bytes(img, CropBox(0, 0, 500, 500))
-        assert len(small) < 5000  # uniform grey JPEGs compress trivially
+        # libjpeg-turbo (no extra optimization pass) lands a 500×500
+        # uniform grey at ~5–6 KB; the proxy here is "trivially small
+        # vs textured content", so 8 KB is a comfortable ceiling.
+        assert len(small) < 8000
 
     def test_textured_image_compresses_larger(self) -> None:
-        # High-frequency noise gives much larger JPEGs than uniform grey.
-        import numpy as np
-
-        rng = np.random.default_rng(42)
-        arr = rng.integers(0, 256, size=(500, 500, 3), dtype="uint8")
-        textured = Image.fromarray(arr)
+        textured = _noisy_bgr(500, 500)
         big = crop_to_bytes(textured, CropBox(0, 0, 500, 500))
-
-        flat = Image.new("RGB", (500, 500), color=(128, 128, 128))
+        flat = _flat_bgr(500, 500)
         small = crop_to_bytes(flat, CropBox(0, 0, 500, 500))
-
         assert len(big) > 10 * len(small)
 
     def test_quality_changes_size(self) -> None:
-        import numpy as np
-
-        rng = np.random.default_rng(0)
-        arr = rng.integers(0, 256, size=(500, 500, 3), dtype="uint8")
-        textured = Image.fromarray(arr)
+        textured = _noisy_bgr(500, 500, seed=0)
         hi = crop_to_bytes(textured, CropBox(0, 0, 500, 500), quality=95)
         lo = crop_to_bytes(textured, CropBox(0, 0, 500, 500), quality=40)
         assert len(hi) > len(lo)
+
+    def test_handles_non_contiguous_slice(self) -> None:
+        # Box that lands away from origin produces a non-contiguous
+        # numpy slice; the encoder needs C-contiguous input.
+        img = _noisy_bgr(1000, 1000)
+        out = crop_to_bytes(img, CropBox(100, 200, 500, 800))
+        assert out[:3] == b"\xff\xd8\xff"
 
 
 # --- crop_image_file (one real-JPEG round-trip) -----------------------------
 
 
 class TestCropImageFile:
-    def test_writes_seventeen_crops_with_recorded_sizes(self, tmp_path: Path) -> None:
-        # Build a 1500x1500 PIL image, save as JPEG, then crop it.
-        # 1500 / 1.5 = 1000, well above 500x500 so DX crops fit.
-        import numpy as np
-
+    def test_writes_seventeen_crops_with_recorded_sizes(
+        self, tmp_path: Path
+    ) -> None:
+        # 1500x1500 noisy JPEG → 1000 mid-band wide, well above 500x500
+        # so DX crops fit.
         rng = np.random.default_rng(1)
         arr = rng.integers(0, 256, size=(1500, 1500, 3), dtype="uint8")
         Image.fromarray(arr).save(tmp_path / "source.jpg", quality=92)

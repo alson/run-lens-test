@@ -12,6 +12,7 @@ dependencies = [
     "lens-test-detect-core",
     "pyftdi>=0.57.1",
     "questionary>=2.0",
+    "PyTurboJPEG>=1.7",
 ]
 
 [tool.uv.sources]

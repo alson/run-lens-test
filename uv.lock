@@ -244,6 +244,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyftdi" },
     { name = "pyserial" },
+    { name = "pyturbojpeg" },
     { name = "questionary" },
     { name = "requests" },
 ]
@@ -262,6 +263,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11.0" },
     { name = "pyftdi", specifier = ">=0.57.1" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "pyturbojpeg", specifier = ">=1.7" },
     { name = "questionary", specifier = ">=2.0" },
     { name = "requests", specifier = ">=2.32" },
 ]
@@ -491,6 +493,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/b1/51/a849f96e117386044
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9d/7a/d968e294073affff457b041c2be9868a40c1c71f4a35fcc1e45e5493067b/pytest_cov-7.1.0-py3-none-any.whl", hash = "sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678", size = 22876, upload-time = "2026-03-21T20:11:14.438Z" },
 ]
+
+[[package]]
+name = "pyturbojpeg"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d7/c6/efd96866c457f22d1e893f9ac67f17ff61a5661ad2a061da61657e9c4999/pyturbojpeg-2.2.0.tar.gz", hash = "sha256:aaf0305aa9627ce7fdb8f592eb5e0fce804e1bd87db49900bcf78d7d5138eb88", size = 32514, upload-time = "2026-02-21T02:49:46.505Z" }
 
 [[package]]
 name = "pyusb"
