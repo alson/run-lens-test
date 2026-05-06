@@ -189,9 +189,24 @@ user chooses "Other (free text)" — signals the caller to fall back to
 :func:`prompt_lens_config` + :func:`prompt_magnification`."""
 
 
+def _is_f16_only(entry: Any) -> bool:
+    """True if this entry's status flags it as F16-only-truncated.
+
+    Status text is whatever the plan author put in the markdown table;
+    we match the ``(F16-only)`` substring case-insensitively so other
+    annotations (``(est.)``, ``(NEW)``, etc.) don't false-positive.
+    """
+    return "f16-only" in (getattr(entry, "status", "") or "").lower()
+
+
 def _format_choice_title(entry: Any, completed: set[str], slugify: Callable[[str], str]) -> str:
-    marker = "[done]" if slugify(entry.lens_config) in completed else "      "
-    return f"{marker}  {entry.lens_config}  —  {entry.magnification_text}"
+    if slugify(entry.lens_config) in completed:
+        leading = "[done]"
+    elif _is_f16_only(entry):
+        leading = "[F16-opt]"
+    else:
+        leading = "      "
+    return f"{leading}  {entry.lens_config}  —  {entry.magnification_text}"
 
 
 def prompt_lens_config_from_plan(
@@ -225,9 +240,28 @@ def prompt_lens_config_from_plan(
     """
     import questionary
 
+    # Stable per-group sort: F16-only entries sink to the bottom of
+    # their group because they're optional (only F16 truncated; user
+    # can skip if F16 completeness isn't required). Within each
+    # category (normal vs F16-only) the original plan-file order
+    # is preserved.
+    by_group: dict[str, list] = {}
+    group_order: list[str] = []
+    for entry in entries:
+        if entry.group not in by_group:
+            by_group[entry.group] = []
+            group_order.append(entry.group)
+        by_group[entry.group].append(entry)
+    sorted_entries: list = []
+    for group in group_order:
+        bucket = by_group[group]
+        # Python sort is stable: original order preserved within each key.
+        bucket.sort(key=lambda e: 1 if _is_f16_only(e) else 0)
+        sorted_entries.extend(bucket)
+
     choices: list = []
     last_group: str | None = None
-    for entry in entries:
+    for entry in sorted_entries:
         if entry.group != last_group:
             choices.append(questionary.Separator(f"── {entry.group} ──"))
             last_group = entry.group

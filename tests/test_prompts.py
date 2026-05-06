@@ -244,6 +244,105 @@ class TestPromptLensConfigFromPlan:
         assert "Lens A" in marked
         assert "1:1" in marked
 
+    def test_f16_only_marker_present(self) -> None:
+        e = PlanEntry(
+            group="Group 1 — bench",
+            number=99,
+            lens_config="Lens F16-only",
+            magnification=1.0,
+            magnification_text="1:1",
+            status="reshoot (F16-only)",
+            estimated=False,
+        )
+        title = _format_choice_title(e, set(), slugify_lens_config)
+        assert "[F16-opt]" in title
+        assert "Lens F16-only" in title
+
+    def test_done_takes_precedence_over_f16_only(self) -> None:
+        # If a lens is both completed and F16-only, the done marker wins.
+        e = PlanEntry(
+            group="Group 1 — bench",
+            number=99,
+            lens_config="Lens F16-only",
+            magnification=1.0,
+            magnification_text="1:1",
+            status="reshoot (F16-only)",
+            estimated=False,
+        )
+        title = _format_choice_title(
+            e, {slugify_lens_config("Lens F16-only")}, slugify_lens_config
+        )
+        assert "[done]" in title
+        assert "[F16-opt]" not in title
+
+    def test_status_without_f16_only_gets_no_marker(self) -> None:
+        # Status containing "F16" but not "F16-only" must not match
+        # (e.g. a hypothetical "reshoot (F16+truncated)").
+        e = PlanEntry(
+            group="Group 1 — bench",
+            number=1,
+            lens_config="Lens X",
+            magnification=1.0,
+            magnification_text="1:1",
+            status="reshoot",  # plain status
+            estimated=False,
+        )
+        title = _format_choice_title(e, set(), slugify_lens_config)
+        assert "[F16-opt]" not in title
+        assert "[done]" not in title
+
+    def test_f16_only_entries_sink_to_bottom_of_group(self) -> None:
+        # Group with normal entries, an F16-only entry interleaved, and
+        # entries from a second group. F16-only must appear after the
+        # normal ones in its own group; group order is preserved.
+        entries = [
+            PlanEntry(
+                group="Group 1", number=1, lens_config="L1",
+                magnification=1.0, magnification_text="1:1",
+                status="reshoot", estimated=False,
+            ),
+            PlanEntry(
+                group="Group 1", number=2, lens_config="L2-F16",
+                magnification=1.0, magnification_text="1:1",
+                status="reshoot (F16-only)", estimated=False,
+            ),
+            PlanEntry(
+                group="Group 1", number=3, lens_config="L3",
+                magnification=1.0, magnification_text="1:1",
+                status="NEW", estimated=False,
+            ),
+            PlanEntry(
+                group="Group 2", number=4, lens_config="L4-F16",
+                magnification=1.0, magnification_text="1:1",
+                status="reshoot (F16-only)", estimated=False,
+            ),
+            PlanEntry(
+                group="Group 2", number=5, lens_config="L5",
+                magnification=1.0, magnification_text="1:1",
+                status="reshoot", estimated=False,
+            ),
+        ]
+        captured: list = []
+        prompt_lens_config_from_plan(
+            entries, completed=set(),
+            ask=lambda choices: captured.extend(choices) or None,
+        )
+        # Extract just the entry-titled choices in shown order.
+        titles_in_order = [
+            getattr(c, "title", None)
+            for c in captured
+            if hasattr(c, "value") and isinstance(getattr(c, "value", None), PlanEntry)
+        ]
+        # Within Group 1: L1, L3, L2-F16 (F16-only sinks)
+        # Within Group 2: L5, L4-F16
+        idx = {name: i for i, t in enumerate(titles_in_order) for name in [
+            "L1", "L2-F16", "L3", "L4-F16", "L5"
+        ] if name in str(t)}
+        assert idx["L1"] < idx["L3"] < idx["L2-F16"]
+        assert idx["L5"] < idx["L4-F16"]
+        # Group order preserved (G1 before G2)
+        assert idx["L2-F16"] < idx["L5"]
+
 
 class TestConfirm:
     def test_enter_confirms(self) -> None:
