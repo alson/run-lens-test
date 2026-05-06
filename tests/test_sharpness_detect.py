@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 
 from sharpness.detect import (
+    DEFAULT_DYNAMIC_RANGE_MIN,
     CropStatus,
     analyze_crop,
     analyze_crops_for_aperture,
+    dynamic_range,
     estimate_peak_vertex,
     extra_steps_needed,
     is_flat,
@@ -103,6 +105,22 @@ class TestIsFlat:
 
     def test_empty_returns_false(self) -> None:
         assert not is_flat([])
+
+
+class TestDynamicRange:
+    def test_bell_has_substantial_range(self) -> None:
+        # BELL: max=132, min=68 → (132 - 68) / 132 ≈ 0.485
+        assert dynamic_range(BELL) == pytest.approx(0.485, abs=0.01)
+
+    def test_constant_is_zero(self) -> None:
+        assert dynamic_range([72] * 10) == 0.0
+
+    def test_empty_is_zero(self) -> None:
+        assert dynamic_range([]) == 0.0
+
+    def test_negative_max_is_zero(self) -> None:
+        # Defensive: corrupt sizes shouldn't propagate as a real range.
+        assert dynamic_range([0, 0, 0]) == 0.0
 
 
 class TestOffTargetByCrossCompare:
@@ -224,6 +242,8 @@ class TestAnalyzeCrop:
         assert a.peak_step is not None
         assert a.extra_steps_needed is None
         assert a.max_size == max(BELL)
+        assert a.valid is True
+        assert a.dynamic_range > DEFAULT_DYNAMIC_RANGE_MIN
 
     def test_truncated_end_recommends_extension(self) -> None:
         rising = [int(50 + i * 5) for i in range(15)]  # 50, 55, ..., 120
@@ -243,14 +263,47 @@ class TestAnalyzeCrop:
         assert a.status == CropStatus.OFF_TARGET
         assert a.peak_step is None
         assert a.extra_steps_needed is None
+        # Cross-compare flagged (peak weaker than peers), but BELL has
+        # plenty of dynamic range, so the crop stays valid=True so the
+        # advisor can distinguish it from "fell off the wafer".
+        assert a.valid is True
 
-    def test_flat_profile_is_off_target(self) -> None:
+    def test_flat_profile_is_off_target_and_invalid(self) -> None:
         a = analyze_crop("top-left", [70] * 15, flagged_off_target=False)
         assert a.status == CropStatus.OFF_TARGET
+        assert a.valid is False
+        assert a.dynamic_range == 0.0
+
+    def test_low_dynamic_range_is_invalid(self) -> None:
+        # Window sits on low-contrast background — JPEG sizes wobble a
+        # tiny bit due to noise but well below the 25% floor.
+        # max=104, min=100 → dynamic range ≈ 3.8%.
+        noisy_off_wafer = [100, 101, 102, 103, 104, 103, 102, 101, 100, 102]
+        a = analyze_crop("top-left", noisy_off_wafer, flagged_off_target=False)
+        assert a.valid is False
+        assert a.status == CropStatus.OFF_TARGET
+        assert 0.0 < a.dynamic_range < DEFAULT_DYNAMIC_RANGE_MIN
+        # The dynamic-range gate should *not* try to find a peak or
+        # recommend an extension on a series we've declared invalid.
+        assert a.peak_step is None
+        assert a.extra_steps_needed is None
+
+    def test_dynamic_range_threshold_can_be_overridden(self) -> None:
+        # Same flat-ish series as above; with a permissive 1% floor it
+        # should now pass the gate and run normal detection.
+        noisy = [100, 101, 102, 103, 104, 103, 102, 101, 100, 102]
+        a = analyze_crop(
+            "top-left",
+            noisy,
+            flagged_off_target=False,
+            dynamic_range_min=0.01,
+        )
+        assert a.valid is True
 
     def test_empty(self) -> None:
         a = analyze_crop("center", [], flagged_off_target=False)
         assert a.status == CropStatus.EMPTY
+        assert a.valid is False
 
 
 # --- analyze_crops_for_aperture ------------------------------------------

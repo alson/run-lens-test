@@ -7,13 +7,27 @@ the session runner can call after the rail sweep completes:
     for aperture, rec in sorted(report.items()):
         print(rec.summary())
 
-Each ``Recommendation`` aggregates the 17 per-crop verdicts into:
+Each ``Recommendation`` aggregates all 17 per-crop verdicts into:
 
-- a scenario-level status (``OK`` / ``NEEDS_RESHOOT``);
+- a scenario-level status (``OK`` / ``NEEDS_RESHOOT`` / ``OFF_TARGET``);
 - a direction (``EXTEND_FORWARD`` / ``EXTEND_BACKWARD`` / ``BOTH``)
-  derived from the truncation direction(s) of the on-target crops;
+  derived from the truncation direction(s) of the *valid* crops —
+  field curvature can shift corner peaks past the captured range
+  while the centre lands fine, so we want each valid crop to weigh
+  in independently rather than collapsing into one synthetic peak;
 - an estimated extension in rail steps (max across the truncated crops,
   so we cover the worst case at the centre or in any corner).
+
+Validity. Corner crops can fall off the wafer onto a low-contrast
+background, in which case their JPEG-size series barely moves across
+the rail. We gate on the per-crop dynamic range
+``(max - min) / max`` against ``SHARPNESS_CROP_DYNAMIC_RANGE_MIN``
+(``DEFAULT_DYNAMIC_RANGE_MIN`` here when no value is plumbed
+through). Crops below the floor are flagged ``valid=False`` and
+excluded from the per-aperture verdict; the ``Recommendation``
+exposes them via :meth:`Recommendation.invalid_crops` and the
+rationale string calls them out individually so the user can tell
+"corner fell off the wafer" apart from "everything is flat".
 
 Note on direction semantics: ``EXTEND_FORWARD`` corresponds to
 ``TRUNCATED_END`` — the rail ran out of range before reaching the peak,
@@ -32,6 +46,7 @@ from enum import Enum
 from sharpness.collector import CollectedDataset
 from sharpness.crops import CROP_NAMES
 from sharpness.detect import (
+    DEFAULT_DYNAMIC_RANGE_MIN,
     DEFAULT_EDGE_STEPS,
     DEFAULT_OFF_TARGET_FACTOR,
     CropAnalysis,
@@ -51,12 +66,12 @@ class Verdict(str, Enum):
     OK = "OK"
     NEEDS_RESHOOT = "NEEDS_RESHOOT"
     OFF_TARGET = "OFF_TARGET"
-    """No crop in this aperture has a real bell curve — every series
-    is flat (max/min < DEFAULT_FLAT_RATIO) or the cross-compare flag
-    rejected it. Either the rail spans an entirely out-of-focus
-    region or the test target lacks micro-detail at every crop
-    location. The runner treats this as a re-jog signal at the
-    session level when *all* apertures land here."""
+    """No *valid* crop in this aperture has a real bell curve — either
+    every crop fell below the dynamic-range floor (window off the
+    wafer / wholly out-of-focus area), or the cross-compare /
+    is_flat flag rejected the few valid ones. The runner treats this
+    as a re-jog signal at the session level when *all* apertures land
+    here."""
 
 
 @dataclass(frozen=True)
@@ -69,25 +84,54 @@ class Recommendation:
 
     @property
     def truncated_crops(self) -> tuple[CropAnalysis, ...]:
-        return tuple(c for c in self.crop_analyses if c.status.is_truncated)
+        return tuple(
+            c for c in self.crop_analyses if c.valid and c.status.is_truncated
+        )
 
     @property
     def off_target_crops(self) -> tuple[CropAnalysis, ...]:
-        return tuple(c for c in self.crop_analyses if c.status == CropStatus.OFF_TARGET)
+        # Cross-compare / legacy is_flat off-targets — crops with real
+        # dynamic range but a much weaker peak than their peers. Distinct
+        # from invalid_crops (window fell off the wafer entirely).
+        return tuple(
+            c
+            for c in self.crop_analyses
+            if c.valid and c.status == CropStatus.OFF_TARGET
+        )
+
+    @property
+    def invalid_crops(self) -> tuple[CropAnalysis, ...]:
+        """Crops excluded from the verdict because their dynamic range
+        was below ``SHARPNESS_CROP_DYNAMIC_RANGE_MIN`` — the window
+        almost certainly fell off the wafer onto low-contrast
+        background and has no usable focus signal."""
+        return tuple(c for c in self.crop_analyses if not c.valid)
+
+    @property
+    def valid_crops(self) -> tuple[CropAnalysis, ...]:
+        return tuple(c for c in self.crop_analyses if c.valid)
+
+    def per_crop(self) -> dict[str, CropAnalysis]:
+        """Convenience accessor: ``{crop_name: CropAnalysis}``."""
+        return {c.crop_name: c for c in self.crop_analyses}
 
     def summary(self) -> str:
         """Single-line, human-readable recommendation suitable for the
         terminal output of the session runner.
         """
+        invalid_note = self._invalid_note()
         if self.verdict == Verdict.OK:
             n_off = len(self.off_target_crops)
             base = f"f/{self.aperture:g}: OK"
-            return base + (f" ({n_off} off-target crops ignored)" if n_off else "")
+            if n_off:
+                base += f" ({n_off} off-target crops ignored)"
+            return base + invalid_note
         if self.verdict == Verdict.OFF_TARGET:
-            return (
-                f"f/{self.aperture:g}: OFF_TARGET — every crop is flat; "
-                "no focus signal in this sweep"
+            base = (
+                f"f/{self.aperture:g}: OFF_TARGET — no focus signal in "
+                "this sweep (every valid crop flat or no crop valid)"
             )
+            return base + invalid_note
         crops = ", ".join(c.crop_name for c in self.truncated_crops)
         if self.direction == Direction.EXTEND_FORWARD:
             arrow = "extend forward (further past start position)"
@@ -98,7 +142,19 @@ class Recommendation:
         return (
             f"f/{self.aperture:g}: NEEDS_RESHOOT — {arrow} by ~{self.extra_steps} "
             f"rail step(s); truncated crops: {crops}"
+        ) + invalid_note
+
+    def _invalid_note(self) -> str:
+        invalid = self.invalid_crops
+        if not invalid:
+            return ""
+        # Compact "(2 invalid crops: top-left 4%, bottom-right 6%)" so
+        # the user knows at a glance which corners fell off the wafer.
+        details = ", ".join(
+            f"{c.crop_name} {int(round(c.dynamic_range * 100))}%"
+            for c in invalid
         )
+        return f" [{len(invalid)} invalid crops: {details}]"
 
 
 # --- internals -----------------------------------------------------------
@@ -125,7 +181,12 @@ def _extra_steps_for(crops: tuple[CropAnalysis, ...]) -> int:
 def _build_recommendation(
     aperture: float, analyses: list[CropAnalysis]
 ) -> Recommendation:
-    truncated = tuple(c for c in analyses if c.status.is_truncated)
+    # Only valid crops feed into the verdict / direction / extension.
+    # Invalid (low dynamic range) crops fell off the wafer; their
+    # near-constant series would otherwise look "non-truncated peak in
+    # range" purely as a numerical artifact.
+    valid = [c for c in analyses if c.valid]
+    truncated = tuple(c for c in valid if c.status.is_truncated)
     if truncated:
         direction = _direction_for(truncated)
         extra = _extra_steps_for(truncated)
@@ -136,10 +197,12 @@ def _build_recommendation(
             extra_steps=extra,
             crop_analyses=tuple(analyses),
         )
-    # No truncated crops. Distinguish "every crop has a real peak in
-    # range" (OK) from "every crop is flat / off-target" (OFF_TARGET).
-    # If even one crop reports CropStatus.OK the aperture has signal.
-    has_real_peak = any(c.status == CropStatus.OK for c in analyses)
+    # No truncated crops among the valid ones. Distinguish "at least
+    # one valid crop has a real peak in range" (OK) from "every valid
+    # crop is flat / off-target, or no crop is valid at all"
+    # (OFF_TARGET). The latter is the runner's re-jog signal at the
+    # session level when *all* apertures land here.
+    has_real_peak = any(c.status == CropStatus.OK for c in valid)
     if has_real_peak:
         return Recommendation(
             aperture=aperture,
@@ -165,6 +228,7 @@ def advise(
     *,
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
     edge_steps: int = DEFAULT_EDGE_STEPS,
+    dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
     crop_names: tuple[str, ...] = CROP_NAMES,
 ) -> dict[float, Recommendation]:
     """Produce one ``Recommendation`` per aperture present in ``dataset``.
@@ -172,6 +236,15 @@ def advise(
     Replicas at the same (step, aperture) are collapsed via per-crop
     median before peak / truncation detection so the bell-curve
     primitives see one point per rail step, not N.
+
+    All crops with sufficient dynamic range
+    (``(max-min)/max >= dynamic_range_min``) feed independently into
+    the per-aperture aggregate: the verdict is OK only when every
+    valid crop is OK; truncation in any direction at any valid crop
+    promotes the aperture to ``NEEDS_RESHOOT``; if valid crops
+    disagree on truncation direction (e.g. centre rolls back while a
+    corner runs forward — classic field curvature) the aperture
+    direction collapses to ``BOTH`` so the runner extends bilaterally.
     """
     aggregated = dataset.aggregated()
     out: dict[float, Recommendation] = {}
@@ -185,6 +258,7 @@ def advise(
             crop_sizes,
             cross_compare_factor=cross_compare_factor,
             edge_steps=edge_steps,
+            dynamic_range_min=dynamic_range_min,
         )
         out[aperture] = _build_recommendation(aperture, analyses)
     return out

@@ -39,11 +39,13 @@ from lens_test_detect_core import truncation_status as _truncation_status_core
 __all__ = [
     "CropAnalysis",
     "CropStatus",
+    "DEFAULT_DYNAMIC_RANGE_MIN",
     "DEFAULT_EDGE_STEPS",
     "DEFAULT_FLAT_RATIO",
     "DEFAULT_OFF_TARGET_FACTOR",
     "analyze_crop",
     "analyze_crops_for_aperture",
+    "dynamic_range",
     "estimate_peak_vertex",
     "extra_steps_needed",
     "is_flat",
@@ -59,6 +61,13 @@ __all__ = [
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_FLAT_RATIO = 1.15
 DEFAULT_OFF_TARGET_FACTOR = 0.65
+# Minimum per-crop dynamic range ``(max - min) / max`` for the crop to
+# count as valid for its aperture's verdict. Below this we assume the
+# crop window fell off the wafer onto low-contrast background. Default
+# matches ``config.SHARPNESS_CROP_DYNAMIC_RANGE_MIN`` but is duplicated
+# here so the detector stays import-free of session config — callers
+# wire the configured value through ``analyze_crops_for_aperture``.
+DEFAULT_DYNAMIC_RANGE_MIN = 0.25
 
 
 # Backwards-compatible alias — the live module historically called this
@@ -92,6 +101,29 @@ class CropAnalysis:
     extra_steps_needed: int | None  # rail steps to extend in the truncation direction
     max_size: int | None
     min_size: int | None
+    # Dynamic-range gate (the wafer-on-frame validity check). ``valid``
+    # is the explicit signal callers should use to decide whether this
+    # crop contributes to the aperture verdict. ``dynamic_range`` is
+    # ``(max - min) / max`` over the rail-step series, exposed for
+    # diagnostics / rationale strings (e.g. "top-left invalid: dynamic
+    # range 4 % < 25 %").
+    valid: bool = True
+    dynamic_range: float = 0.0
+
+
+def dynamic_range(values: list[int]) -> float:
+    """Per-series dynamic range ``(max - min) / max``.
+
+    Returns 0.0 when the series is empty or its max is non-positive
+    (defensive against corrupt files); 0.0 always trips the validity
+    gate so degenerate inputs are conservatively dropped.
+    """
+    if not values:
+        return 0.0
+    mx = max(values)
+    if mx <= 0:
+        return 0.0
+    return (mx - min(values)) / mx
 
 
 def estimate_peak_vertex(sizes: np.ndarray | list[int]) -> float | None:
@@ -159,7 +191,19 @@ def analyze_crop(
     *,
     flagged_off_target: bool,
     edge_steps: int = DEFAULT_EDGE_STEPS,
+    dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
 ) -> CropAnalysis:
+    """Per-crop bell-curve verdict for one aperture.
+
+    ``dynamic_range_min`` is the validity floor: crops whose rail
+    series has ``(max-min)/max < dynamic_range_min`` are flagged
+    invalid (window fell off the wafer or otherwise has no focus
+    signal) and short-circuited to ``CropStatus.OFF_TARGET`` without
+    running peak / truncation detection. ``flagged_off_target``
+    carries the cross-compare result and acts as a secondary
+    ``OFF_TARGET`` signal for crops that *do* swing across the rail
+    but whose peak is far weaker than the best crop in the aperture.
+    """
     n = len(sizes)
     if n == 0:
         return CropAnalysis(
@@ -172,9 +216,14 @@ def analyze_crop(
             extra_steps_needed=None,
             max_size=None,
             min_size=None,
+            valid=False,
+            dynamic_range=0.0,
         )
 
-    if flagged_off_target or is_flat(sizes):
+    dr = dynamic_range(sizes)
+    valid = dr >= dynamic_range_min
+
+    if not valid:
         return CropAnalysis(
             crop_name=crop_name,
             status=CropStatus.OFF_TARGET,
@@ -185,6 +234,29 @@ def analyze_crop(
             extra_steps_needed=None,
             max_size=max(sizes),
             min_size=min(sizes),
+            valid=False,
+            dynamic_range=dr,
+        )
+
+    if flagged_off_target or is_flat(sizes):
+        # Cross-compare or legacy is_flat fallback. Crop has *some*
+        # dynamic range but its peak is much weaker than the best crop
+        # in the aperture, or it's still flat under the looser
+        # max/min<1.15 metric. Treat as OFF_TARGET but valid=True so
+        # diagnostics distinguish "fell off the wafer" (dynamic range
+        # below floor) from "weaker than peers".
+        return CropAnalysis(
+            crop_name=crop_name,
+            status=CropStatus.OFF_TARGET,
+            n_steps=n,
+            peak_step=None,
+            peak_pct=None,
+            estimated_peak_step=None,
+            extra_steps_needed=None,
+            max_size=max(sizes),
+            min_size=min(sizes),
+            valid=True,
+            dynamic_range=dr,
         )
 
     pk = peak_index(sizes)
@@ -203,6 +275,8 @@ def analyze_crop(
         extra_steps_needed=extra,
         max_size=max(sizes),
         min_size=min(sizes),
+        valid=True,
+        dynamic_range=dr,
     )
 
 
@@ -211,23 +285,31 @@ def analyze_crops_for_aperture(
     *,
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
     edge_steps: int = DEFAULT_EDGE_STEPS,
+    dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
 ) -> list[CropAnalysis]:
     """Run the full per-crop analysis for one aperture.
 
     ``crop_sizes`` is ``{crop_name: [size_at_step_0, size_at_step_1, ...]}``.
     The returned list has one ``CropAnalysis`` per crop, in the
     iteration order of ``crop_sizes``.
+
+    Cross-compare is computed only over the crops that pass the
+    dynamic-range gate so a swarm of off-wafer corners can't drag
+    down the reference max and falsely flag the few valid crops.
     """
-    crop_maxes: dict[str, int] = {
-        name: max(sizes) for name, sizes in crop_sizes.items() if sizes
+    valid_maxes: dict[str, int] = {
+        name: max(sizes)
+        for name, sizes in crop_sizes.items()
+        if sizes and dynamic_range(sizes) >= dynamic_range_min
     }
-    flagged = off_target_by_cross_compare(crop_maxes, factor=cross_compare_factor)
+    flagged = off_target_by_cross_compare(valid_maxes, factor=cross_compare_factor)
     return [
         analyze_crop(
             name,
             sizes,
             flagged_off_target=name in flagged,
             edge_steps=edge_steps,
+            dynamic_range_min=dynamic_range_min,
         )
         for name, sizes in crop_sizes.items()
     ]

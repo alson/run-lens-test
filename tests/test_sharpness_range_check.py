@@ -95,6 +95,32 @@ def _samples_for_aperture(
     return out
 
 
+def _samples_with_per_crop_series(
+    aperture: float,
+    per_crop_sizes: dict[str, list[int]],
+    *,
+    rail_step_start: int = 0,
+) -> list[ShotSample]:
+    """Build samples where each crop has its own size series. All
+    series must have the same length; missing crops are filled with
+    a constant flat value high enough to keep their dynamic range
+    above the validity floor unless the test deliberately omits them.
+    """
+    n = len(next(iter(per_crop_sizes.values())))
+    for name, series in per_crop_sizes.items():
+        if len(series) != n:
+            raise ValueError(f"crop {name} has length {len(series)}, expected {n}")
+    out = []
+    for i in range(n):
+        sizes = {name: series[i] for name, series in per_crop_sizes.items()}
+        out.append(ShotSample(
+            rail_step=rail_step_start + i,
+            aperture=aperture,
+            sizes=sizes,
+        ))
+    return out
+
+
 @pytest.fixture
 def cfg():
     return SimpleNamespace()
@@ -228,6 +254,74 @@ class TestFirstCall:
         )
         # Adapter calls wait_for_pending() exactly once per evaluate.
         assert dataset.waits == 1
+
+
+class TestMultiCropFieldCurvature:
+    """Per-crop verdicts disagree within a single aperture (field
+    curvature): the adapter must surface that at the
+    :class:`RangeResult` level so the runner extends bilaterally."""
+
+    def test_corners_disagree_yields_both(self, cfg) -> None:
+        # Centre is OK, one corner truncates forward, another backward.
+        n = 11
+        bell = _bell(n, peak_step=5)
+        rising = _rising(n)   # peak past the far end
+        falling = _falling(n)  # peak before the start
+        # Build a full crop dict so all 17 crops are present and well
+        # above the validity floor; the three "field-curvature" crops
+        # diverge from the bell.
+        per_crop = {name: list(bell) for name in CROP_NAMES}
+        per_crop["top-left"] = rising
+        per_crop["bottom-right"] = falling
+        samples = _samples_with_per_crop_series(8.0, per_crop)
+        checker = SharpnessRangeChecker(cfg, collector=FakeCollector(samples=samples))
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=1.0, apertures=["f/8"],
+        )
+        # A single aperture with mixed-direction valid crops collapses
+        # to Direction.BOTH at the advisor level; the adapter maps
+        # that straight onto peak_side="both".
+        assert result.peak_side == "both"
+        assert result.ok is False
+        assert result.needs_extension is True
+
+    def test_invalid_corners_dont_perturb_centered_verdict(self, cfg) -> None:
+        # Centre + edges are clean bells; the four corner crops fall
+        # off the wafer (low dynamic range). The aperture should land
+        # on OK / centered — invalid crops must not influence the
+        # verdict, even when their constant series would otherwise
+        # look "non-truncated peak in range" purely numerically.
+        n = 11
+        bell = _bell(n, peak_step=5)
+        # Off-wafer noise: dynamic range ≈ 4%, well below 25% floor.
+        noise = [100, 101, 102, 103, 104, 103, 102, 101, 100, 102, 100]
+        per_crop = {name: list(bell) for name in CROP_NAMES}
+        for corner in ("top-left", "top-right", "bottom-left", "bottom-right"):
+            per_crop[corner] = list(noise)
+        samples = _samples_with_per_crop_series(8.0, per_crop)
+        checker = SharpnessRangeChecker(cfg, collector=FakeCollector(samples=samples))
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=1.0, apertures=["f/8"],
+        )
+        assert result.ok is True
+        assert result.peak_side == "centered"
+
+    def test_all_crops_invalid_marks_all_off_target(self, cfg) -> None:
+        # No crop has enough dynamic range — runner should treat as
+        # "no signal at all", not "extend the rail".
+        noise = [100, 101, 102, 103, 104, 103, 102, 101, 100, 102, 100]
+        per_crop = {name: list(noise) for name in CROP_NAMES}
+        samples = _samples_with_per_crop_series(8.0, per_crop)
+        checker = SharpnessRangeChecker(cfg, collector=FakeCollector(samples=samples))
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=1.0, apertures=["f/8"],
+        )
+        assert result.all_off_target is True
+        assert result.ok is False
+        assert result.needs_extension is False
 
 
 class TestUnsetCollector:

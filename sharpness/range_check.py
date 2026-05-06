@@ -35,6 +35,7 @@ from sharpness.advisor import (
     advise,
 )
 from sharpness.collector import CollectedDataset, LiveCollector
+from sharpness.detect import DEFAULT_DYNAMIC_RANGE_MIN
 
 
 # Crop name used to derive the canonical per-aperture sharpness curve
@@ -104,7 +105,16 @@ class SharpnessRangeChecker(RangeChecker):
         # downstream curve-builders too — per_aperture in the
         # RangeResult is one point per step.
         dataset = self.collector.dataset.aggregated()
-        recs = advise(dataset)
+        # Pull the validity floor from config when available so a
+        # campaign tuning the dynamic-range gate doesn't need to edit
+        # detect.py defaults; SimpleNamespace test fixtures fall
+        # through to the detector default.
+        dr_min = getattr(
+            self.config,
+            "SHARPNESS_CROP_DYNAMIC_RANGE_MIN",
+            DEFAULT_DYNAMIC_RANGE_MIN,
+        )
+        recs = advise(dataset, dynamic_range_min=dr_min)
 
         if probe_data is None:
             # First call: classify the main sweep.

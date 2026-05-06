@@ -161,10 +161,13 @@ RANGE_CHECK_PROBE_STEPS = 2
 
 # ---- Sharpness pipeline ----------------------------------------------------
 
-SHARPNESS_MAX_WORKERS = 4
-"""Concurrent crop workers per LiveCollector. Tune for the laptop's
-core count vs flash recycle: 4 keeps a single 45 MP JPEG cropping run
-just under typical 3 s recycle on the test rig."""
+SHARPNESS_MAX_WORKERS = 8
+"""Concurrent crop workers per LiveCollector. Production uses a
+ProcessPoolExecutor (true parallel libjpeg encode across cores), so
+this should match the laptop's logical core count. The bench-rig
+i5-8350U has 8 logical cores; 4 was the previous ThreadPool default
+and bottlenecked at ~3× speedup because of GIL contention between
+encodes."""
 
 SHOTS_PER_STEP_APERTURE = 3
 """Number of frames captured at each (rail step, aperture) pair.
@@ -179,6 +182,19 @@ swamp a weak focus signal. Set to 1 to revert to single-shot."""
 SHARPNESS_CROPPED_DIRNAME = "cropped"
 """Subdirectory name under each <lens>/<aperture>/ directory where the
 17 crops are persisted. Matches the user's offline-analysis layout."""
+
+SHARPNESS_CROP_DYNAMIC_RANGE_MIN = 0.25
+"""Per-crop validity floor as ``(max - min) / max`` over the rail
+series. Crops below this dynamic range are declared *invalid* for the
+aperture they belong to and excluded from the per-aperture verdict.
+
+The wafer doesn't necessarily fill the frame, so corner crops can
+fall off onto a low-contrast background; their JPEG sizes barely
+move across the focus sweep because there's nothing to focus on.
+A defocused wafer crop, by contrast, swings dramatically (typical
+on-target peak/trough ratios of 1.5–1.8 ⇒ dynamic range 0.33–0.44).
+0.25 sits comfortably below that band and well above empty-frame
+noise (typically ≤ 0.10)."""
 
 # ---- Step-numbering for capture filenames ----------------------------------
 
