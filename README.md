@@ -220,6 +220,16 @@ Per-session directory under `OUTPUT_ROOT`, named with a timestamp:
 * **Replica suffix**: replica 0 keeps the legacy unsuffixed name so
   existing offline-analysis tooling sees no change; replicas 1, 2, …
   use `_b`, `_c`, …
+* **Per-aperture subsampling**: smaller apertures may have *fewer*
+  `step_NNNN.jpg` files than wider ones. The planner's
+  `subsample_factors` (in `session.json` under each lens config)
+  records the integer skip stride per aperture — e.g. `f/4.5: 1`
+  means "every step", `f/16: 3` means "every third step". The
+  planner picks the factors so the FWHM density at every aperture
+  is comparable, even though smaller apertures shoot less. The
+  runner now honours these factors at capture time, saving
+  20-35 % of the wall-clock per lens config at typical
+  magnifications.
 * **`session.json`** records `lens_configs`, `baseline_median_luminance`,
   StackShot software / hardware IDs, ntfy topic, `aborted` flag,
   and `ended_at`.

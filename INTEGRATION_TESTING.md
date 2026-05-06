@@ -529,13 +529,28 @@ After the main sweep, the runner runs the sharpness analysis and the flow branch
 ### Verify the cropping kept up
 
 ```bash
-# Total source JPEGs at one aperture
-n=$(ls <session>/<lens>/f_4_5/step_*.jpg | wc -l)
-# Cropped JPEGs per crop name (should equal n)
-ls <session>/<lens>/f_4_5/cropped/center/ | wc -l
+# Source JPEGs at one aperture (replica 0 only):
+ls <session>/<lens>/f_4_5/step_[0-9][0-9][0-9][0-9].jpg | wc -l
+# Cropped JPEGs at the same aperture (also replica 0 only):
+ls <session>/<lens>/f_4_5/cropped/center/step_[0-9][0-9][0-9][0-9].jpg | wc -l
 ```
 
-The two should match. If `cropped/` has fewer files, the collector's queue didn't drain in time — `wait_for_pending()` should prevent this; if it doesn't, capture the issue with `dmesg` and the runner's stderr.
+The two should match (and match `rail_positions / subsample_factors[ap]` rounded up — see below). If `cropped/` has fewer files, the collector's queue didn't drain in time — `wait_for_pending()` should prevent this; if it doesn't, capture the issue with `dmesg` and the runner's stderr.
+
+### Per-aperture file counts (Phase B subsampling)
+
+With `SamplePlan.subsample_factors` honoured at capture time, smaller apertures have **fewer** source JPEGs than wider ones. For each aperture, the expected count is:
+
+```
+expected = ceil(rail_positions / subsample_factors[aperture]) × replicas
+```
+
+Read the factors from `session.json → lens_configs[i].sample_plan.subsample_factors` (keyed by float aperture). Quick check:
+
+```bash
+# Replicas suffixed _b, _c, …; replica 0 is unsuffixed
+ls <session>/<lens>/f_16/step_*.jpg | wc -l   # = expected (with all replicas)
+```
 
 ### Multi-shot replicas
 

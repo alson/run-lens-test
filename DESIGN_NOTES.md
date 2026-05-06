@@ -551,6 +551,68 @@ spans more rail positions even at the same step. Those bumps would
 have been counterproductive, so the planner has no per-band-hint
 beyond the high-mag transition.
 
+### 5.10 Phase B: capture-time subsampling
+
+Phase A persisted `SamplePlan.subsample_factors` in `session.json`
+but the sweep still captured every aperture at every rail step.
+Phase B wires the factors into the runner's three capture loops
+(`_run_one_step`, `_shoot_at_position`, `_reshoot_steps`) so an
+aperture A at step S is shot only when `S % factor[A] == 0`. The
+trip dropped one new helper (`_should_capture`) into each loop
+and a per-lens-config lookup (`_subsample_factors`) on the runner.
+
+**Why subsampling is sound analytically.** The planner sizes
+`rail_step_mm` from the *widest* aperture's DOF — the narrowest
+peak, the worst case for sampling. Wider DOF (smaller aperture)
+→ broader FWHM → fewer rail positions needed for the same
+peak-detection accuracy. The factors are computed as
+`floor(N / N_widest)` so each aperture ends up with roughly the
+same number of rail positions across its FWHM as the widest gets
+across its (narrower) FWHM. The user's resampling experiment on
+the existing 25-position dataset confirmed this empirically.
+
+**Reshoot honours factors.** When droop fires and the rail
+rewinds to overwrite under-exposed frames, the reshoot loop also
+applies `_should_capture`. The reshoot grid mirrors the original
+sweep's exactly — f/16 at factor 5 stays at every-fifth-step
+inside the reshoot range, not every step. Series stays uniform
+end-to-end.
+
+**Skipped captures are silent.** No `phase=skipped` row in
+shots.csv; no shots.csv row at all for the skipped (step,
+aperture) pair. Sparse series shows up as absent rows;
+downstream tooling (advisor, range checker) already iterates
+actual rows, so no filtering required.
+
+**Droop window dilation, accepted.** The droop detector keeps
+a fixed 10-sample rolling window per aperture. With f/16 sampled
+every fifth step, those 10 samples span 50 sweep iterations —
+detection is 5× delayed in real time at f/16. Documented and
+intentional: full-sampling apertures (f/4.5, f/5.6) trip first
+because they're 5× more sensitive in real time, so the dilation
+at smaller apertures doesn't matter on the rig. If false
+negatives surface in practice, the fix is to pass per-aperture
+`window // factor` into `DroopDetector` at construction time.
+
+**Advisor sparse-safety: free.** Re-exploration during Phase B
+planning confirmed `sharpness/advisor.py:advise()` already
+iterates apertures independently, never compares lengths across
+them; `sharpness/range_check.py:_build_curves` uses the real
+`rail_step` from `dataset.crop_series_for(...)`, not array
+indices. The runner uses `RANGE_EXTENSION_FRACTION` for the
+extension-shot count, not the advisor's `extra_steps_needed`,
+so the advisor's array-index-relative output (which is
+technically wrong on sparse data) is harmless. Phase B added no
+code in those modules.
+
+**Throughput.** Typical session at M=1.58, widest f/4.5, 100
+positions × 5 apertures × 3 replicas ≈ 1500 captures. With
+Phase B factors `{4.5: 1, 5.6: 1, 8.0: 1, 11.0: 2, 16.0: 3}`,
+captures drop to ~1150. At wider widest-apertures (f/2.8) the
+factors fan out further (f/16: 5) for ~30 % savings. Plan
+announcement now prints the per-aperture breakdown + savings
+percentage so the user can sanity-check before committing.
+
 ## 6. What would be different if redoing the project
 
 - **Test the SB-5000 commander earlier.** The first half of the planning

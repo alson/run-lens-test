@@ -284,6 +284,13 @@ class SessionRunner:
     metadata: SessionMetadata | None = None
     baseline_median: float | None = None
     _sharpness_collector: SharpnessCollectorLike | None = None
+    _subsample_factors: dict[str, int] = field(default_factory=dict)
+    """Per-aperture skip stride for the current lens config. Built
+    from ``SamplePlan.subsample_factors`` once per lens config and
+    cleared on exit. Aperture A is captured at step S iff
+    ``S % factor[A] == 0``; missing apertures default to factor 1
+    (no skip). Skipped captures are silent — no shots.csv row, no
+    droop push, no replicas."""
     _last_capture_started_at: float | None = None
     """monotonic() reading taken just before each ``camera.capture_to``.
 
@@ -525,6 +532,7 @@ class SessionRunner:
             magnification=magnification,
             widest_aperture=widest_aperture,
             widest_aperture_str=widest_aperture_str,
+            apertures=apertures,
         )
         steps = plan.rail_positions
         step_size_mm = math.copysign(plan.rail_step_mm, end_mm)
@@ -541,6 +549,7 @@ class SessionRunner:
         # plan. The collector lives for the entire lens config so
         # probe / extension shots feed the same dataset.
         self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
+        self._subsample_factors = self._build_subsample_lookup(apertures, plan)
         if self.range_checker is not None:
             self.range_checker.set_collector(self._sharpness_collector)
         try:
@@ -564,6 +573,36 @@ class SessionRunner:
             if self.range_checker is not None:
                 self.range_checker.set_collector(None)
             self._sharpness_collector = None
+            self._subsample_factors = {}
+
+    def _build_subsample_lookup(
+        self, apertures: list[str], plan: SamplePlan,
+    ) -> dict[str, int]:
+        """Build a per-aperture skip-stride lookup from a SamplePlan.
+
+        Walks the camera's aperture strings (``"f/4.5"`` etc.),
+        parses each to a float, and reads the integer factor from
+        ``plan.subsample_factors`` (which is keyed by float
+        aperture). Apertures the planner doesn't list — typically
+        ⅓-stops not in ``KNOWN_APERTURE_STOPS`` — default to 1
+        (no skip), the safe choice.
+        """
+        out: dict[str, int] = {}
+        for ap_str in apertures:
+            try:
+                ap_float = _parse_fnum(ap_str)
+            except ValueError:
+                out[ap_str] = 1
+                continue
+            out[ap_str] = max(1, int(plan.subsample_factors.get(ap_float, 1)))
+        return out
+
+    def _should_capture(self, aperture: str, step_index: int) -> bool:
+        """``True`` when this (step, aperture) is on the aperture's
+        sparse grid. Skipped captures are silent — no shots.csv row,
+        no droop push, no replicas."""
+        factor = self._subsample_factors.get(aperture, 1)
+        return step_index % factor == 0
 
     def _jog_and_plan(
         self,
@@ -571,6 +610,7 @@ class SessionRunner:
         magnification: float,
         widest_aperture: float,
         widest_aperture_str: str,
+        apertures: list[str] | None = None,
     ) -> tuple[float, SamplePlan]:
         """Run the jog UI, build a sweep plan, and refuse-prompt-rejog
         if the resulting position count is below
@@ -599,6 +639,12 @@ class SessionRunner:
                     f"positions={positions}, "
                     f"replicas={plan.replicas_per_position}"
                 )
+                if apertures:
+                    self._announce_subsample_breakdown(
+                        apertures=apertures,
+                        plan=plan,
+                        positions=positions,
+                    )
                 return end_mm, plan
             ok = self.confirm(
                 f"\nJogged range ({abs(end_mm):.2f} mm) yields only "
@@ -721,6 +767,11 @@ class SessionRunner:
                         magnification=magnification,
                         widest_aperture=_parse_fnum(widest_aperture_str),
                         widest_aperture_str=widest_aperture_str,
+                        apertures=apertures,
+                    )
+                    # Rebuild subsample factor lookup from the new plan.
+                    self._subsample_factors = self._build_subsample_lookup(
+                        apertures, plan
                     )
                     continue
             break
@@ -823,6 +874,9 @@ class SessionRunner:
                     position_mm=position_mm,
                     aperture=aperture,
                 )
+                continue
+            if not self._should_capture(aperture, step_index):
+                # Off this aperture's subsample grid — silent skip.
                 continue
             cal = calibration.per_aperture[aperture]
             self._progress(
@@ -1184,6 +1238,9 @@ class SessionRunner:
         file_factory: Callable[[str], Path],
     ) -> None:
         for aperture in apertures:
+            if not self._should_capture(aperture, step_index):
+                # Off this aperture's subsample grid — silent skip.
+                continue
             cal = calibration.per_aperture[aperture]
             self._set_capture_settings(aperture, cal)
             self._wait_for_recycle()
@@ -1490,6 +1547,7 @@ class SessionRunner:
         magnification: float = 1.0,
         widest_aperture: float = 4.0,
         widest_aperture_str: str = "f/4",
+        apertures: list[str] | None = None,
     ) -> tuple[float, int, float, SamplePlan]:
         """Run the jog UI again, return rail to step 0, and rebuild
         the per-lens-config sharpness collector so the next sweep's
@@ -1505,6 +1563,7 @@ class SessionRunner:
             magnification=magnification,
             widest_aperture=widest_aperture,
             widest_aperture_str=widest_aperture_str,
+            apertures=apertures,
         )
         steps = plan.rail_positions or 0
         step_size_mm = math.copysign(plan.rail_step_mm, end_mm)
@@ -1634,6 +1693,10 @@ class SessionRunner:
             for aperture in apertures:
                 if skip_remainder:
                     # An inner reshoot already covered this step.
+                    continue
+                if not self._should_capture(aperture, step_index):
+                    # Off this aperture's subsample grid — original
+                    # sweep skipped it, so reshoot mirrors that.
                     continue
                 cal = calibration.per_aperture[aperture]
                 ev = self._capture_one(
@@ -1891,6 +1954,45 @@ class SessionRunner:
                 phase=phase,
                 notes="",
             )
+        )
+
+    def _announce_subsample_breakdown(
+        self,
+        *,
+        apertures: list[str],
+        plan: SamplePlan,
+        positions: int,
+    ) -> None:
+        """Print the per-aperture capture-count breakdown so the
+        user can sanity-check before committing to the sweep. Lists
+        each aperture's subsample factor, the resulting shot count,
+        and a total against the unsampled baseline."""
+        replicas = max(1, int(plan.replicas_per_position))
+        per_ap_lines: list[str] = []
+        total_shots = 0
+        for ap_str in apertures:
+            try:
+                ap_float = _parse_fnum(ap_str)
+            except ValueError:
+                factor = 1
+            else:
+                factor = max(1, int(plan.subsample_factors.get(ap_float, 1)))
+            shots = (positions + factor - 1) // factor   # ceil(positions/factor)
+            per_ap_total = shots * replicas
+            total_shots += per_ap_total
+            per_ap_lines.append(
+                f"    {ap_str:6s} ×{factor} → {shots} × {replicas} = {per_ap_total}"
+            )
+        unsampled_total = positions * replicas * len(apertures)
+        if unsampled_total > 0:
+            saved_pct = (1 - total_shots / unsampled_total) * 100
+        else:
+            saved_pct = 0.0
+        self._announce(
+            "  per-aperture (factor × shots × replicas):\n"
+            + "\n".join(per_ap_lines)
+            + f"\n  total: {total_shots} captures "
+            f"(vs {unsampled_total} unsampled — saves {saved_pct:.0f} %)"
         )
 
     def _announce(self, message: str) -> None:

@@ -578,6 +578,61 @@ class TestOffTarget:
             _run_one_lens_config(runner)
 
 
+# ---- Subsampling on the probe / extension path ---------------------------
+
+
+class TestProbeWithSubsampling:
+    """Probes / extensions also honour per-aperture subsample factors.
+    A probe at step_index=N is shot only by apertures whose factor
+    divides N. Smaller-aperture series stay sparse end-to-end."""
+
+    def test_smaller_aperture_skips_probes_off_its_grid(
+        self, cfg, tmp_path
+    ) -> None:
+        # 5-step main sweep at f/4 + f/8 with f/8 factor=2.
+        # Original sweep f/4 indices: 0,1,2,3,4 (factor 1).
+        # Original sweep f/8 indices: 0,2,4 (factor 2).
+        # Far-side probe shoots at step_index=5 first.
+        # f/4: 5 % 1 == 0 → captured.
+        # f/8: 5 % 2 == 1 → SKIPPED.
+        # Second probe at step_index=6.
+        # f/4: 6 % 1 == 0 → captured.
+        # f/8: 6 % 2 == 0 → captured.
+        # → expect 2 f/4 probe rows, 1 f/8 probe row.
+        camera = FakeCamera(apertures=["f/4", "f/8"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={
+                "lens": "L", "steps": 5, "end_mm": 20.0,
+                "subsample_factors": {4.0: 1, 8.0: 2},
+            },
+        )
+        # Force a probe by scripting peak_side='far' once, then ok.
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="far",
+                        needs_extension=True, notes="far"),
+            RangeResult(ok=True, peak_side="far",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket"),
+        ])
+        _run_one_lens_config(runner)
+        rows = runner.shots_csv.read_rows()
+        probe_rows = [r for r in rows if r["phase"] == "probe"]
+        f4_probe_steps = sorted(
+            int(r["rail_step"]) for r in probe_rows if r["aperture"] == "f/4"
+        )
+        f8_probe_steps = sorted(
+            int(r["rail_step"]) for r in probe_rows if r["aperture"] == "f/8"
+        )
+        # Both probe step indices captured at f/4.
+        assert f4_probe_steps == [5, 6]
+        # Only step 6 captured at f/8 (step 5 % 2 != 0 → skipped).
+        assert f8_probe_steps == [6]
+
+
 # ---- Step-index helper math -----------------------------------------------
 
 

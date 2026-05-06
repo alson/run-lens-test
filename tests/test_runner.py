@@ -253,6 +253,12 @@ def make_runner(
     ) -> SamplePlan:
         steps = inputs.get("steps", 3)
         step_size = rail_range_mm / max(1, steps - 1) if steps > 1 else rail_range_mm
+        # Tests can override subsample_factors via inputs to exercise
+        # the per-aperture skip logic; default is "no skip" so
+        # existing tests keep their pre-Phase-B behaviour.
+        factors = inputs.get(
+            "subsample_factors", {widest_aperture: 1}
+        )
         return SamplePlan(
             rail_step_mm=step_size,
             replicas_per_position=replicas,
@@ -260,7 +266,7 @@ def make_runner(
             estimated_fwhm_mm_widest=0.5,
             widest_aperture=widest_aperture,
             max_aperture=max_aperture,
-            subsample_factors={widest_aperture: 1},
+            subsample_factors=factors,
             rail_range_mm=rail_range_mm,
             rail_positions=steps,
         )
@@ -604,6 +610,144 @@ class TestCalibrationFailure:
         runner.run()
         # Calibration-failure prompt fired at least once.
         assert any("Calibration didn't reach" in p for p in prompts)
+
+
+class TestSubsampling:
+    """SamplePlan.subsample_factors are honoured at capture time.
+    Apertures whose factor doesn't divide the current step_index are
+    silently skipped — no shots.csv row, no replicas, no droop push."""
+
+    def test_skip_pattern_per_aperture(self, cfg, tmp_path) -> None:
+        # 6 rail positions, 2 apertures: f/4 (factor 1) + f/8 (factor 2).
+        # f/4 captures every step → 6 shots.
+        # f/8 captures step_index % 2 == 0 → steps 0, 2, 4 → 3 shots.
+        # Plus 2 calibration baseline shots (one per aperture; the
+        # widest-aperture shot at step 0 sets the baseline).
+        camera = FakeCamera(apertures=["f/4", "f/8"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={
+                "lens": "L", "steps": 6, "end_mm": 5.0,
+                "subsample_factors": {4.0: 1, 8.0: 2},
+            },
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        rows = runner.shots_csv.read_rows()
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        f4_rows = [r for r in sweep_rows if r["aperture"] == "f/4"]
+        f8_rows = [r for r in sweep_rows if r["aperture"] == "f/8"]
+        assert len(f4_rows) == 6
+        # f/8 only at step indices divisible by 2.
+        f8_steps = sorted(int(r["rail_step"]) for r in f8_rows)
+        assert f8_steps == [0, 2, 4]
+
+    def test_factor_default_one_for_unlisted_aperture(self, cfg, tmp_path) -> None:
+        # Camera offers f/4 + f/8 but plan.subsample_factors only
+        # lists f/4. f/8 falls back to factor 1 (no skip), the safe
+        # default. Both apertures get every step.
+        camera = FakeCamera(apertures=["f/4", "f/8"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={
+                "lens": "L", "steps": 4, "end_mm": 3.0,
+                "subsample_factors": {4.0: 1},  # f/8 omitted
+            },
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        rows = runner.shots_csv.read_rows()
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        # 4 steps × 2 apertures = 8 sweep rows (no skip).
+        assert len(sweep_rows) == 8
+
+    def test_zero_captures_at_aperture_when_factor_exceeds_steps(
+        self, cfg, tmp_path
+    ) -> None:
+        # f/8 with factor 10 on a 5-step sweep gets exactly 1 shot
+        # (step 0; 0 % 10 == 0). No other steps qualify.
+        camera = FakeCamera(apertures=["f/4", "f/8"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 20,
+            inputs={
+                "lens": "L", "steps": 5, "end_mm": 4.0,
+                "subsample_factors": {4.0: 1, 8.0: 10},
+            },
+        )
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        rows = runner.shots_csv.read_rows()
+        f8_sweep = [
+            r for r in rows
+            if r["phase"] == "sweep" and r["aperture"] == "f/8"
+        ]
+        assert len(f8_sweep) == 1
+        assert int(f8_sweep[0]["rail_step"]) == 0
+
+    def test_reshoot_honours_factors(self, cfg, tmp_path) -> None:
+        # Droop trips at step 4 f/4; reshoot covers steps 1..4.
+        # f/4 (factor 1) reshot at every step in range = 4 frames.
+        # f/8 (factor 2) reshot only at steps 2 and 4 = 2 frames.
+        camera = FakeCamera(apertures=["f/4", "f/8"])
+        rail = FakeRail()
+        # Medians: 1 cal + sweep + reshoot.
+        # Sweep: f/4 every step (5 steps) + f/8 every 2nd step (3 steps).
+        # f/4 medians: step 0=100, 1=100, 2=100, 3=25, 4=25 (last 2 are -2 EV → trip on step 4)
+        # f/8 medians: step 0=100, 2=100, 4=100
+        # The aperture loop order is f/4 first, f/8 second per aperture_sequence.
+        # Step 4: f/4 captured (median 25), droop pushes ev=-2 EV. Window has
+        # f/4 step 0=0, 1=0, 2=0, 3=-2, 4=-2 → 2 of 5 ≤ -2 → trip.
+        # earliest underexposed step = 3 (first -2 EV). Reshoot covers 3..4.
+        # f/4 reshoot steps 3, 4 (factor 1 → both qualify).
+        # f/8 reshoot: step 3 % 2 = 1 (skip), step 4 % 2 = 0 (capture).
+        # So 2 f/4 + 1 f/8 reshoot rows.
+        medians = [
+            100.0,                     # calibration baseline (f/4 step 0)
+            100.0,                     # cal f/8 step 0
+            100.0, 100.0,              # step 0: f/4, f/8
+            100.0,                     # step 1 f/4
+            100.0, 100.0,              # step 2: f/4, f/8
+            25.0,                      # step 3 f/4 (under-exposed)
+            25.0, 100.0,               # step 4: f/4 (TRIP), f/8
+            100.0, 100.0, 100.0,       # reshoot fillers
+        ]
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={
+                "lens": "L", "steps": 5, "end_mm": 4.0,
+                "subsample_factors": {4.0: 1, 8.0: 2},
+            },
+        )
+        runner.confirm = lambda _msg: True   # ENTER on droop prompt
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+        rows = runner.shots_csv.read_rows()
+        reshoot_rows = [r for r in rows if r["phase"] == "reshoot"]
+        f4_reshoot = sorted(
+            int(r["rail_step"]) for r in reshoot_rows if r["aperture"] == "f/4"
+        )
+        f8_reshoot = sorted(
+            int(r["rail_step"]) for r in reshoot_rows if r["aperture"] == "f/8"
+        )
+        # f/4 reshoot every step in 3..4
+        assert f4_reshoot == [3, 4]
+        # f/8 reshoot only on its grid (step%2==0)
+        assert f8_reshoot == [4]
 
 
 class TestMultiShot:
