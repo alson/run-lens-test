@@ -1304,14 +1304,37 @@ class SessionRunner:
             })
             return start_step_index + steps - 1
 
-        extension_mm = end_mm * float(
-            getattr(self.config, "RANGE_EXTENSION_FRACTION", 0.5)
-        )
-        # Per-side extension capacity in whole grid steps.
-        extension_steps = int(extension_mm // step_size_mm)
+        # Per-side extension target. Prefer the advisor's per-
+        # aperture extra_steps projection (max across truncated
+        # apertures) when available — it's a curve-fit estimate of
+        # how far past the captured edge the peak actually sits, far
+        # better than the static RANGE_EXTENSION_FRACTION budget
+        # whenever the truncation detector could fit something useful.
+        # When the advisor returns 0 (no truncation, OFF_TARGET, or
+        # the parabolic fit fell back without producing a real
+        # number), fall back to the static fraction-of-range budget.
+        # In either case cap at the original sweep length so a
+        # runaway projection can't extend more than doubling the
+        # rail range.
         configured_probe_count = int(
             getattr(self.config, "RANGE_CHECK_PROBE_STEPS", 2)
         )
+        budget_steps = int(
+            (end_mm * float(
+                getattr(self.config, "RANGE_EXTENSION_FRACTION", 0.5)
+            )) // step_size_mm
+        )
+        advisor_extra = int(getattr(result, "extra_steps_max", 0) or 0)
+        if advisor_extra > 0:
+            # Floor at probe count so we always have room for the
+            # configured probes; ceiling at the original sweep length
+            # to bound runaway projections.
+            extension_steps = max(
+                configured_probe_count, min(advisor_extra, steps)
+            )
+        else:
+            extension_steps = budget_steps
+        extension_mm = extension_steps * abs(step_size_mm)
         if extension_steps < 1:
             # Extension wouldn't fit a single grid step — nothing to
             # probe, nothing to extend. Trust the first-call decision

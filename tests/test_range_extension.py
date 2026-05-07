@@ -320,6 +320,127 @@ class TestBothExtension:
 # ---- Probe says peak still outside ----------------------------------------
 
 
+class TestExtraStepsRespected:
+    """``RangeResult.extra_steps_max`` overrides the default
+    ``RANGE_EXTENSION_FRACTION`` budget when the advisor populated
+    it. Floored at the configured probe count, ceiling-capped at
+    the original sweep length."""
+
+    def test_advisor_extra_steps_used_when_smaller_than_budget(
+        self, cfg, tmp_path
+    ) -> None:
+        # Big rail range gives a default budget of (60 mm × 0.5) /
+        # 10 mm/step = 3 extension slots. Advisor projects only 2
+        # extra steps for the actual peak. Runner should use 2, not
+        # 3 — saves a full grid-aligned shot per aperture per side.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"steps": 7, "end_mm": 60.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(
+                ok=False, peak_side="end_side",
+                needs_extension=True, extra_steps_max=2,
+                notes="advisor: extend by 2",
+            ),
+            RangeResult(
+                ok=True, peak_side="end_side",
+                needs_extension=False, peak_in_range_after_probe=True,
+                notes="brackets peak",
+            ),
+        ])
+        _run_one_lens_config(runner)
+
+        # 1 cal + 7 sweep + 2 probe + 0 extension follow-up = 10
+        # (advisor said 2, equal to probe count → no follow-up).
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 10
+
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["extension_applied"] is True
+        assert rc["extension_step_count"] == {"end_side": 0, "start_side": 0}
+
+    def test_advisor_extra_steps_used_when_larger_than_budget(
+        self, cfg, tmp_path
+    ) -> None:
+        # Small rail range gives a default budget of (20 × 0.5) / 10
+        # = 1 slot — the runner would normally cover only the probe
+        # and stop. Advisor projects 5 extra steps. Runner should
+        # use 5 (capped at original 3 steps via the safety ceiling).
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(
+                ok=False, peak_side="end_side",
+                needs_extension=True, extra_steps_max=5,
+                notes="advisor: extend by 5",
+            ),
+            RangeResult(
+                ok=True, peak_side="end_side",
+                needs_extension=False, peak_in_range_after_probe=True,
+                notes="brackets peak",
+            ),
+        ])
+        _run_one_lens_config(runner)
+
+        # Advisor=5 capped at original_steps=3 → extension_steps=3.
+        # 1 cal + 3 sweep + 2 probe + 1 extension follow-up = 7.
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 7
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        assert rc["extension_step_count"] == {"end_side": 1, "start_side": 0}
+
+    def test_falls_back_to_static_budget_when_advisor_zero(
+        self, cfg, tmp_path
+    ) -> None:
+        # extra_steps_max=0 (advisor didn't populate, e.g. legacy
+        # RangeResult). Runner should use the existing
+        # RANGE_EXTENSION_FRACTION budget.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 30,
+            inputs={"steps": 7, "end_mm": 60.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(
+                ok=False, peak_side="end_side",
+                needs_extension=True, extra_steps_max=0,
+                notes="no advisor signal",
+            ),
+            RangeResult(
+                ok=True, peak_side="end_side",
+                needs_extension=False, peak_in_range_after_probe=True,
+                notes="brackets peak",
+            ),
+        ])
+        _run_one_lens_config(runner)
+
+        # Static fallback: budget = (60 × 0.5) / 10 = 3 slots.
+        # 1 cal + 7 sweep + 2 probe + 1 extension follow-up = 11.
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 11
+
+
 class TestProbeFails:
     def test_no_extension_user_prompted(self, cfg, tmp_path) -> None:
         # User picks 'skip' at the range-inadequate prompt → keep

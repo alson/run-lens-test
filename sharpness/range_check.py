@@ -155,6 +155,13 @@ class SharpnessRangeChecker(RangeChecker):
             apertures=apertures, dataset=dataset, step_size_mm=step_size_mm
         )
         notes = self._summarise(recs)
+        # Max across truncated apertures of the per-aperture
+        # extra_steps projection. Untruncated apertures' extra_steps
+        # is 0 by construction, so a simple max() over all values
+        # picks up only the actual truncation projections.
+        extra_steps_max = max(
+            (r.extra_steps for r in recs.values()), default=0
+        )
         return RangeResult(
             ok=verdict_ok,
             peak_side=peak_side,
@@ -163,6 +170,7 @@ class SharpnessRangeChecker(RangeChecker):
             notes=notes,
             all_off_target=all_off_target,
             per_aperture=per_aperture,
+            extra_steps_max=extra_steps_max,
         )
 
     @staticmethod

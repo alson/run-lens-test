@@ -83,6 +83,21 @@ class RangeResult:
     per_aperture: list[ApertureCurve] = field(default_factory=list)
     """The curves the detector built; useful for diagnostics."""
 
+    extra_steps_max: int = 0
+    """Maximum across truncated apertures of the detector's per-
+    aperture ``extra_steps`` projection — i.e. the largest number
+    of rail steps any single aperture's truncated crop wants the
+    runner to extend by. ``0`` when no aperture is truncated or the
+    detector didn't populate the field.
+
+    The runner uses this to size its probe-and-extend budget so
+    extending past the captured END/START matches the curve-fit
+    projection from :func:`sharpness.detect.extra_steps_needed`,
+    rather than always using a static ``RANGE_EXTENSION_FRACTION``
+    of the original range. The static budget is still applied as a
+    fallback when ``extra_steps_max == 0`` and as a safety floor /
+    ceiling around the advisor's number."""
+
 
 class RangeChecker:
     """Decides whether a captured rail range bracketed the peak
