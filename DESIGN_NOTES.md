@@ -1086,3 +1086,185 @@ so the user can enter a focus-position description and the
 planner derives M from the table. The current setup is "user
 types the magnification and the planner trusts it", which works
 fine as long as the reshoot-plan menu entries are accurate.
+
+### 6.20 Live cropping pipeline: ProcessPool + libjpeg-turbo
+
+The live `LiveCollector` originally used a `ThreadPoolExecutor`
+of 4 workers wrapping PIL/Pillow's JPEG decode/encode. PIL links
+libjpeg-turbo on this system, but the pipeline still bottlenecked
+because (a) only one worker was actually busy most of the time
+(cropping finished inside the flash recycle so the queue stayed at
+depth 1), and (b) the GIL serialised the Python-side dispatch
+between encodes, capping thread scaling at ~3× past 4 workers.
+
+Two changes pushed per-shot wall-clock from 154 ms (PIL +
+thread×4) to 89 ms (process×8 + libjpeg-turbo) on the bench
+i5-8350U with a real 45 MP Z7 JPEG, 17 crops/shot:
+
+1. **`executor_kind="process"`** + worker pre-warm. The collector
+   now defaults its production wiring to a `ProcessPoolExecutor`,
+   submitting a no-op task per worker at construction so the
+   fork/spawn cost lands once, not on the first real shot.
+   Refactor: the per-shot worker is a top-level `_crop_worker`
+   function (picklable), and result merging happens via a
+   `Future.add_done_callback` hook on the main process.
+2. **`PyTurboJPEG` cropper rewrite**. Direct libjpeg-turbo via
+   the `turbojpeg` ctypes wrapper: decode the source JPEG once
+   into a numpy ndarray, slice each crop with a numpy view, encode
+   each slice back to JPEG bytes. Same codec PIL was already
+   linking, but minus the `Image` allocations and dispatch.
+
+Notable: with libjpeg-turbo direct, threads scale almost as well
+as processes (88 ms thread×8 vs 89 ms process×8). The GIL is no
+longer the bottleneck. Production stays on processes for worker
+isolation, but threads are a viable lower-memory alternative if
+RAM pressure ever becomes an issue (RSS difference is ~50 MB per
+process worker).
+
+Output-size note: at the same nominal `quality=92`, libjpeg-turbo
+produces files ~10–17 % larger than PIL because PIL applies a
+small extra optimization step that turbojpeg's default encode
+doesn't. The file-size-as-sharpness proxy stays valid as long as
+every shot in a session uses the same encoder + quality — the
+proxy is monotonic in scene detail, not calibrated to an absolute
+byte count.
+
+A single `TurboJPEG` instance per (process, thread) is enough;
+the wrapper holds a libturbojpeg handle that's a few KB of native
+state. The cropper caches via `threading.local` so process-pool
+workers each get their own thread-local instance on first call.
+
+### 6.21 Multi-crop advisor with dynamic-range validity gate
+
+The advisor originally drove every per-aperture verdict from the
+**center** crop alone. The cropper produces 17 crops per shot
+(centre + 4 edges + 4 corners + DX-frame variants), but the
+extra 16 were persisted to disk for offline analysis and never
+fed back into the live decision. Two consequences:
+
+1. **Field curvature was invisible.** Corner peaks legitimately
+   sit at a different rail step than the centre (focus shifts
+   across the frame). With the centre as sole oracle, the
+   advisor's verdict was "OK" any time the centre peaked inside
+   the captured range — even when the corners were truncated
+   past the captured END (or START).
+2. **Field curvature on opposite sides → "both" peak_side**. If
+   one corner truncates past END and the opposite past START, no
+   single direction extension covers both — the runner needs to
+   extend bilaterally. That's now a real cascade-output value.
+
+`advise()` now iterates `CROP_NAMES = CROP_NAMES_FULL_FRAME +
+CROP_NAMES_DX` (17 crops) and runs detection per crop. A per-
+aperture aggregate combines the crop verdicts:
+
+* **Verdict**: NEEDS_RESHOOT if any valid crop is truncated;
+  else OK if any has a real peak; else OFF_TARGET.
+* **Direction** (per-aperture): union over valid truncated
+  crops; mixed TRUNCATED_START + TRUNCATED_END collapses to
+  `Direction.BOTH`, which `SharpnessRangeChecker._aggregate_peak_side`
+  maps to `peak_side="both"`.
+* **Extra steps**: max across valid truncated crops.
+
+**Validity gate** for "out of frame / off the wafer". The wafer
+doesn't necessarily fill the frame, so corner crops can fall onto
+featureless background. Their JPEG file size barely moves across
+the sweep — signature is dynamic range
+`(max - min) / max < threshold`. New
+`SHARPNESS_CROP_DYNAMIC_RANGE_MIN = 0.25` in `config.py` declares
+those crops invalid for the aperture and excludes them from the
+verdict and from the cross-compare. Defocused-but-on-wafer crops
+swing 0.33–0.44; 0.25 sits below that band and well above
+empty-frame noise (≤ 0.10).
+
+`Recommendation` gains:
+- `valid_crops`, `invalid_crops` iterators
+- `per_crop()` dict for keyed lookup
+- `truncated_crops` / `off_target_crops` filter on `valid`
+
+`CropAnalysis` gains `valid: bool` and `dynamic_range: float`.
+
+### 6.22 Cross-compare threshold tuned for live shooting
+
+`DEFAULT_OFF_TARGET_FACTOR` was 0.65, inherited from the offline
+`rail-coverage` analyser where the wafer often didn't cover the
+corners — a corner peaking below 65 % of centre was strong
+evidence the crop fell off the subject.
+
+In the live shooting context the wafer fills the frame at >1:1
+mag, so corners are real measurements. Their peaks legitimately
+land at 30–60 % of centre because of corner softness and field
+curvature. Empirical post-hoc multi-crop check on
+`2026-05-06_175727` (61 mm extension) and `2026-05-06_200150`
+(diopters): 12–15 corners per aperture flagged OFF_TARGET at 0.65,
+all with valid bell shapes. That hid genuine truncation signal
+and false-flagged perfectly fine soft corners.
+
+Lowered to **0.25**: well below the lowest legitimate corner peak
+ratio observed on this rig, but still catches crops with peaks
+materially below the dynamic-range floor. The dynamic-range gate
+at 0.25 catches the off-wafer cases the cross-compare used to
+also catch; the two now do different jobs.
+
+Surfacing change: `range_check.json`'s `notes` field now uses
+`Recommendation.summary()` per aperture (instead of a one-liner),
+so when corners are flagged the user sees per-crop detail:
+`"f/4.5: NEEDS_RESHOOT — extend in BOTH directions by ~5 rail
+step(s); truncated crops: top-left, bottom-right"` and the
+`[N invalid crops: top-right 16%, ...]` suffix when any failed
+the dynamic-range gate.
+
+### 6.23 Droop reshoot off-by-one — always reshoot the current step
+
+`_handle_droop`'s "should we rewind?" check was
+`restart_step < current_step_index` (strictly less than). When
+droop tripped on the current step's shots and no earlier step in
+the rolling window was under-exposed, `restart_step ==
+current_step_index` and the strict `<` was false — the runner
+just paused for the battery swap, reset the droop window, and
+continued, **leaving the under-exposed JPEG and CSV row on disk**.
+
+Symptom: in the user's traces, most droop trips just continued
+without reshooting; only trips whose rolling window also
+contained a previously-bad step (typical of moderate trips with
+gradual drift) actually fired the reshoot.
+
+Fixed: any droop trip now reshoots at least the current step's
+apertures, with the rewind extending backward when earlier
+under-exposed steps are present in the window. `_handle_droop`
+unconditionally returns `True` since reshoot covers the current
+step. `_reshoot_steps` drops the stale sweep / aborted / reshoot
+rows for the rewind range before writing fresh reshoot rows; the
+on-disk JPEGs get overwritten by deterministic step-numbered
+filenames.
+
+**Replica resilience footnote**: post-hoc multi-crop recheck on
+the in-flight 35 mm extension session showed that even with 7
+under-exposed shots not auto-reshot (5 sub-1 EV, 2 catastrophic
+−15 EV), the per-(step, aperture) median over 3 replicas absorbed
+the outliers — the advisor's verdicts changed by at most 1 step
+between with-bad-shots and without-bad-shots datasets. So the
+bug fix matters more for record-keeping integrity (CSV rows
+matching JPEGs that match exposure intent) than for the actual
+sharpness analysis. Triple-replica was a good resilience
+investment.
+
+### 6.24 peak_side step-space labels: start_side / end_side
+
+The `peak_side` literal originally used `"near"` and `"far"` —
+terms that read as physical-direction labels but actually live
+in step-index space: `"near"` = past step 0 (extend before
+START), `"far"` = past step N (extend past END). The label
+aligned with the user's physical-direction mental model only
+when they jogged START at the near-subject end and END at the
+far-subject end. Jog the other way and the label inverts vs the
+mental model — confusing.
+
+Renamed to `"start_side"` / `"end_side"`, which carry no physical
+direction connotation. The rail-position math
+(`target = step_index * step_size_mm`) was already direction-
+agnostic; this is a pure naming clarity change. `"both"` and
+`"centered"` are unchanged.
+
+Older `range_check.json` files with `"near"`/`"far"` keep their
+old values; nothing in the code path reads them back, so no
+on-disk-compatibility shim needed.

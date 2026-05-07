@@ -291,9 +291,18 @@ All tunable constants are at the top of `config.py`. Notable ones:
   start-side extensions where step indices go negative (default
   offset 100, width 4 → `step_0099.jpg` for step −1,
   `step_0100.jpg` for step 0, etc.).
-- `SHARPNESS_MAX_WORKERS` — concurrent crop workers (default 4).
+- `SHARPNESS_MAX_WORKERS` — concurrent crop workers (default 8;
+  matches a typical laptop's logical-core count). Production uses
+  a `ProcessPoolExecutor` with these workers and direct
+  libjpeg-turbo via `PyTurboJPEG`; per-shot crop time on the
+  bench rig is ~89 ms for 17 crops at 45 MP.
 - `SHARPNESS_CROPPED_DIRNAME` — subdir name under each
   `<lens>/<aperture>/` where the 17 crops are persisted.
+- `SHARPNESS_CROP_DYNAMIC_RANGE_MIN` — per-crop validity floor
+  (default 0.25). A crop whose `(max - min) / max` size series
+  falls below this is treated as "off the wafer" and excluded
+  from the per-aperture verdict. Defocused-but-on-wafer crops
+  swing 0.33–0.44, so 0.25 is comfortably below.
 - `OUTPUT_ROOT` — where session directories are created.
 - `NTFY_TOPIC` / `NTFY_BASE_URL` — ntfy.sh topic + endpoint. Set the
   topic once per laptop.
@@ -303,9 +312,17 @@ All tunable constants are at the top of `config.py`. Notable ones:
 - `CROP_*_FRAC` — central-crop position and size on the wafer.
 - `ROLLING_WINDOW`, `DROOP_CRIT_A`, `DROOP_CRIT_B` — droop detector
   window length + the two trip criteria
-  (default: 3-of-10 ≤ −0.7 EV OR 2-of-10 ≤ −2.0 EV).
+  (default: 1 severe shot ≤ −2.0 EV OR 2-of-10 ≤ −0.7 EV).
+  The detector pools shots session-wide so consecutive
+  under-exposed shots at *different* apertures still trip the
+  moderate criterion. On any trip the runner reshoots at least
+  the current step's apertures (rewinding further when earlier
+  steps in the window are also under-exposed).
 - `RANGE_CHECK_ENABLED`, `RANGE_EXTENSION_FRACTION`,
-  `RANGE_CHECK_PROBE_STEPS` — auto-extension behaviour.
+  `RANGE_CHECK_PROBE_STEPS` — auto-extension behaviour. The
+  multi-crop advisor checks all 17 crops per aperture; field
+  curvature where corners truncate on opposite sides maps to
+  `peak_side="both"` and triggers bilateral extension.
 
 ## Troubleshooting
 
