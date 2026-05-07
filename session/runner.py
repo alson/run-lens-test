@@ -1489,33 +1489,41 @@ class SessionRunner:
         # Don't let the multi-minute battery swap poison the ETA EWMA.
         self._eta_invalidate()
         # Find the earliest step (across all apertures) whose EV ≤
-        # the firing trip threshold. That's the first under-exposed
-        # shot we trust the user wants to overwrite with a fresh
-        # capture. ``window_snapshot`` is the firing aperture's
-        # window only; ``earliest_underexposed_step`` consults all.
+        # the firing trip threshold. ``window_snapshot`` is the
+        # firing aperture's window only; ``earliest_underexposed_step``
+        # consults all. We always reshoot at least the current step:
+        # the trip means we just captured an under-exposed frame
+        # here, and leaving it on disk would pollute the sharpness
+        # dataset. If the window also contains earlier under-exposed
+        # steps (typical of moderate trips that drift in over a few
+        # shots), rewind further to cover those too.
         restart_step = droop.earliest_underexposed_step(event.threshold)
-        reshot_current_step = (
-            restart_step is not None and restart_step < current_step_index
-        )
-        if reshot_current_step:
-            # Reset the droop window before recursing so the nested
-            # reshoot starts from a clean slate; if its captures are
-            # still under-exposed the new samples will trip droop
-            # again and recurse further.
-            droop.reset_all()
-            self._reshoot_steps(
-                lens_dir=lens_dir,
-                slug=slug,
-                from_step=restart_step,
-                through_step=current_step_index,
-                from_position_mm=current_position_mm,
-                step_size_mm=step_size_mm,
-                apertures=apertures,
-                calibration=calibration,
-                droop=droop,
-            )
+        if restart_step is None or restart_step > current_step_index:
+            # Defensive: trip implies at least one push ≤ threshold,
+            # so restart_step should always be <= current_step_index.
+            # Fall back to current step if the search came up empty.
+            restart_step = current_step_index
+        # Reset the droop window before reshooting so the nested
+        # reshoot starts from a clean slate; if its captures are
+        # still under-exposed the new samples will trip droop again
+        # and recurse further.
         droop.reset_all()
-        return reshot_current_step
+        self._reshoot_steps(
+            lens_dir=lens_dir,
+            slug=slug,
+            from_step=restart_step,
+            through_step=current_step_index,
+            from_position_mm=current_position_mm,
+            step_size_mm=step_size_mm,
+            apertures=apertures,
+            calibration=calibration,
+            droop=droop,
+        )
+        droop.reset_all()
+        # Reshoot now always covers the current step's apertures,
+        # so the caller can skip the rest of its inner aperture
+        # loop unconditionally.
+        return True
 
     def _handle_calibration_failure(
         self,

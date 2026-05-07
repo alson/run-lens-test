@@ -1159,24 +1159,27 @@ class TestDroopPause:
         # SHOTS_PER_STEP_APERTURE=3. Replica 0 at step 1 is severely
         # under-exposed (median 25 → ≈-4.4 EV) → severe criterion
         # trips on the very first push. Replicas 1 and 2 must NOT be
-        # captured: the runner should short-circuit at the first
-        # trip, prompt for batteries, and only then re-shoot.
+        # captured: the runner short-circuits at the first trip,
+        # prompts for batteries, then reshoots step 1 with fresh
+        # batteries (any droop trip overwrites at least the current
+        # step's apertures).
         cfg.SHOTS_PER_STEP_APERTURE = 3
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         # Single aperture, 3-step sweep.
         # Step 0: 3 replicas at 100 (clean).
         # Step 1: replica 0 = 25 (severe trip, no more replicas).
-        # _handle_droop: earliest=1, current=1 → no reshoot, just
-        #   prompt + reset. Inner loop sets aborted=True. f/4 was
-        #   the only aperture.
+        # _handle_droop: restart_step=1, current=1 → reshoot just
+        #   step 1 (3 fresh replicas).
         # Step 2: 3 replicas at 100 (clean).
         medians = [
             100.0,                     # cal f/4
             # Step 0 (3 replicas):
             100.0, 100.0, 100.0,
-            # Step 1 (only replica 0 captured before trip):
+            # Step 1 sweep (replica 0 captured before trip):
             25.0,
+            # Step 1 reshoot (3 replicas, fresh batteries):
+            100.0, 100.0, 100.0,
             # Step 2 (clean again, 3 replicas):
             100.0, 100.0, 100.0,
         ]
@@ -1193,17 +1196,27 @@ class TestDroopPause:
         runner.run()
 
         rows = runner.shots_csv.read_rows()
-        # Step 1 sweep rows: only replica 0 was captured before trip
-        # short-circuited the rest.
+        # The single under-exposed sweep row at step 1 (replica 0,
+        # captured before the short-circuit) is dropped by
+        # _reshoot_steps before the reshoot writes its fresh rows —
+        # otherwise the stale row would point at a JPEG that the
+        # reshoot is about to overwrite. So the only step-1 rows
+        # remaining are the 3 reshoot replicas.
         step1_sweep = [
             r for r in rows
             if r["phase"] == "sweep" and int(r["rail_step"]) == 1
         ]
-        assert len(step1_sweep) == 1
+        assert len(step1_sweep) == 0
+        step1_reshoot = [
+            r for r in rows
+            if r["phase"] == "reshoot" and int(r["rail_step"]) == 1
+        ]
+        assert len(step1_reshoot) == 3
         # Total capture events for the session:
-        # 1 cal + 3 step 0 + 1 step 1 (short-circuit) + 3 step 2 = 8.
+        # 1 cal + 3 step 0 + 1 step 1 sweep (short-circuit) + 3 step 1
+        # reshoot + 3 step 2 = 11.
         capture_count = sum(1 for k, _ in camera.history if k == "capture")
-        assert capture_count == 8
+        assert capture_count == 11
 
     def test_resume_reshoots_from_first_underexposed_step(
         self, cfg, tmp_path
