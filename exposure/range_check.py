@@ -21,11 +21,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-PeakSide = Literal["near", "far", "both", "centered"]
+PeakSide = Literal["start_side", "end_side", "both", "centered"]
 """Side of the captured rail range the peak sharpness was detected on.
 
-* ``"near"`` — peak is at the position-0 end; runner extends backwards.
-* ``"far"`` — peak is at the END_MM end; runner extends forwards.
+* ``"start_side"`` — peak is at the position-0 end; runner extends backwards.
+* ``"end_side"`` — peak is at the END_MM end; runner extends forwards.
 * ``"both"`` — different apertures peaked on different sides (focus
   shift); runner extends bilaterally.
 * ``"centered"`` — peak is comfortably inside the captured range; no

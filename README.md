@@ -238,8 +238,9 @@ Per-session directory under `OUTPUT_ROOT`, named with a timestamp:
 
 * **Filename → step_index**: `STEP_NUMBER_OFFSET = 100`, so
   `step_0100.jpg` = step_index 0, `step_0099.jpg` = step_index −1
-  (near-side extension), `step_0107.jpg` = step_index 7 (far-side
-  extension). Phase (sweep / probe / extension / reshoot) lives in
+  (start-side extension, before step 0), `step_0107.jpg` =
+  step_index 7 (end-side extension, past the original step count).
+  Phase (sweep / probe / extension / reshoot) lives in
   `shots.csv`'s `phase` column, not the filename — the same
   `step_NNNN.jpg` is reused across phases (file gets overwritten in
   place on a reshoot).
@@ -287,8 +288,9 @@ All tunable constants are at the top of `config.py`. Notable ones:
   replicas via per-crop median before peak detection. Set to 1 to
   revert to single-shot.
 - `STEP_NUMBER_OFFSET` / `STEP_NUMBER_WIDTH` — filename layout for
-  near-side extensions (default offset 100, width 4 → `step_0099.jpg`
-  for step −1, `step_0100.jpg` for step 0, etc.).
+  start-side extensions where step indices go negative (default
+  offset 100, width 4 → `step_0099.jpg` for step −1,
+  `step_0100.jpg` for step 0, etc.).
 - `SHARPNESS_MAX_WORKERS` — concurrent crop workers (default 4).
 - `SHARPNESS_CROPPED_DIRNAME` — subdir name under each
   `<lens>/<aperture>/` where the 17 crops are persisted.

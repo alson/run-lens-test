@@ -50,6 +50,7 @@ from session.log import (
     completed_slugs,
     write_json,
 )
+from session.probe import PhaseAResult, phase_a_peaks, phase_c_window_mm
 from stackshot.controller import StackShotController
 from stackshot.protocol import Direction
 from sharpness.planner import SamplePlan, plan_sweep
@@ -766,38 +767,101 @@ class SessionRunner:
         # raises ``_RejogRequested`` to bring us back here with a
         # fresh range, fresh collector, and the rail back at step 0.
         # Calibration is preserved across re-jogs.
+        probe_enabled = bool(getattr(self.config, "PROBE_ENABLED", False))
         while True:
+            # Phase A (when probe enabled) collapses the user's wide
+            # jog to a sparse single-aperture probe pass. The
+            # phase-C window is computed from the observed crop-peak
+            # bracket; on inconclusive phase A we fall back to the
+            # uniform sweep below.
+            phase_c_start = 0
+            phase_c_steps = steps
+            phase_a_result: PhaseAResult | None = None
+            if probe_enabled:
+                widest_aperture_str = apertures[0]
+                phase_a_result = self._run_phase_a(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    end_mm=end_mm,
+                    widest_aperture=widest_aperture_str,
+                    calibration=cal_result,
+                    n_probes=int(getattr(
+                        self.config, "PROBE_PHASE_A_POINTS", 7
+                    )),
+                )
+                phase_c_plan = self._plan_phase_c(
+                    phase_a_result,
+                    end_mm=end_mm,
+                    rail_step_mm=plan.rail_step_mm,
+                    fwhm_mm=plan.estimated_fwhm_mm_widest,
+                    n_probes=int(getattr(
+                        self.config, "PROBE_PHASE_A_POINTS", 7
+                    )),
+                    padding_x_fwhm=float(getattr(
+                        self.config, "PROBE_PHASE_C_FWHM_PADDING", 1.5
+                    )),
+                )
+                if phase_c_plan is None:
+                    self._announce(
+                        "Phase A inconclusive — falling back to "
+                        "uniform sweep across the user-jogged range."
+                    )
+                    # Retract to rail-zero, then run today's sweep.
+                    self._return_rail_to_zero(end_mm)
+                else:
+                    phase_c_start, phase_c_steps = phase_c_plan
+                    target_mm = phase_c_start * step_size_mm
+                    self._announce(
+                        f"Phase C: {phase_c_steps} steps × {len(apertures)} "
+                        f"apertures from step {phase_c_start} "
+                        f"({target_mm:+.3f} mm) — "
+                        f"corner spread "
+                        f"{phase_a_result.corner_spread_samples:.2f} "
+                        f"phase-A samples."
+                    )
+                    # Single retract from end_mm to phase_c_start * step_size_mm
+                    # with backlash compensation — the only direction reversal
+                    # in the whole probe.
+                    self._move_to(end_mm, target_mm)
+
             self._announce(
-                f"Sweeping {slug}: {steps} steps × {len(apertures)} apertures..."
+                f"Sweeping {slug}: {phase_c_steps} steps × "
+                f"{len(apertures)} apertures..."
             )
             # Reset ETA tracking for the new sweep — earlier
-            # calibration intervals are not representative.
+            # calibration / phase-A intervals are not representative.
             self._eta_sweep_apertures = tuple(apertures)
-            self._eta_sweep_step_count = steps
+            self._eta_sweep_step_count = phase_c_steps
             self._eta_lens_interval_sum = 0.0
             self._eta_lens_interval_count = 0
             self._eta_last_shot_at = None
             self._run_sweep(
                 lens_dir=lens_dir,
                 slug=slug,
-                steps=steps,
+                steps=phase_c_steps,
                 step_size_mm=step_size_mm,
                 calibration=cal_result,
                 apertures=apertures,
+                start_step_index=phase_c_start,
             )
 
-            forward_steps_done = steps - 1
+            # range-check end_mm: signed extent of the *captured*
+            # window. For the uniform sweep that's the user's jog;
+            # for phase C it's the narrower phase-C span.
+            range_check_end_mm = (phase_c_steps - 1) * step_size_mm
+            forward_steps_done = phase_c_start + phase_c_steps - 1
             if self.range_checker is not None:
                 self._announce("Range check (waiting on sharpness crops)...")
                 try:
                     forward_steps_done = self._run_range_check_and_extend(
                         lens_dir=lens_dir,
                         slug=slug,
-                        end_mm=end_mm,
+                        end_mm=range_check_end_mm,
                         step_size_mm=step_size_mm,
-                        steps=steps,
+                        steps=phase_c_steps,
                         calibration=cal_result,
                         apertures=apertures,
+                        start_step_index=phase_c_start,
                     )
                 except _RejogRequested:
                     # User wants new START / END; rewind, recreate
@@ -805,7 +869,9 @@ class SessionRunner:
                     widest_aperture_str = apertures[0]
                     end_mm, steps, step_size_mm, plan = self._rejog_for_lens_config(
                         lens_dir=lens_dir,
-                        current_position_mm=(steps - 1) * step_size_mm,
+                        current_position_mm=(
+                            phase_c_start + phase_c_steps - 1
+                        ) * step_size_mm,
                         slug=slug,
                         magnification=magnification,
                         widest_aperture=_parse_fnum(widest_aperture_str),
@@ -821,7 +887,9 @@ class SessionRunner:
 
         # Return rail to 0 for the next lens config (backlash on; we
         # may have moved into negative territory if the extension was
-        # on the 'near' side).
+        # on the 'start_side' side). ``forward_steps_done`` is the absolute
+        # step index from rail-zero — always correct to multiply by
+        # ``step_size_mm`` to get the retract distance.
         if forward_steps_done != 0:
             self._announce("Returning rail to start...")
             self._return_rail_to_zero(forward_steps_done * step_size_mm)
@@ -860,7 +928,22 @@ class SessionRunner:
         step_size_mm: float,
         calibration: CalibrationResult,
         apertures: list[str],
+        start_step_index: int = 0,
     ) -> None:
+        """Forward sweep across ``steps`` rail positions.
+
+        ``start_step_index`` is the integer index used for the first
+        captured position. The default 0 matches the user-jog flow:
+        rail is at position 0, step_index runs 0..steps-1, and
+        ``rail_position_mm`` recorded in shots.csv is
+        ``step_index × step_size_mm`` (== absolute rail-mm from
+        rail-zero). The probe (phase-C) flow passes a non-zero start
+        so the file step numbers and shots.csv positions stay anchored
+        to rail-zero — phase C starts at e.g. step 60, not step 0,
+        so its file numbers (``step_0160.jpg`` etc.) don't collide
+        with phase A's and downstream analysis sees absolute rail
+        positions consistently.
+        """
         droop = self.droop_detector or DroopDetector(
             window=self.config.ROLLING_WINDOW,
             criteria=(self.config.DROOP_CRIT_A, self.config.DROOP_CRIT_B),
@@ -874,8 +957,9 @@ class SessionRunner:
             Direction.FORWARD if step_size_mm >= 0 else Direction.BACKWARD
         )
         sweep_step_distance = abs(step_size_mm)
-        for step_index in range(steps):
-            if step_index > 0:
+        end_step_index = start_step_index + steps
+        for step_index in range(start_step_index, end_step_index):
+            if step_index > start_step_index:
                 self.rail.move_and_wait(
                     sweep_direction, sweep_step_distance, backlash=False
                 )
@@ -894,6 +978,183 @@ class SessionRunner:
         # Newline so the next print() output doesn't overwrite the
         # final progress line.
         self._progress_done()
+
+    # ---- Coarse-to-fine focus probe ------------------------------------
+
+    def _run_phase_a(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        end_mm: float,
+        widest_aperture: str,
+        calibration: CalibrationResult,
+        n_probes: int,
+    ) -> PhaseAResult:
+        """Phase A: sparse forward sweep at the widest aperture only.
+
+        Captures ``n_probes`` evenly-spaced positions across the
+        user-jogged range ``[0, end_mm]``, single replica each, with
+        all 17 crops cropped via a *separate* phase-A LiveCollector
+        rooted at ``<lens_dir>/probe/``. Phase A samples never enter
+        the per-lens collector that drives phase D, so the range
+        check sees only the phase-C dataset.
+
+        Pre: rail is at rail-position 0.
+        Post: rail is at ``end_mm`` (the last probe position).
+        Returns the PhaseAResult; on inconclusive results the caller
+        should fall back to today's uniform-sweep flow.
+        """
+        if n_probes < 3:
+            raise ValueError(f"n_probes must be ≥ 3, got {n_probes}")
+        # Phase-A captures live under <lens_dir>/probe/ so they don't
+        # mix with phase-C files in the same crop subtree, and the
+        # phase-A collector cropping output goes to
+        # <lens_dir>/probe/cropped/<crop>/. The directory is created
+        # on first capture (collector handles that).
+        probe_dir = lens_dir / "probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        probe_collector = self.sharpness_collector_factory(probe_dir)
+        widest_ap_value = _parse_fnum(widest_aperture)
+        cal = calibration.per_aperture[widest_aperture]
+
+        # Spacing across the user's jog. Sign is preserved so we move
+        # FORWARD when end_mm > 0, BACKWARD otherwise.
+        spacing_mm = end_mm / (n_probes - 1)
+        sweep_direction = (
+            Direction.FORWARD if spacing_mm >= 0 else Direction.BACKWARD
+        )
+        spacing_distance = abs(spacing_mm)
+
+        previous_collector = self._sharpness_collector
+        self._sharpness_collector = probe_collector
+        try:
+            self._announce(
+                f"Phase A: {n_probes} probes at {widest_aperture} across "
+                f"{end_mm:+.2f} mm jog ..."
+            )
+            for probe_index in range(n_probes):
+                if probe_index > 0:
+                    self.rail.move_and_wait(
+                        sweep_direction, spacing_distance, backlash=False
+                    )
+                position_mm = probe_index * spacing_mm
+                self._set_capture_settings(widest_aperture, cal)
+                self._wait_for_recycle()
+                # Probe captures use a small offset-free filename so
+                # they don't accidentally collide with the main sweep's
+                # offset+step naming. The probe subdir keeps them
+                # isolated regardless.
+                ap_subdir = self._aperture_subdir(widest_aperture)
+                dest = probe_dir / ap_subdir / step_filename(
+                    probe_index,
+                    offset=int(getattr(self.config, "STEP_NUMBER_OFFSET", 100)),
+                    width=int(getattr(self.config, "STEP_NUMBER_WIDTH", 4)),
+                )
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                self._last_capture_started_at = self.monotonic()
+                self._last_capture_aperture = widest_aperture
+                self.camera.capture_to(dest)
+                self._record_sharpness(
+                    step_index=probe_index, aperture=widest_aperture, dest=dest,
+                )
+                median = self._measure(dest)
+                ev = ev_delta(median, self.baseline_median or median)
+                self._log_shot(
+                    slug=slug,
+                    step_index=probe_index,
+                    position_mm=position_mm,
+                    aperture=widest_aperture,
+                    cal=cal,
+                    median=median,
+                    ev=ev,
+                    filename=str(dest.relative_to(lens_dir)),
+                    phase=Phase.PROBE,
+                )
+            # Drain crops so the collector dataset is complete.
+            probe_collector.wait_for_pending()
+            dataset = probe_collector.snapshot() if hasattr(
+                probe_collector, "snapshot"
+            ) else None
+            if dataset is None:
+                # Test-fake collectors may not implement snapshot().
+                # That path can't run real phase A — return an
+                # inconclusive result and let the caller fall back.
+                return PhaseAResult(inconclusive=True)
+            # Build {crop_name: [size_at_probe_0, ...]} ordered by probe index.
+            agg = dataset.aggregated()
+            crop_names: set[str] = set()
+            for s in agg.samples:
+                crop_names.update(s.sizes.keys())
+            crop_sizes: dict[str, list[int]] = {}
+            for name in sorted(crop_names):
+                series = [
+                    size for _step, size in agg.crop_series_for(widest_ap_value, name)
+                ]
+                if len(series) == n_probes:
+                    crop_sizes[name] = series
+            if not crop_sizes:
+                return PhaseAResult(inconclusive=True)
+            return phase_a_peaks(
+                crop_sizes,
+                dynamic_range_min=getattr(
+                    self.config, "SHARPNESS_CROP_DYNAMIC_RANGE_MIN", 0.25
+                ),
+            )
+        finally:
+            try:
+                probe_collector.shutdown(wait=True)
+            except Exception:                            # noqa: BLE001
+                log.exception("phase-A collector shutdown failed")
+            self._sharpness_collector = previous_collector
+
+    def _plan_phase_c(
+        self,
+        result: PhaseAResult,
+        *,
+        end_mm: float,
+        rail_step_mm: float,
+        fwhm_mm: float,
+        n_probes: int,
+        padding_x_fwhm: float,
+    ) -> tuple[int, int] | None:
+        """Convert a PhaseAResult into phase-C step-index bounds.
+
+        Returns ``(start_step_index, n_steps)`` where ``start_step_index``
+        is the rail step (signed, relative to rail-zero) where phase C
+        begins and ``n_steps`` is the count of forward steps to capture.
+        Returns ``None`` when phase A was inconclusive — the caller
+        falls back to the uniform sweep.
+        """
+        window = phase_c_window_mm(
+            result,
+            phase_a_start_mm=0.0,
+            phase_a_end_mm=end_mm,
+            n_probes=n_probes,
+            fwhm_mm=fwhm_mm,
+            padding_x_fwhm=padding_x_fwhm,
+        )
+        if window is None:
+            return None
+        lo_mm, hi_mm = window
+        # Convert to step-index bounds. Step indices are signed and
+        # represent rail positions relative to rail-zero in units of
+        # ``rail_step_mm``. For backward jogs (end_mm < 0,
+        # step_size_mm < 0) lo_mm < hi_mm both ≤ 0; converting to step
+        # indices preserves order via signed division.
+        start_step = int(round(lo_mm / rail_step_mm))
+        end_step = int(round(hi_mm / rail_step_mm))
+        # Always sweep forward in step-index direction matching end_mm.
+        if end_mm >= 0:
+            n_steps = end_step - start_step + 1
+        else:
+            # Backward sweep: step indices decrease from start. Flip
+            # so we iterate in the user's chosen direction.
+            start_step, end_step = end_step, start_step
+            n_steps = end_step - start_step + 1
+        if n_steps < 1:
+            return None
+        return start_step, n_steps
 
     def _run_one_step(
         self,
@@ -966,13 +1227,21 @@ class SessionRunner:
         steps: int,
         calibration: CalibrationResult,
         apertures: list[str],
+        start_step_index: int = 0,
     ) -> int:
         """Evaluate range adequacy; probe + extend if peak is at an
-        edge. Returns the total forward step count from the START
-        position so the caller can drive the rail back to 0.
+        edge. Returns the absolute step index from rail-zero where the
+        rail currently sits; the caller multiplies by ``step_size_mm``
+        to retract.
 
         Stays a no-op if ``range_checker.evaluate`` returns ``ok=True``
         (which is the stub's behaviour today).
+
+        ``start_step_index`` is the rail-zero-relative step index at
+        which the just-completed sweep began. The default 0 matches
+        the user-jog flow. The probe (phase-C) flow passes a non-zero
+        start so far/near extensions land at absolute step indices
+        beyond the phase-C window, not relative to step 0.
         """
         from session.log import write_json
 
@@ -1021,11 +1290,11 @@ class SessionRunner:
                     "flat data and continued. " + result.notes
                 ),
             })
-            return steps - 1
+            return start_step_index + steps - 1
         if (
             result.ok
             or not result.needs_extension
-            or result.peak_side not in ("near", "far", "both")
+            or result.peak_side not in ("start_side", "end_side", "both")
         ):
             write_json(lens_dir / "range_check.json", {
                 "ok": result.ok,
@@ -1033,7 +1302,7 @@ class SessionRunner:
                 "extension_applied": False,
                 "notes": result.notes,
             })
-            return steps - 1
+            return start_step_index + steps - 1
 
         extension_mm = end_mm * float(
             getattr(self.config, "RANGE_EXTENSION_FRACTION", 0.5)
@@ -1055,7 +1324,7 @@ class SessionRunner:
                 "notes": (result.notes or "")
                 + " (extension shorter than one grid step; skipped)",
             })
-            return steps - 1
+            return start_step_index + steps - 1
 
         # Per-side probe count — split for BOTH so we shoot ~half on
         # each side; cap at the available extension slots so we never
@@ -1064,7 +1333,7 @@ class SessionRunner:
             probe_per_side = min(
                 max(1, configured_probe_count // 2 + 1), extension_steps
             )
-            sides = [("far", probe_per_side), ("near", probe_per_side)]
+            sides = [("end_side", probe_per_side), ("start_side", probe_per_side)]
         else:
             probe_per_side = min(configured_probe_count, extension_steps)
             sides = [(result.peak_side, probe_per_side)]
@@ -1074,13 +1343,16 @@ class SessionRunner:
         # convention as the rest of the sweep — sweep, probe, and
         # (if it follows) extension are distinguished only by the
         # phase column in shots.csv.
-        current_pos = (steps - 1) * step_size_mm  # rail at end_mm
+        current_pos = (start_step_index + steps - 1) * step_size_mm  # rail at end of sweep
         probe_data: list = []
-        probe_positions_per_side: dict[str, list[float]] = {"far": [], "near": []}
+        probe_positions_per_side: dict[str, list[float]] = {"end_side": [], "start_side": []}
         for side, count in sides:
             for i in range(count):
                 step_index = self._extension_step_index(
-                    side=side, original_steps=steps, offset_in_extension=i
+                    side=side,
+                    original_steps=steps,
+                    offset_in_extension=i,
+                    start_step_index=start_step_index,
                 )
                 target = step_index * step_size_mm
                 self._move_to(current_pos, target)
@@ -1120,10 +1392,10 @@ class SessionRunner:
         # Track total grid slots shot per side across probes +
         # any extend-more rounds. The "fill rest" branch below
         # uses this to know how far to continue from.
-        shot_so_far_per_side: dict[str, int] = {"far": 0, "near": 0}
+        shot_so_far_per_side: dict[str, int] = {"end_side": 0, "start_side": 0}
         for side, count in sides:
             shot_so_far_per_side[side] = count
-        extension_step_count_per_side: dict[str, int] = {"far": 0, "near": 0}
+        extension_step_count_per_side: dict[str, int] = {"end_side": 0, "start_side": 0}
         extend_rounds = 0
 
         # Extend-more loop: as long as the data still doesn't bracket
@@ -1243,8 +1515,8 @@ class SessionRunner:
             "extension_step_count": extension_step_count_per_side,
             "extend_rounds": extend_rounds,
             "probe_step_count": {
-                "far": dict(sides).get("far", 0),
-                "near": dict(sides).get("near", 0),
+                "end_side": dict(sides).get("end_side", 0),
+                "start_side": dict(sides).get("start_side", 0),
             },
             "notes": result2.notes,
         })
@@ -1252,15 +1524,26 @@ class SessionRunner:
 
     @staticmethod
     def _extension_step_index(
-        *, side: str, original_steps: int, offset_in_extension: int
+        *,
+        side: str,
+        original_steps: int,
+        offset_in_extension: int,
+        start_step_index: int = 0,
     ) -> int:
         """Map (side, position-within-extension) to a signed step
-        index. Far side continues past the main sweep; near side
-        descends below zero."""
-        if side == "far":
-            return original_steps + offset_in_extension
-        # side == "near"
-        return -1 - offset_in_extension
+        index. ``end_side`` continues past the just-completed sweep
+        (step indices > original_steps); ``start_side`` descends
+        below the sweep start (negative step indices).
+
+        ``start_step_index`` is 0 for the user-jog flow and the
+        phase-C window's start step for the probe flow — extensions
+        always anchor to the sweep's actual rail-zero-relative start
+        and end, never to step 0.
+        """
+        if side == "end_side":
+            return start_step_index + original_steps + offset_in_extension
+        # side == "start_side"
+        return start_step_index - 1 - offset_in_extension
 
     def _shoot_at_position(
         self,

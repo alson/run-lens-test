@@ -4,9 +4,9 @@ Uses a scripted FakeRangeChecker (separate from the production stub)
 to drive the runner through:
   * stub-style ok=True: no extra captures, range_check.json has
     extension_applied=False
-  * needs_extension=True, peak_side='far' -> grid-aligned probe,
+  * needs_extension=True, peak_side='end_side' -> grid-aligned probe,
     optional extension follow-up; phases marked PROBE / EXTENSION
-  * peak_side='near' -> probe + extension at negative step indices
+  * peak_side='start_side' -> probe + extension at negative step indices
     (filenames stay positive thanks to STEP_NUMBER_OFFSET)
   * peak_side='both' -> bilateral probes + bilateral extensions
   * peak_in_range_after_probe=False -> user prompted; no extension
@@ -130,10 +130,10 @@ class TestFarExtension:
             inputs={"steps": 3, "end_mm": 20.0},
         )
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         notes="peak likely beyond end"),
-            RangeResult(ok=True, peak_side="far",
+            RangeResult(ok=True, peak_side="end_side",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
                         notes="probe brackets peak"),
@@ -170,11 +170,11 @@ class TestFarExtension:
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
         assert rc["ok"] is False
-        assert rc["peak_side"] == "far"
+        assert rc["peak_side"] == "end_side"
         assert rc["extension_applied"] is True
         # Per-side counters: 0 extension follow-up shots on far side
         # (the lone slot was already covered by the probe).
-        assert rc["extension_step_count"] == {"far": 0, "near": 0}
+        assert rc["extension_step_count"] == {"end_side": 0, "start_side": 0}
 
     def test_probe_then_extension_follow_up(self, cfg, tmp_path) -> None:
         """Bigger range so the extension fits the probe count plus an
@@ -188,9 +188,9 @@ class TestFarExtension:
             inputs={"steps": 7, "end_mm": 60.0},
         )
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="far",
-                        needs_extension=True, notes="far"),
-            RangeResult(ok=True, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
+                        needs_extension=True, notes="end_side"),
+            RangeResult(ok=True, peak_side="end_side",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
                         notes="bracket"),
@@ -218,7 +218,7 @@ class TestFarExtension:
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
-        assert rc["extension_step_count"] == {"far": 1, "near": 0}
+        assert rc["extension_step_count"] == {"end_side": 1, "start_side": 0}
 
 
 # ---- Near-side extension --------------------------------------------------
@@ -236,9 +236,9 @@ class TestNearExtension:
             inputs={"steps": 3, "end_mm": 20.0},
         )
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="near",
-                        needs_extension=True, notes="near"),
-            RangeResult(ok=True, peak_side="near",
+            RangeResult(ok=False, peak_side="start_side",
+                        needs_extension=True, notes="start_side"),
+            RangeResult(ok=True, peak_side="start_side",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
                         notes="probe ok"),
@@ -259,7 +259,7 @@ class TestNearExtension:
         rc = json.loads(
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
-        assert rc["peak_side"] == "near"
+        assert rc["peak_side"] == "start_side"
         assert rc["extension_applied"] is True
 
 
@@ -314,7 +314,7 @@ class TestBothExtension:
             (runner.session_dir / "L" / "range_check.json").read_text()
         )
         assert rc["peak_side"] == "both"
-        assert rc["probe_step_count"] == {"far": 1, "near": 1}
+        assert rc["probe_step_count"] == {"end_side": 1, "start_side": 1}
 
 
 # ---- Probe says peak still outside ----------------------------------------
@@ -337,9 +337,9 @@ class TestProbeFails:
             lambda msg: (prompts.append(msg), "skip")[1]
         )
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True, notes="peak beyond end"),
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         peak_in_range_after_probe=False,
                         notes="probe still doesn't bracket"),
@@ -380,21 +380,21 @@ class TestProbeFails:
         )
         runner.range_checker = ScriptedRangeChecker([
             # 1) first call after main sweep
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         notes="peak beyond end"),
             # 2) after probe — still no bracket
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         peak_in_range_after_probe=False,
                         notes="still beyond end"),
             # 3) after first extend-more round — still no
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         peak_in_range_after_probe=False,
                         notes="still beyond end"),
             # 4) after second extend-more round — bracket!
-            RangeResult(ok=True, peak_side="far",
+            RangeResult(ok=True, peak_side="end_side",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
                         notes="bracket"),
@@ -428,9 +428,9 @@ class TestProbeFails:
         )
         runner.prompt_range_inadequate = lambda msg: "abort"
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True, notes="peak beyond"),
-            RangeResult(ok=False, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
                         needs_extension=True,
                         peak_in_range_after_probe=False,
                         notes="still beyond"),
@@ -609,11 +609,11 @@ class TestProbeWithSubsampling:
                 "subsample_factors": {4.0: 1, 8.0: 2},
             },
         )
-        # Force a probe by scripting peak_side='far' once, then ok.
+        # Force a probe by scripting peak_side='end_side' once, then ok.
         runner.range_checker = ScriptedRangeChecker([
-            RangeResult(ok=False, peak_side="far",
-                        needs_extension=True, notes="far"),
-            RangeResult(ok=True, peak_side="far",
+            RangeResult(ok=False, peak_side="end_side",
+                        needs_extension=True, notes="end_side"),
+            RangeResult(ok=True, peak_side="end_side",
                         needs_extension=False,
                         peak_in_range_after_probe=True,
                         notes="bracket"),
@@ -640,17 +640,17 @@ class TestExtensionStepIndex:
     def test_far_side_continues_past_main_sweep(self) -> None:
         # 3-step main sweep (indices 0..2). Far probe i=0 is index 3.
         assert SessionRunner._extension_step_index(
-            side="far", original_steps=3, offset_in_extension=0
+            side="end_side", original_steps=3, offset_in_extension=0
         ) == 3
         assert SessionRunner._extension_step_index(
-            side="far", original_steps=3, offset_in_extension=2
+            side="end_side", original_steps=3, offset_in_extension=2
         ) == 5
 
     def test_near_side_descends_below_zero(self) -> None:
         # Near probe i=0 is index -1 (one step *before* main sweep).
         assert SessionRunner._extension_step_index(
-            side="near", original_steps=3, offset_in_extension=0
+            side="start_side", original_steps=3, offset_in_extension=0
         ) == -1
         assert SessionRunner._extension_step_index(
-            side="near", original_steps=3, offset_in_extension=2
+            side="start_side", original_steps=3, offset_in_extension=2
         ) == -3

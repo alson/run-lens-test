@@ -517,7 +517,7 @@ The runner retries up to 3 times. On the 3rd failure: high-priority ntfy alert "
 
 ## 8. Range-check + auto-extension on rig
 
-**Validated 2026-05-05** — `peak_side='near'`, 3 extend rounds, 12 near-side extension steps, final verdict OK on all apertures.
+**Validated 2026-05-05** — `peak_side='start_side'`, 3 extend rounds, 12 start-side extension steps, final verdict OK on all apertures.
 
 ### Setup
 
@@ -533,7 +533,7 @@ Start a session per step 5; pick the deliberately-narrow START/END.
 
 After the main sweep, the runner runs the sharpness analysis and the flow branches three ways:
 
-**A. Truncated bell on one side (or both)**: The runner shoots `RANGE_CHECK_PROBE_STEPS` (default 2) grid-aligned probe shots in the failing direction (filenames `step_0103.jpg` … on the far side, `step_0099.jpg` … on the near side, or both for `peak_side=both`). If the probes bracket the peak it then fills out the rest of the extension at the original step size automatically. No prompt. `range_check.json` records `extension_applied: true` and the `extension_step_count` per side.
+**A. Truncated bell on one side (or both)**: The runner shoots `RANGE_CHECK_PROBE_STEPS` (default 2) grid-aligned probe shots in the failing direction. The labels `peak_side="start_side" | "end_side" | "both" | "centered"` are step-space, not physical: `end_side` = past step N (extending past the user-set END), `start_side` = past step 0 (before START). The probe filenames `step_0103.jpg` … sit past step N (`end_side`), `step_0099.jpg` … sit before step 0 (`start_side`), or both for `peak_side=both`. If the probes bracket the peak it then fills out the rest of the extension at the original step size automatically. No prompt. `range_check.json` records `extension_applied: true` and the `extension_step_count` per side.
 
 **B. Truncated bell that the probe didn't bracket**: The runner prompts: `Range still inadequate on <slug> (peak_side=…). [ENTER] extend by ~N mm (M steps) on the failing side, [s] skip and continue to lens change, [q] abort`. ENTER shoots another `extension_steps` worth of grid slots on the failing side(s), re-evaluates, and re-prompts; loops until peak brackets or you skip / abort. `range_check.json` records `extend_rounds` (count of times you pressed ENTER).
 

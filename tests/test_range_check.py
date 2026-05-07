@@ -89,12 +89,12 @@ class TestPeakSideAccepts:
     for reacting to each value (§8.3.3 in the plan)."""
 
     def test_near(self) -> None:
-        result = RangeResult(ok=False, peak_side="near", needs_extension=True)
-        assert result.peak_side == "near"
+        result = RangeResult(ok=False, peak_side="start_side", needs_extension=True)
+        assert result.peak_side == "start_side"
 
     def test_far(self) -> None:
-        result = RangeResult(ok=False, peak_side="far", needs_extension=True)
-        assert result.peak_side == "far"
+        result = RangeResult(ok=False, peak_side="end_side", needs_extension=True)
+        assert result.peak_side == "end_side"
 
     def test_both(self) -> None:
         result = RangeResult(ok=False, peak_side="both", needs_extension=True)

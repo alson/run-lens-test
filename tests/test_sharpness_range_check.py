@@ -10,9 +10,9 @@ produces:
 * a complete bell on every aperture -> verdict OK -> ``RangeResult``
   ``ok=True``, ``peak_side='centered'``, ``needs_extension=False``.
 * a strictly-rising series (peak is past the rail's far end) ->
-  ``Direction.EXTEND_FORWARD`` -> ``peak_side='far'``.
+  ``Direction.EXTEND_FORWARD`` -> ``peak_side='end_side'``.
 * a strictly-falling series (peak is before the rail's start) ->
-  ``Direction.EXTEND_BACKWARD`` -> ``peak_side='near'``.
+  ``Direction.EXTEND_BACKWARD`` -> ``peak_side='start_side'``.
 * mixed across apertures -> ``peak_side='both'``.
 * on the second call, if probes complete the bell -> verdict OK
   again -> ``peak_in_range_after_probe=True``.
@@ -173,7 +173,7 @@ class TestFirstCall:
             step_size_mm=1.0, apertures=["f/8"],
         )
         assert result.ok is False
-        assert result.peak_side == "far"
+        assert result.peak_side == "end_side"
         assert result.needs_extension is True
 
     def test_all_flat_yields_all_off_target(self, cfg) -> None:
@@ -206,7 +206,7 @@ class TestFirstCall:
             lens_dir=Path("."), end_mm=10.0,
             step_size_mm=1.0, apertures=["f/8"],
         )
-        assert result.peak_side == "near"
+        assert result.peak_side == "start_side"
 
     def test_mixed_apertures_mean_both(self, cfg) -> None:
         # f/4 wants forward extension, f/16 wants backward → BOTH.
@@ -350,7 +350,7 @@ class TestSecondCall:
             lens_dir=Path("."), end_mm=4.0,
             step_size_mm=1.0, apertures=["f/8"],
         )
-        assert first.peak_side == "far"
+        assert first.peak_side == "end_side"
 
         # Now extend the dataset with two probes at rail_step 5, 6
         # whose sizes complete the bell (peak ~5500 at step 6).

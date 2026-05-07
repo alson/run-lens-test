@@ -185,9 +185,9 @@ class SharpnessRangeChecker(RangeChecker):
             if d == Direction.BOTH:
                 return "both"
             if d == Direction.EXTEND_FORWARD:
-                sides_seen.add("far")
+                sides_seen.add("end_side")
             elif d == Direction.EXTEND_BACKWARD:
-                sides_seen.add("near")
+                sides_seen.add("start_side")
         if not sides_seen:
             return "centered"
         if len(sides_seen) > 1:
