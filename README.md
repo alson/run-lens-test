@@ -322,7 +322,11 @@ All tunable constants are at the top of `config.py`. Notable ones:
   `RANGE_CHECK_PROBE_STEPS` — auto-extension behaviour. The
   multi-crop advisor checks all 17 crops per aperture; field
   curvature where corners truncate on opposite sides maps to
-  `peak_side="both"` and triggers bilateral extension.
+  `peak_side="both"` and triggers bilateral extension. The
+  extension target prefers the advisor's per-aperture
+  `extra_steps` projection (max across truncated apertures, capped
+  at the original sweep length); `RANGE_EXTENSION_FRACTION` is the
+  fallback budget when the advisor returns 0.
 
 ## Troubleshooting
 

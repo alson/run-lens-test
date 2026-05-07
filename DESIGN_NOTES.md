@@ -1268,3 +1268,66 @@ agnostic; this is a pure naming clarity change. `"both"` and
 Older `range_check.json` files with `"near"`/`"far"` keep their
 old values; nothing in the code path reads them back, so no
 on-disk-compatibility shim needed.
+
+### 6.25 Runner now respects the advisor's per-aperture extra_steps
+
+The advisor's `Recommendation.extra_steps` carries a curve-fit
+projection of how many rail steps past the captured edge the
+peak actually sits — `sharpness.detect.extra_steps_needed` does
+a parabolic fit on the visible portion of the bell, falling back
+to `n // 2` when the visible curve is still monotonically rising
+and the parabola can't latch onto a half-bell. Capped internally
+at `n` so a half-bell can never recommend more than doubling.
+
+Previously this number reached `Recommendation.summary()` for the
+human-readable rationale string, but **the runner ignored it** —
+`SharpnessRangeChecker._aggregate` built a `RangeResult` with no
+`extra_steps` field, and the runner sized its extension purely
+from `RANGE_EXTENSION_FRACTION × end_mm`. Two failure modes:
+
+1. **Under-extension** when the projection exceeded the static
+   50 % budget — user saw "Range still inadequate" prompts and
+   pressed ENTER repeatedly for additional rounds.
+2. **Over-extension** when the projection was small — runner
+   spent shots filling a 50 %-of-range budget the bell only
+   needed a few steps of.
+
+Wiring:
+
+* `RangeResult.extra_steps_max: int = 0` — max across truncated
+  apertures. Untruncated apertures have `extra_steps=0` so a
+  simple `max()` over all values picks up only real projections.
+* `SharpnessRangeChecker._aggregate` populates it.
+* Runner's `_run_range_check_and_extend` switches sizing:
+  ```
+  if advisor_extra > 0:
+      extension_steps = max(probe_count,
+                            min(advisor_extra, original_steps))
+  else:
+      extension_steps = static_budget
+  ```
+  Floor at probe count (probes always need to fit), ceiling at
+  original sweep length (no runaway >2× rail range).
+
+Backwards-compat: `RangeResult` instances without the field
+default to 0 and trigger the static-budget fallback. All
+existing tests stayed green.
+
+**Cross-aperture aggregation**: `max` is intentional — the worst-
+case aperture's projection wins so the extension is large enough
+for every truncated crop. Smaller-aperture crops just see extra
+past-peak data, which doesn't hurt the bell-fitting.
+
+**Mid-run "62 steps extension" was the fallback**: the 35 mm
+extension session at step 123/160 had `n=123`; the parabolic fit
+couldn't latch onto a still-rising series, so the projection
+came from `max(2, 123 // 2) = 61`. Off by one because the cap
+includes the edge buffer. So the advisor wasn't predicting a
+specific peak position — it was the half-range fallback dressed
+up as a recommendation. Once the sweep finished at step 159 the
+peaks DID roll off comfortably inside the captured range, and
+the post-sweep `evaluate()` returned `peak_side="centered"` with
+no extension needed. The mid-run extrapolation was correctly
+flagged as truncated *at that moment* but doesn't generalise
+past it — useful as a sanity-check trigger, less useful as a
+specific position prediction.
