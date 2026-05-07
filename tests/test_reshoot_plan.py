@@ -54,9 +54,12 @@ class TestRealPlan:
         assert observed.status == "reshoot"
 
     def test_inverse_ratio_form(self, real_plan: list[PlanEntry]) -> None:
-        # "1:1.39" → 1/1.39 ≈ 0.7194
+        # Viltrox 85 + 61 mm tube: corrected estimate "1:1.18" using
+        # m_native (= 0.13 at MFD) + L_tube/F_eff (= 61/85). The
+        # observable here is just that the inverse-ratio parser
+        # handles "1:N" forms — exact value tracks the reshoot plan.
         e = next(e for e in real_plan if "Viltrox 85" in e.lens_config and "61mm" in e.lens_config)
-        assert e.magnification == pytest.approx(1 / 1.39, rel=1e-3)
+        assert e.magnification == pytest.approx(1 / 1.18, rel=1e-3)
 
     def test_numbers_are_strictly_increasing(self, real_plan: list[PlanEntry]) -> None:
         nums = [e.number for e in real_plan]

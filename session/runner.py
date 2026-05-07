@@ -489,12 +489,6 @@ class SessionRunner:
         self.start()
         try:
             while True:
-                # Allow a freeform jog before the user picks the next
-                # lens config — useful at first-launch to clear a
-                # stale rail position from a previous crashed run, and
-                # to release the StackShot from USB-control mode if
-                # needed (jog SPACE key releases panel).
-                self._offer_jog_pause(where="before lens-config selection")
                 if self._plan_entries:
                     picked = self.prompt_lens_config_from_plan(
                         self._plan_entries, self._completed_slugs

@@ -902,8 +902,7 @@ nowhere useful when a fresh runner launches. Two consequences:
    the jog UI.
 
 Added `jog_freeform` injection + `_offer_jog_pause(where)` helper
-called at two new points: right before the FEC sanity check, and
-at the top of each lens-config prompt iteration. Prompts
+called right before the FEC sanity check. Prompts
 `[ENTER] continue, [j] jog rail, [q] abort:`; pressing `j` enters
 the freeform jog (which already releases the camera for live view
 via SPACE → on_release callback) and re-prompts on exit. Default
@@ -1041,15 +1040,37 @@ Two consequences:
    ideal — over-sampling, not under-sampling, so peak detection
    still works. The safe error direction.
 
-The reshoot plan's `(est.)` values for IF lenses are documented
-as lower bounds with the F_eff-corrected numbers attached as a
-note. Calling out the Z 24-120 and Viltrox 85 as also-IF without
-a measured F_eff is intentional — the plan uses the nominal
-estimates as a lower bound but flags them in the file header.
+**Per-lens parameters** (gathered from manufacturer specs +
+review-site optical-bench measurements):
 
-Future improvement (not implemented): a per-lens F_eff lookup
-table baked into the planner, keyed off the slug, that picks the
-right F based on which focus distance the user reports. The
-current setup is "user types the magnification and the planner
-trusts it", which works fine as long as the menu entries don't
-mislead.
+| Lens | F_eff at close focus | m_native at MFD |
+|---|---|---|
+| Z MC 105 mm f/2.8 VR S | ~49 mm at 1:1 | 1.0 |
+| Z 24-120 mm f/4 S (at 120 mm) | ~120 mm | 0.39 |
+| Viltrox 85 mm f/2 EVO | ~85 mm | 0.13 |
+
+The Z MC 105 is the outlier — modern internal-focus macros that
+reach 1:1 typically halve their focal length to do it. The
+Z 24-120 measured 3 % focus breathing through its full focus
+range (per cameralabs review), so F_eff stays essentially at the
+zoom-position nominal. The Viltrox 85 is not a macro and reaches
+only 0.13× max; its breathing is described as "comparatively low".
+
+**Two-effect formula** for total magnification with an external
+extension tube:
+
+```
+m_total = m_native + L_tube / F_eff
+```
+
+The "+1 + L/F" form some planning tools default to is wrong twice
+over for the 24-120 and Viltrox 85: those lenses don't reach 1:1
+internally, AND nominal F isn't the right value to plug in for
+F_eff. The reshoot plan's estimates have been corrected per lens.
+
+Future improvement (not implemented): a per-lens F_eff +
+m_native lookup table baked into the planner, keyed off the slug,
+so the user can enter a focus-position description and the
+planner derives M from the table. The current setup is "user
+types the magnification and the planner trusts it", which works
+fine as long as the reshoot-plan menu entries are accurate.

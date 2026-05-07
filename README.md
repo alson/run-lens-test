@@ -113,33 +113,34 @@ The program will:
    need to release the panel buttons.
 3. Validate camera state (M mode, focus mode = Manual, full config
    tree, FEC sanity test).
-4. Offer the same freeform jog pause before the lens-config prompt.
-5. Prompt for the first lens configuration as a free-text line.
-6. Prompt for the **magnification** in ratio (`1:1`, `1.5:1`, `1:1.5`,
+4. Prompt for the first lens configuration as a free-text line.
+5. Prompt for the **magnification** in ratio (`1:1`, `1.5:1`, `1:1.5`,
    `2:1`) or float form (`0.5`, `1.0`). The runner uses this plus the
    lens's widest aperture to compute the rail step size from a thin-lens
    DOF model — you no longer pick a step count manually.
 
-   **Internal-focus macro caveat**: lens barrel focal length is the
-   *infinity* focal length. Modern IF macros (e.g. the Z MC 105 mm
-   f/2.8 VR S, which drops to ~49 mm at 1:1) shorten F substantially
-   at close focus. When you stack an external extension tube, the
-   true magnification at the lens's own minimum focus is
-   `1 + L_tube / F_eff_at_close_focus`, not `1 + L_tube / F_nominal`.
-   The reshoot-plan menu's `(est.)` magnifications use the nominal
-   F and underestimate the real value. Over-estimating M makes the
-   planner pick a smaller rail step, which over-samples the bell —
-   the safe error direction — but if you want a tighter rail range,
-   enter the F_eff-corrected value.
-7. Drop you into a jog session: use `a`/`d` to step the rail back/forward
+   **Magnification math caveat**: total magnification with an
+   extension tube is `m_native + L_tube / F_eff`, where `m_native`
+   is the lens's max magnification at minimum focus and `F_eff` is
+   the focal length at that focus (which is *not* the barrel
+   nominal for internal-focus macros). The Z MC 105 mm f/2.8 VR S
+   drops to ~49 mm F_eff at 1:1 (per photomacrography.net optical-
+   bench measurements); the Z 24-120 stays close to its zoom-
+   position nominal (3 % breathing); the Viltrox 85 mm f/2 EVO
+   reaches only 0.13× max and breathes little. The reshoot-plan
+   menu carries pre-computed estimates corrected per-lens. Over-
+   estimating M makes the planner pick a smaller rail step, which
+   over-samples the bell — the safe error direction — but if you
+   want a tighter rail range, enter the corrected value.
+6. Drop you into a jog session: use `a`/`d` to step the rail back/forward
    in fine increments, `A`/`D` for coarse, `s` to mark the start position,
    `e` to mark the end, `q` to abort. The current position is shown live.
    The runner prints the planned rail step + position count once you've
    set END; if the jogged range yields fewer than `MIN_RAIL_POSITIONS`
    (default 10) positions, you'll be prompted to re-jog wider.
-8. Run FEC calibration at step 0 (one test shot per aperture, possibly more).
-9. Run the rail sweep.
-10. Notify on completion and prompt for the next lens config.
+7. Run FEC calibration at step 0 (one test shot per aperture, possibly more).
+8. Run the rail sweep.
+9. Notify on completion and prompt for the next lens config.
 
 ### Lens change procedure
 
