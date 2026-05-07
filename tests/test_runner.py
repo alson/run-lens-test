@@ -1153,6 +1153,71 @@ class TestDroopPause:
         # consumed exactly — assert no leftover medians:
         assert camera.history  # smoke check that captures happened
 
+    def test_droop_repeats_when_user_resumes_without_swapping(
+        self, cfg, tmp_path
+    ) -> None:
+        # User-reported workflow: when droop fires the user can't
+        # always tell which flash needs new batteries until they see
+        # the flashes shoot during the reshoot. So they press ENTER
+        # without swapping, droop fires again on the reshoot, they
+        # press ENTER again, etc. Confirm three nested levels work
+        # cleanly (each level reshoots the current step + rewinds via
+        # the rolling window) and that after the user finally swaps
+        # batteries the freshest captures land on disk with phase=
+        # reshoot at every previously-bad step.
+        cfg.SHOTS_PER_STEP_APERTURE = 1
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # Sweep: severe trip at step 2 (median 25 → ≈-4.4 EV).
+        # Outer reshoot covers [2..2]; reshoot also under (still no
+        # battery swap) → nested reshoot. Nested also under → nested-
+        # nested reshoot. THIS time the user finally swaps. Sweep
+        # then continues at step 3.
+        medians = [
+            100.0,    # cal
+            100.0,    # step 0 sweep ok
+            100.0,    # step 1 sweep ok
+            25.0,     # step 2 sweep — severe trip
+            25.0,     # outer reshoot at step 2 — still bad, recurses
+            25.0,     # 2nd nested reshoot at step 2 — still bad
+            100.0,    # 3rd nested reshoot at step 2 — fresh batteries
+            100.0,    # sweep step 3 ok
+        ]
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 4, "end_mm": 3.0},
+        )
+        confirm_calls = []
+        def confirm(msg):
+            confirm_calls.append(msg)
+            return True
+        runner.confirm = confirm
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        # Sweep rows: only steps 0, 1, 3 — step 2's sweep row was
+        # dropped by the outer reshoot's stale-row purge.
+        sweep_rows = [r for r in rows if r["phase"] == "sweep"]
+        assert sorted(int(r["rail_step"]) for r in sweep_rows) == [0, 1, 3]
+        # Reshoot rows at step 2: the outermost / 2nd-nested / 3rd-
+        # nested reshoots all wrote rows for step 2 in turn, but each
+        # subsequent _reshoot_steps drops the stale rows from the
+        # prior attempt before writing new ones. The final row count
+        # at step 2 is just the final (fresh-battery) attempt.
+        step2_reshoot = [
+            r for r in rows
+            if r["phase"] == "reshoot" and int(r["rail_step"]) == 2
+        ]
+        assert len(step2_reshoot) == 1
+        assert float(step2_reshoot[0]["median_central_luminance"]) == 100.0
+        # Three droop confirms = one per trip (outer sweep + two nested).
+        droop_prompts = [m for m in confirm_calls if "droop" in m.lower()]
+        assert len(droop_prompts) == 3
+
     def test_severe_trip_on_first_replica_skips_remaining_replicas(
         self, cfg, tmp_path
     ) -> None:
