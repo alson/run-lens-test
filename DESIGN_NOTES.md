@@ -1068,6 +1068,18 @@ over for the 24-120 and Viltrox 85: those lenses don't reach 1:1
 internally, AND nominal F isn't the right value to plug in for
 F_eff. The reshoot plan's estimates have been corrected per lens.
 
+**Caveat: thin-lens under-predicts the 24-120 + tube case.** Past
+shots (`2026-02-18`) of the 24-120 at 120 mm + 10 mm tube and
++ 16 mm tube landed at 0.54 and 0.63 magnification respectively —
+~15-20 % higher than the thin-lens `0.39 + L/120` formula
+predicts. The empirical slope is ≈ 0.015 mag per mm of tube at
+120 mm, roughly 1.8× the thin-lens slope. Plausibly the tube
+lets the lens focus past its own native MFD, compounding both
+the lens-internal close-focus mechanism and the tube. The 24-120
++ 35 / 45 / 61 mm entries in the reshoot plan are projected from
+this empirical slope, with a note in the file header marking
+them as upper-bound estimates pending actual shots.
+
 Future improvement (not implemented): a per-lens F_eff +
 m_native lookup table baked into the planner, keyed off the slug,
 so the user can enter a focus-position description and the
