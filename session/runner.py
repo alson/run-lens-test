@@ -985,6 +985,10 @@ class SessionRunner:
                 apertures=apertures,
                 calibration=calibration,
                 droop=droop,
+                # Phase-C runs at non-zero step_index (e.g. 45..96),
+                # but the progress bar's "step N/M" should count
+                # 1..M relative to the phase, not the absolute index.
+                progress_step_display=step_index - start_step_index,
             )
         # Newline so the next print() output doesn't overwrite the
         # final progress line.
@@ -1228,6 +1232,7 @@ class SessionRunner:
         apertures: list[str],
         calibration: CalibrationResult,
         droop: DroopDetector,
+        progress_step_display: int | None = None,
     ) -> None:
         aborted = False
         for ap_index, aperture in enumerate(apertures):
@@ -1254,6 +1259,7 @@ class SessionRunner:
                 phase=Phase.SWEEP,
                 droop=droop,
                 progress_ctx=(step_count, ap_index, len(apertures)),
+                progress_step_display=progress_step_display,
             )
             if event is not None:
                 current_step_reshot = self._handle_droop(
