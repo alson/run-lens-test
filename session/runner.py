@@ -1070,6 +1070,20 @@ class SessionRunner:
                         )
                     position_mm = probe_index * spacing_mm
                     self._set_capture_settings(widest_aperture, cal)
+                    # Phase A is single-aperture, single-replica, so
+                    # the progress bar advances one notch per probe.
+                    # ETA is suppressed — phase-A is too short and
+                    # too unrepresentative to seed the EWMA.
+                    self._progress(
+                        step_index=probe_index,
+                        step_count=n_probes,
+                        position_mm=position_mm,
+                        aperture=widest_aperture,
+                        aperture_index=0,
+                        aperture_count=1,
+                        phase_label="probe",
+                        show_eta=False,
+                    )
                     self._wait_for_recycle()
                     ap_subdir = self._aperture_subdir(widest_aperture)
                     dest = probe_dir / ap_subdir / step_filename(
@@ -1106,6 +1120,9 @@ class SessionRunner:
                         droop_tripped = True
                         break
                 if not droop_tripped:
+                    # Land the progress bar on its trailing newline so
+                    # subsequent prints aren't overwritten.
+                    self._progress_done()
                     # Drain crops so the collector dataset is complete.
                     probe_collector.wait_for_pending()
                     dataset = probe_collector.snapshot() if hasattr(
@@ -1435,6 +1452,11 @@ class SessionRunner:
         current_pos = (start_step_index + steps - 1) * step_size_mm  # rail at end of sweep
         probe_data: list = []
         probe_positions_per_side: dict[str, list[float]] = {"end_side": [], "start_side": []}
+        # Total probes across all sides (the progress bar counts
+        # rail steps, not aperture-shots, mirroring the main-sweep
+        # bar's granularity).
+        probe_total = sum(c for _s, c in sides)
+        probe_done = 0
         for side, count in sides:
             for i in range(count):
                 step_index = self._extension_step_index(
@@ -1456,8 +1478,11 @@ class SessionRunner:
                     phase=Phase.PROBE,
                     file_factory=lambda ap, idx=step_index:
                         self._sweep_destination(lens_dir, ap, idx),
+                    progress_ctx=("probe", probe_done, probe_total),
                 )
+                probe_done += 1
                 probe_positions_per_side[side].append(target)
+        self._progress_done()
 
         # Drain pending sharpness crops so the second evaluate() sees
         # the main sweep + every probe shot just taken.
@@ -1491,10 +1516,19 @@ class SessionRunner:
         # the peak, give the user the choice to extend further by one
         # more standard increment, accept what we have, or abort.
         while not result2.peak_in_range_after_probe:
-            if self.ntfy is not None and extend_rounds == 0:
+            # Send ntfy on every prompt round, not just the first —
+            # the user may be away from the rig and only check their
+            # phone periodically; missing the second prompt because
+            # we suppressed it would block progress indefinitely.
+            if self.ntfy is not None:
+                round_label = (
+                    "still inadequate"
+                    if extend_rounds == 0
+                    else f"still inadequate after {extend_rounds} extend round(s)"
+                )
                 self.ntfy.with_body(
                     Notification(
-                        title="Range still inadequate",
+                        title=f"Range {round_label}",
                         body="",
                         priority="high",
                         tags=("warning",),
@@ -1535,6 +1569,8 @@ class SessionRunner:
                 return self._steps_from_zero_at(current_pos, step_size_mm)
             # choice == "extend": shoot extension_steps more grid
             # slots on each originally-failing side.
+            ext_total = extension_steps * len(sides)
+            ext_done = 0
             for side, _ in sides:
                 for i in range(extension_steps):
                     offset = shot_so_far_per_side[side] + i
@@ -1555,9 +1591,14 @@ class SessionRunner:
                         phase=Phase.EXTENSION,
                         file_factory=lambda ap, idx=step_index:
                             self._sweep_destination(lens_dir, ap, idx),
+                        progress_ctx=(
+                            f"extend r{extend_rounds + 1}", ext_done, ext_total,
+                        ),
                     )
+                    ext_done += 1
                     extension_step_count_per_side[side] += 1
                 shot_so_far_per_side[side] += extension_steps
+            self._progress_done()
             extend_rounds += 1
             if self._sharpness_collector is not None:
                 self._sharpness_collector.wait_for_pending()
@@ -1572,6 +1613,10 @@ class SessionRunner:
         # Probe (and any extend-more rounds) brackets the peak — fill
         # in the remaining grid slots inside the original extension on
         # each requested side, so the data is dense up to ``extension_steps``.
+        fill_total = sum(
+            max(0, extension_steps - shot_so_far_per_side[s]) for s, _ in sides
+        )
+        fill_done = 0
         for side, _ in sides:
             for i in range(shot_so_far_per_side[side], extension_steps):
                 step_index = self._extension_step_index(
@@ -1590,9 +1635,14 @@ class SessionRunner:
                     phase=Phase.EXTENSION,
                     file_factory=lambda ap, idx=step_index:
                         self._sweep_destination(lens_dir, ap, idx),
+                    progress_ctx=("extend fill", fill_done, fill_total)
+                        if fill_total > 0 else None,
                 )
+                fill_done += 1
                 extension_step_count_per_side[side] += 1
                 shot_so_far_per_side[side] += 1
+        if fill_total > 0:
+            self._progress_done()
 
         # `ok` here reflects the *original* first-call verdict — the
         # data needed extension. The fact that we extended (and now
@@ -1645,13 +1695,36 @@ class SessionRunner:
         calibration: CalibrationResult,
         phase: Phase,
         file_factory: Callable[[str], Path],
+        progress_ctx: tuple[str, int, int] | None = None,
     ) -> None:
-        for aperture in apertures:
+        """Capture one frame per aperture at the current rail position.
+
+        Used by the probe + extension shooters (single replica). The
+        main-sweep N-replica path goes through ``_capture_one``.
+
+        ``progress_ctx`` is ``(phase_label, step_in_phase,
+        total_steps_in_phase)`` — when provided, the runner shows a
+        live progress bar matching the main-sweep one but counts
+        within the probe/extension/etc. block.
+        """
+        for ap_index, aperture in enumerate(apertures):
             if not self._should_capture(aperture, step_index):
                 # Off this aperture's subsample grid — silent skip.
                 continue
             cal = calibration.per_aperture[aperture]
             self._set_capture_settings(aperture, cal)
+            if progress_ctx is not None:
+                phase_label, step_in_phase, total_in_phase = progress_ctx
+                self._progress(
+                    step_index=step_in_phase,
+                    step_count=total_in_phase,
+                    position_mm=position_mm,
+                    aperture=aperture,
+                    aperture_index=ap_index,
+                    aperture_count=len(apertures),
+                    phase_label=phase_label,
+                    show_eta=False,
+                )
             self._wait_for_recycle()
             dest = file_factory(aperture)
             dest.parent.mkdir(parents=True, exist_ok=True)
