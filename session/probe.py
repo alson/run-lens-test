@@ -102,13 +102,26 @@ def _per_crop_peak(
     raw_argmax = sm_argmax + 1
     if 0 < raw_argmax < n - 1:
         y0, y1, y2 = arr[raw_argmax - 1], arr[raw_argmax], arr[raw_argmax + 1]
+        # The smoothed argmax can land one sample off the raw peak when
+        # the bell has an asymmetric tail: a sharp peak at index k
+        # produces a smoothed maximum at smoothed-index k or k+1
+        # depending on which neighbour is heavier. If the raw
+        # argmax-of-smooth position isn't a local max in the raw
+        # series, the parabolic refinement is fitting a monotonic
+        # slope and would project the vertex outside the local
+        # triplet. Fall back to the raw argmax of the original series.
+        if y1 < y0 or y1 < y2:
+            return float(int(np.argmax(arr)))
         denom = y0 - 2 * y1 + y2
-        if abs(denom) > 1e-9:
-            shift = 0.5 * (y0 - y2) / denom
-            # Clamp to ±1 so a wonky parabola can't jump us across a neighbour.
-            shift = max(-1.0, min(1.0, shift))
-        else:
-            shift = 0.0
+        # ``denom = 2a`` for the parabola; a < 0 (concave down) is the
+        # only configuration with a real maximum. ``a >= 0`` means the
+        # local fit has no peak and we should return the unrefined
+        # raw_argmax.
+        if denom >= 0:
+            return float(raw_argmax)
+        shift = 0.5 * (y0 - y2) / denom
+        # Clamp to ±1 so a wonky parabola can't jump us across a neighbour.
+        shift = max(-1.0, min(1.0, shift))
         return float(raw_argmax) + shift
     return float(raw_argmax)
 

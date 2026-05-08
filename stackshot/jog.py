@@ -56,6 +56,11 @@ def _step_for_key(key: str, keys: JogKeyMap) -> float | None:
 
 # Hot-key for "release to front panel" inside :func:`jog_loop`.
 PANEL_RELEASE_KEY = " "
+# Hot-key for "type a target rail position in mm" — colon makes it
+# unmistakable vs ``a/d/A/D``, and matches the vim/less convention.
+NUMERIC_ENTRY_KEY = ":"
+# Characters allowed inside a numeric-entry buffer.
+_NUMERIC_CHARS: frozenset[str] = frozenset("0123456789.+-")
 
 
 # ---- Pure jog loop ---------------------------------------------------------
@@ -151,6 +156,15 @@ def jog_loop(
             if panel_pending is not None:
                 pending_key = panel_pending
             continue
+        if key == NUMERIC_ENTRY_KEY:
+            position = _numeric_entry(
+                controller=controller,
+                read_key=read_key,
+                write_status=write_status,
+                label=label,
+                start_position=position,
+            )
+            continue
         step = _step_for_key(key, keys)
         if step is None:
             # Unknown key — ignore. Tests can assert nothing happened.
@@ -164,6 +178,77 @@ def jog_loop(
         # them so we don't run into an end-stop after release. Keep
         # the first different keystroke for the next iteration.
         pending_key = _drain_after_move(read_key, key)
+
+
+def _numeric_entry(
+    *,
+    controller: StackShotController,
+    read_key: Callable[..., str | None],
+    write_status: Callable[[float, str], None],
+    label: str,
+    start_position: float,
+) -> float:
+    """Read a typed absolute target position, then move there.
+
+    Activated inside :func:`jog_loop` when the user presses ``:``.
+    Echoes typed characters into the status line so the user sees
+    what they're entering. Returns the rail's position after the
+    move (or ``start_position`` unchanged if the user cancelled).
+
+    Accepted keystrokes:
+    * ``0``-``9``, ``.``, ``+``, ``-``: appended to the buffer.
+    * Backspace (``\\x7f`` or ``\\b``): pops the last character.
+    * Enter (``\\r`` or ``\\n``): parse + move. Empty input cancels.
+    * ``:`` (entry key) again, or ESC (``\\x1b``), or ``q``: cancel.
+
+    On parse errors the buffer is cleared and the user is shown an
+    error hint; entry stays open so they can retry without leaving
+    the jog loop.
+    """
+    buffer = ""
+    error: str | None = None
+    while True:
+        prefix = f"{label} | enter target mm:"
+        if error:
+            write_status(start_position, f"{prefix} {buffer}_  [{error}]")
+        else:
+            write_status(start_position, f"{prefix} {buffer}_")
+        key = read_key()
+        if key is None:
+            # Stream closed; treat as cancel.
+            return start_position
+        if key in ("\r", "\n"):
+            text = buffer.strip()
+            if not text:
+                return start_position
+            try:
+                target = float(text)
+            except ValueError:
+                error = "not a number"
+                buffer = ""
+                continue
+            # Compute delta and execute the move.
+            delta = target - start_position
+            if delta == 0:
+                return start_position
+            direction = Direction.FORWARD if delta > 0 else Direction.BACKWARD
+            controller.move_and_wait(direction, abs(delta), backlash=True)
+            new_position = controller.get_position()
+            write_status(new_position, label)
+            return new_position
+        if key in (NUMERIC_ENTRY_KEY, "\x1b", "q"):
+            # Cancel — restore the regular status line.
+            write_status(start_position, label)
+            return start_position
+        if key in ("\x7f", "\b"):
+            buffer = buffer[:-1]
+            error = None
+            continue
+        if key in _NUMERIC_CHARS:
+            buffer += key
+            error = None
+            continue
+        # Anything else (cursor keys, etc.): silently ignore.
 
 
 def _drain_after_move(
@@ -416,8 +501,8 @@ def jog_start_and_end(
     mode.
     """
     prompt = (
-        "  a/d=coarse(1mm)  A/D=fine(0.05mm)  SPACE=front-panel+camera  "
-        "{set}=set {label}  q=abort"
+        "  a/d=coarse(1mm)  A/D=fine(0.05mm)  :=type-target-mm  "
+        "SPACE=front-panel+camera  {set}=set {label}  q=abort"
     )
     print("Jog rail to START.")
     print(prompt.format(set="s", label="START"))

@@ -1511,11 +1511,31 @@ class SessionRunner:
             shot_so_far_per_side[side] = count
         extension_step_count_per_side: dict[str, int] = {"end_side": 0, "start_side": 0}
         extend_rounds = 0
+        max_extend_rounds = int(getattr(self.config, "MAX_EXTEND_ROUNDS", 8))
 
         # Extend-more loop: as long as the data still doesn't bracket
         # the peak, give the user the choice to extend further by one
         # more standard increment, accept what we have, or abort.
         while not result2.peak_in_range_after_probe:
+            # Re-derive the failing side from the *latest* result so
+            # the next round extends the side that's currently
+            # truncated, not whichever was failing on the first call.
+            # The original first-call ``sides`` was for probing —
+            # after one or more extend rounds, the truncated side may
+            # have flipped (e.g. once we capture the centre peak,
+            # corners on the opposite side become the failing edges).
+            current_peak_side = result2.peak_side or result.peak_side
+            if current_peak_side == "both":
+                current_sides = [
+                    ("end_side", extension_steps),
+                    ("start_side", extension_steps),
+                ]
+            elif current_peak_side in ("end_side", "start_side"):
+                current_sides = [(current_peak_side, extension_steps)]
+            else:
+                # peak_side is "centered" or None but the loop didn't
+                # exit — defensive fall-through using the original sides.
+                current_sides = list(sides)
             # Send ntfy on every prompt round, not just the first —
             # the user may be away from the rig and only check their
             # phone periodically; missing the second prompt because
@@ -1533,15 +1553,41 @@ class SessionRunner:
                         priority="high",
                         tags=("warning",),
                     ),
-                    f"{slug}: probe on {result.peak_side} side did not "
+                    f"{slug}: probe on {current_peak_side} side did not "
                     "bracket peak.",
                 )
+            if extend_rounds >= max_extend_rounds:
+                # Stop the bleeding: parabolic extrapolations on
+                # half-bell tails are unreliable, and a stuck loop
+                # will burn rail and flash power without converging.
+                # Fall through to the same json-write the user-skip
+                # path uses so the operator can investigate offline.
+                self._announce(
+                    f"Hit MAX_EXTEND_ROUNDS={max_extend_rounds}; "
+                    "stopping extend loop. Use a wider START / END "
+                    "next time, or sample the missing tail manually."
+                )
+                write_json(lens_dir / "range_check.json", {
+                    "ok": False,
+                    "extension_applied": True,
+                    **record_base,
+                    "extension_step_count": extension_step_count_per_side,
+                    "extend_rounds": extend_rounds,
+                    "notes": (
+                        "advisor did not converge after "
+                        f"{max_extend_rounds} extend rounds; "
+                        "edge crops likely have peaks past the parabolic "
+                        "extrapolation limit. Operator review required."
+                    ),
+                })
+                return self._steps_from_zero_at(current_pos, step_size_mm)
             extend_mm_per_side = extension_steps * abs(step_size_mm)
+            sides_label = ", ".join(s for s, _ in current_sides)
             choice = self.prompt_range_inadequate(
                 f"\nRange still inadequate on {slug} "
-                f"(peak_side={result2.peak_side or result.peak_side}). "
+                f"(peak_side={current_peak_side}). "
                 f"[ENTER] extend by ~{extend_mm_per_side:.1f} mm "
-                f"({extension_steps} steps) on the failing side, "
+                f"({extension_steps} steps) on {sides_label}, "
                 "[s] skip and continue to lens change, [q] abort: "
             )
             if choice == "abort":
@@ -1568,15 +1614,18 @@ class SessionRunner:
                 })
                 return self._steps_from_zero_at(current_pos, step_size_mm)
             # choice == "extend": shoot extension_steps more grid
-            # slots on each originally-failing side.
-            ext_total = extension_steps * len(sides)
+            # slots on each currently-failing side. Use the
+            # re-derived ``current_sides`` so we extend toward
+            # whichever side the latest evaluate flagged.
+            ext_total = extension_steps * len(current_sides)
             ext_done = 0
-            for side, _ in sides:
+            for side, _ in current_sides:
                 for i in range(extension_steps):
                     offset = shot_so_far_per_side[side] + i
                     step_index = self._extension_step_index(
                         side=side, original_steps=steps,
                         offset_in_extension=offset,
+                        start_step_index=start_step_index,
                     )
                     target = step_index * step_size_mm
                     self._move_to(current_pos, target)
@@ -1620,7 +1669,8 @@ class SessionRunner:
         for side, _ in sides:
             for i in range(shot_so_far_per_side[side], extension_steps):
                 step_index = self._extension_step_index(
-                    side=side, original_steps=steps, offset_in_extension=i
+                    side=side, original_steps=steps, offset_in_extension=i,
+                    start_step_index=start_step_index,
                 )
                 target = step_index * step_size_mm
                 self._move_to(current_pos, target)

@@ -39,6 +39,28 @@ class TestPhaseAPeaks:
         assert result.centre_peak_sample is not None
         assert abs(result.centre_peak_sample - 3.7) < 0.5
 
+    def test_asymmetric_tail_does_not_overshoot_peak(self):
+        """Regression: a sharp peak with a heavy right-side tail
+        used to project the parabolic vertex 2 samples past the
+        actual peak, because the smoothed argmax shifted +1 (the
+        right neighbour was heavier than the left), then the
+        parabolic refinement on indices peak..peak+2 saw a concave-
+        up triplet and projected a clamped +1 shift on top of that.
+        Now the peak finder rejects that case and falls back to the
+        raw argmax of the unsmoothed series."""
+        # Real data from the user's NIKKOR Z 24-120mm + 61mm rig
+        # (2026-05-08 session). True peak at sample 3.
+        sizes = [24901, 27273, 33574, 76901, 56339, 47690, 37922, 35030, 32631]
+        result = phase_a_peaks({
+            "center": sizes,
+            "left-edge": sizes,
+            "right-edge": sizes,
+        })
+        assert result.centre_peak_sample is not None
+        # Acceptable window: any sub-sample correction within ±1 of
+        # the true peak at 3 (an integer-3 raw argmax is fine).
+        assert abs(result.centre_peak_sample - 3.0) <= 1.0
+
     def test_inconclusive_when_too_few_valid_crops(self):
         """Fewer than 3 crops with usable bells → inconclusive."""
         flat = [100_000] * 7

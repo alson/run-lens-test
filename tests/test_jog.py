@@ -345,3 +345,134 @@ class TestJogLoopPanelRelease:
             set_key="e",
         )
         controller.take_from_panel.assert_called_once()
+
+
+class TestJogLoopNumericEntry:
+    """``:`` opens a numeric-target entry mode; the user types an
+    absolute mm position and ENTER moves the rail there."""
+
+    def test_colon_then_typed_target_moves_rail(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        controller._pos = -1.0
+        # Type ":-3.10<ENTER>e" → move to -3.10, then 'e' sets END.
+        chars = list(":-3.10\re")
+        write_status = MagicMock()
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=write_status,
+            keys=keys,
+            set_key="e",
+        )
+        # One absolute move from -1.0 to -3.10 → backward 2.10 mm.
+        controller.move_and_wait.assert_called_once_with(
+            Direction.BACKWARD, pytest.approx(2.10), backlash=True
+        )
+        assert result == pytest.approx(-3.10)
+
+    def test_forward_target_uses_forward_direction(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        controller._pos = -2.0
+        chars = list(":+0.5\re")
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_called_once_with(
+            Direction.FORWARD, pytest.approx(2.5), backlash=True
+        )
+        assert result == pytest.approx(0.5)
+
+    def test_empty_input_cancels(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        controller._pos = -2.0
+        # ":<ENTER>e" — empty buffer → no move, then 'e' sets END.
+        chars = list(":\re")
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_not_called()
+        assert result == pytest.approx(-2.0)
+
+    def test_escape_cancels(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        controller._pos = -2.0
+        chars = list(":1.5\x1be")
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_not_called()
+        assert result == pytest.approx(-2.0)
+
+    def test_backspace_edits_buffer(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        controller._pos = 0.0
+        # Type a typo digit then backspace it before continuing.
+        # ":-31<bksp>.10<ENTER>e" → buffer becomes "-3.10".
+        chars = [":", "-", "3", "1", "\x7f", ".", "1", "0", "\r", "e"]
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_called_once_with(
+            Direction.BACKWARD, pytest.approx(3.10), backlash=True
+        )
+        assert result == pytest.approx(-3.10)
+
+    def test_garbage_input_keeps_entry_open(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        # Typing letters then ENTER → "not a number"; entry stays
+        # open. User then types a real number and submits.
+        controller._pos = 0.0
+        # ":abc<ENTER>" gets ignored chars (only NUMERIC_CHARS accepted),
+        # so "abc" never makes it into the buffer; ENTER on empty buffer
+        # cancels. Then "e" sets END at 0.0 unchanged.
+        chars = [":", "a", "b", "c", "\r", "e"]
+        result = jog_loop(
+            controller,
+            read_key=_scripted_reader(*chars),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_not_called()
+        assert result == pytest.approx(0.0)
+
+    def test_status_line_echoes_buffer(
+        self, controller, keys: JogKeyMap,
+    ) -> None:
+        # The status callback should see the partial buffer printed
+        # while the user types so they can read what they're entering.
+        controller._pos = 0.0
+        write_status = MagicMock()
+        jog_loop(
+            controller,
+            read_key=_scripted_reader(*list(":1.5\re")),
+            write_status=write_status,
+            keys=keys,
+            set_key="e",
+        )
+        # Find any call where the message contains the buffer prefix.
+        msgs = [c.args[1] for c in write_status.call_args_list]
+        assert any("enter target mm:" in m for m in msgs)
+        assert any("1.5" in m for m in msgs)
