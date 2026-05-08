@@ -769,6 +769,11 @@ class SessionRunner:
         # Calibration is preserved across re-jogs.
         probe_enabled = bool(getattr(self.config, "PROBE_ENABLED", False))
         while True:
+            # One droop detector per lens-config attempt — phase-A
+            # probes and the main sweep share the same windows so a
+            # flash misfire during probing isn't re-discovered from
+            # scratch on the sweep's first frames.
+            droop = self._make_droop_detector()
             # Phase A (when probe enabled) collapses the user's wide
             # jog to a sparse single-aperture probe pass. The
             # phase-C window is computed from the observed crop-peak
@@ -788,11 +793,12 @@ class SessionRunner:
                     n_probes=int(getattr(
                         self.config, "PROBE_PHASE_A_POINTS", 7
                     )),
+                    droop=droop,
                 )
                 phase_c_plan = self._plan_phase_c(
                     phase_a_result,
                     end_mm=end_mm,
-                    rail_step_mm=plan.rail_step_mm,
+                    rail_step_mm=step_size_mm,
                     fwhm_mm=plan.estimated_fwhm_mm_widest,
                     n_probes=int(getattr(
                         self.config, "PROBE_PHASE_A_POINTS", 7
@@ -843,6 +849,7 @@ class SessionRunner:
                 calibration=cal_result,
                 apertures=apertures,
                 start_step_index=phase_c_start,
+                droop=droop,
             )
 
             # range-check end_mm: signed extent of the *captured*
@@ -929,6 +936,7 @@ class SessionRunner:
         calibration: CalibrationResult,
         apertures: list[str],
         start_step_index: int = 0,
+        droop: DroopDetector | None = None,
     ) -> None:
         """Forward sweep across ``steps`` rail positions.
 
@@ -943,11 +951,14 @@ class SessionRunner:
         so its file numbers (``step_0160.jpg`` etc.) don't collide
         with phase A's and downstream analysis sees absolute rail
         positions consistently.
+
+        ``droop`` may be passed in by the caller so phase-A probe
+        samples and the main sweep share one detector window — a
+        flash misfire during probing then carries forward into the
+        sweep's window. If ``None``, a fresh detector is created.
         """
-        droop = self.droop_detector or DroopDetector(
-            window=self.config.ROLLING_WINDOW,
-            criteria=(self.config.DROOP_CRIT_A, self.config.DROOP_CRIT_B),
-        )
+        if droop is None:
+            droop = self._make_droop_detector()
         # Sweep direction is the sign of step_size_mm. With a positive
         # end_mm (user jogged forward) sweep direction is FORWARD; with
         # negative (user jogged backward) it's BACKWARD. backlash=False
@@ -990,6 +1001,7 @@ class SessionRunner:
         widest_aperture: str,
         calibration: CalibrationResult,
         n_probes: int,
+        droop: DroopDetector,
     ) -> PhaseAResult:
         """Phase A: sparse forward sweep at the widest aperture only.
 
@@ -1004,17 +1016,17 @@ class SessionRunner:
         Post: rail is at ``end_mm`` (the last probe position).
         Returns the PhaseAResult; on inconclusive results the caller
         should fall back to today's uniform-sweep flow.
+
+        Probe captures push EV into ``droop`` so a misbehaving flash
+        trips the same alert flow as the main sweep — instead of
+        running all N probes against a noise-floor frame and falling
+        back to "inconclusive". On a trip, the user is prompted to
+        swap batteries; on resume, Phase A discards its under-exposed
+        captures and restarts from probe 0 at rail-zero with fresh
+        flash power.
         """
         if n_probes < 3:
             raise ValueError(f"n_probes must be ≥ 3, got {n_probes}")
-        # Phase-A captures live under <lens_dir>/probe/ so they don't
-        # mix with phase-C files in the same crop subtree, and the
-        # phase-A collector cropping output goes to
-        # <lens_dir>/probe/cropped/<crop>/. The directory is created
-        # on first capture (collector handles that).
-        probe_dir = lens_dir / "probe"
-        probe_dir.mkdir(parents=True, exist_ok=True)
-        probe_collector = self.sharpness_collector_factory(probe_dir)
         widest_ap_value = _parse_fnum(widest_aperture)
         cal = calibration.per_aperture[widest_aperture]
 
@@ -1026,87 +1038,131 @@ class SessionRunner:
         )
         spacing_distance = abs(spacing_mm)
 
+        # Phase-A captures live under <lens_dir>/probe/ so they don't
+        # mix with phase-C files in the same crop subtree, and the
+        # phase-A collector cropping output goes to
+        # <lens_dir>/probe/cropped/<crop>/. The directory is created
+        # on first capture (collector handles that).
+        probe_dir = lens_dir / "probe"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+
         previous_collector = self._sharpness_collector
-        self._sharpness_collector = probe_collector
-        try:
-            self._announce(
-                f"Phase A: {n_probes} probes at {widest_aperture} across "
-                f"{end_mm:+.2f} mm jog ..."
-            )
-            for probe_index in range(n_probes):
-                if probe_index > 0:
-                    self.rail.move_and_wait(
-                        sweep_direction, spacing_distance, backlash=False
-                    )
-                position_mm = probe_index * spacing_mm
-                self._set_capture_settings(widest_aperture, cal)
-                self._wait_for_recycle()
-                # Probe captures use a small offset-free filename so
-                # they don't accidentally collide with the main sweep's
-                # offset+step naming. The probe subdir keeps them
-                # isolated regardless.
-                ap_subdir = self._aperture_subdir(widest_aperture)
-                dest = probe_dir / ap_subdir / step_filename(
-                    probe_index,
-                    offset=int(getattr(self.config, "STEP_NUMBER_OFFSET", 100)),
-                    width=int(getattr(self.config, "STEP_NUMBER_WIDTH", 4)),
-                )
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                self._last_capture_started_at = self.monotonic()
-                self._last_capture_aperture = widest_aperture
-                self.camera.capture_to(dest)
-                self._record_sharpness(
-                    step_index=probe_index, aperture=widest_aperture, dest=dest,
-                )
-                median = self._measure(dest)
-                ev = ev_delta(median, self.baseline_median or median)
-                self._log_shot(
-                    slug=slug,
-                    step_index=probe_index,
-                    position_mm=position_mm,
-                    aperture=widest_aperture,
-                    cal=cal,
-                    median=median,
-                    ev=ev,
-                    filename=str(dest.relative_to(lens_dir)),
-                    phase=Phase.PROBE,
-                )
-            # Drain crops so the collector dataset is complete.
-            probe_collector.wait_for_pending()
-            dataset = probe_collector.snapshot() if hasattr(
-                probe_collector, "snapshot"
-            ) else None
-            if dataset is None:
-                # Test-fake collectors may not implement snapshot().
-                # That path can't run real phase A — return an
-                # inconclusive result and let the caller fall back.
-                return PhaseAResult(inconclusive=True)
-            # Build {crop_name: [size_at_probe_0, ...]} ordered by probe index.
-            agg = dataset.aggregated()
-            crop_names: set[str] = set()
-            for s in agg.samples:
-                crop_names.update(s.sizes.keys())
-            crop_sizes: dict[str, list[int]] = {}
-            for name in sorted(crop_names):
-                series = [
-                    size for _step, size in agg.crop_series_for(widest_ap_value, name)
-                ]
-                if len(series) == n_probes:
-                    crop_sizes[name] = series
-            if not crop_sizes:
-                return PhaseAResult(inconclusive=True)
-            return phase_a_peaks(
-                crop_sizes,
-                dynamic_range_min=getattr(
-                    self.config, "SHARPNESS_CROP_DYNAMIC_RANGE_MIN", 0.25
-                ),
-            )
-        finally:
+        self._announce(
+            f"Phase A: {n_probes} probes at {widest_aperture} across "
+            f"{end_mm:+.2f} mm jog ..."
+        )
+
+        # Wrap the probe loop so a droop trip can jump us back here
+        # after the user swaps batteries.
+        while True:
+            probe_collector = self.sharpness_collector_factory(probe_dir)
+            self._sharpness_collector = probe_collector
+            droop_tripped = False
             try:
-                probe_collector.shutdown(wait=True)
-            except Exception:                            # noqa: BLE001
-                log.exception("phase-A collector shutdown failed")
-            self._sharpness_collector = previous_collector
+                for probe_index in range(n_probes):
+                    if probe_index > 0:
+                        self.rail.move_and_wait(
+                            sweep_direction, spacing_distance, backlash=False
+                        )
+                    position_mm = probe_index * spacing_mm
+                    self._set_capture_settings(widest_aperture, cal)
+                    self._wait_for_recycle()
+                    ap_subdir = self._aperture_subdir(widest_aperture)
+                    dest = probe_dir / ap_subdir / step_filename(
+                        probe_index,
+                        offset=int(getattr(self.config, "STEP_NUMBER_OFFSET", 100)),
+                        width=int(getattr(self.config, "STEP_NUMBER_WIDTH", 4)),
+                    )
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    self._last_capture_started_at = self.monotonic()
+                    self._last_capture_aperture = widest_aperture
+                    self.camera.capture_to(dest)
+                    self._record_sharpness(
+                        step_index=probe_index, aperture=widest_aperture, dest=dest,
+                    )
+                    median = self._measure(dest)
+                    ev = ev_delta(median, self.baseline_median or median)
+                    self._log_shot(
+                        slug=slug,
+                        step_index=probe_index,
+                        position_mm=position_mm,
+                        aperture=widest_aperture,
+                        cal=cal,
+                        median=median,
+                        ev=ev,
+                        filename=str(dest.relative_to(lens_dir)),
+                        phase=Phase.PROBE,
+                    )
+                    event = droop.push(
+                        widest_aperture, ev, step_index=probe_index
+                    )
+                    if event is not None:
+                        # Pause + prompt; on user 'q' this raises.
+                        self._droop_alert_and_pause(event)
+                        droop_tripped = True
+                        break
+                if not droop_tripped:
+                    # Drain crops so the collector dataset is complete.
+                    probe_collector.wait_for_pending()
+                    dataset = probe_collector.snapshot() if hasattr(
+                        probe_collector, "snapshot"
+                    ) else None
+                    if dataset is None:
+                        # Test-fake collectors may not implement snapshot().
+                        # That path can't run real phase A — return an
+                        # inconclusive result and let the caller fall back.
+                        return PhaseAResult(inconclusive=True)
+                    # Build {crop_name: [size_at_probe_0, ...]} ordered
+                    # by probe index.
+                    agg = dataset.aggregated()
+                    crop_names: set[str] = set()
+                    for s in agg.samples:
+                        crop_names.update(s.sizes.keys())
+                    crop_sizes: dict[str, list[int]] = {}
+                    for name in sorted(crop_names):
+                        series = [
+                            size for _step, size in agg.crop_series_for(
+                                widest_ap_value, name
+                            )
+                        ]
+                        if len(series) == n_probes:
+                            crop_sizes[name] = series
+                    if not crop_sizes:
+                        return PhaseAResult(inconclusive=True)
+                    return phase_a_peaks(
+                        crop_sizes,
+                        dynamic_range_min=getattr(
+                            self.config,
+                            "SHARPNESS_CROP_DYNAMIC_RANGE_MIN",
+                            0.25,
+                        ),
+                    )
+            finally:
+                try:
+                    probe_collector.shutdown(wait=True)
+                except Exception:                        # noqa: BLE001
+                    log.exception("phase-A collector shutdown failed")
+                self._sharpness_collector = previous_collector
+
+            # Trip path: clear the collector, drop the discarded
+            # phase=probe rows from shots.csv, rewind to rail-zero,
+            # reset the droop window, and re-enter the loop.
+            droop.reset_all()
+            if self.shots_csv is not None:
+                self.shots_csv.drop_rows(
+                    lambda r: (
+                        r.get("lens_config_slug") == slug
+                        and r.get("phase") == Phase.PROBE.value
+                    )
+                )
+            # Rail is somewhere between probe 0 and probe N-1; sign-
+            # aware return brings it to position 0 with backlash.
+            current_pos = (probe_index) * spacing_mm  # last position visited
+            self._return_rail_to_zero(current_pos)
+            self._announce(
+                f"Phase A: restarting probes at {widest_aperture} "
+                "with fresh flash power ..."
+            )
 
     def _plan_phase_c(
         self,
@@ -1120,11 +1176,18 @@ class SessionRunner:
     ) -> tuple[int, int] | None:
         """Convert a PhaseAResult into phase-C step-index bounds.
 
+        ``rail_step_mm`` here must be the *signed* step size — same
+        convention as ``step_size_mm`` elsewhere in the runner: positive
+        for forward jogs, negative for backward. Dividing positions
+        (signed) by a signed step size gives unsigned step *indices*
+        regardless of direction, since step indices count forward in
+        the user's chosen direction from rail-zero.
+
         Returns ``(start_step_index, n_steps)`` where ``start_step_index``
-        is the rail step (signed, relative to rail-zero) where phase C
-        begins and ``n_steps`` is the count of forward steps to capture.
-        Returns ``None`` when phase A was inconclusive — the caller
-        falls back to the uniform sweep.
+        is the rail step (relative to rail-zero, in the user's
+        forward direction) where phase C begins and ``n_steps`` is the
+        count of steps to capture. Returns ``None`` when phase A was
+        inconclusive or the resulting window collapses to zero.
         """
         window = phase_c_window_mm(
             result,
@@ -1136,22 +1199,19 @@ class SessionRunner:
         )
         if window is None:
             return None
+        if rail_step_mm == 0:
+            return None
         lo_mm, hi_mm = window
-        # Convert to step-index bounds. Step indices are signed and
-        # represent rail positions relative to rail-zero in units of
-        # ``rail_step_mm``. For backward jogs (end_mm < 0,
-        # step_size_mm < 0) lo_mm < hi_mm both ≤ 0; converting to step
-        # indices preserves order via signed division.
-        start_step = int(round(lo_mm / rail_step_mm))
-        end_step = int(round(hi_mm / rail_step_mm))
-        # Always sweep forward in step-index direction matching end_mm.
-        if end_mm >= 0:
-            n_steps = end_step - start_step + 1
-        else:
-            # Backward sweep: step indices decrease from start. Flip
-            # so we iterate in the user's chosen direction.
-            start_step, end_step = end_step, start_step
-            n_steps = end_step - start_step + 1
+        # Both inputs are signed; dividing signed-by-signed yields a
+        # non-negative step index that counts forward in the user's
+        # chosen rail direction. The two computed indices may straddle
+        # zero or come out reversed; min(...) is the start, max(...) is
+        # the end.
+        s1 = int(round(lo_mm / rail_step_mm))
+        s2 = int(round(hi_mm / rail_step_mm))
+        start_step = min(s1, s2)
+        end_step = max(s1, s2)
+        n_steps = end_step - start_step + 1
         if n_steps < 1:
             return None
         return start_step, n_steps
@@ -1747,6 +1807,46 @@ class SessionRunner:
         median_ev = droop_evs[len(droop_evs) // 2]
         return median_ev, droop_event
 
+    def _make_droop_detector(self) -> DroopDetector:
+        """Return ``self.droop_detector`` if one was injected (tests),
+        otherwise build a fresh one from the config-driven window +
+        trip criteria. Used wherever the runner needs a detector
+        instance — phase A, the main sweep, etc."""
+        return self.droop_detector or DroopDetector(
+            window=self.config.ROLLING_WINDOW,
+            criteria=(self.config.DROOP_CRIT_A, self.config.DROOP_CRIT_B),
+        )
+
+    def _droop_alert_and_pause(self, event: DroopEvent) -> None:
+        """Send the ntfy notification, play the local chirp, and
+        prompt the user to swap batteries. Common to droop trips
+        from any phase (sweep, reshoot, probe).
+
+        Raises :class:`SessionAborted` if the user picks ``q``.
+        """
+        if self.ntfy is not None:
+            self.ntfy.with_body(
+                BATTERY_DROOP,
+                f"{event.aperture}: {event.triggered_count} of last "
+                f"{len(event.window_snapshot)} shots ≤ {event.threshold:+.1f} EV. "
+                f"Window: {event.window_snapshot!r}",
+            )
+        wav_path = getattr(self.config, "ALERT_WAV", None)
+        if wav_path is not None:
+            try:
+                play_alert(wav_path)
+            except Exception:                            # noqa: BLE001
+                log.exception("alert sound failed")
+        ok = self.confirm(
+            f"\nBattery droop on {event.aperture}. "
+            "Swap flash batteries, wait for steady ready light, "
+            "then press ENTER to resume. q = abort: "
+        )
+        if not ok:
+            raise SessionAborted("user aborted at droop pause")
+        # Don't let the multi-minute battery swap poison the ETA EWMA.
+        self._eta_invalidate()
+
     def _handle_droop(
         self,
         event: DroopEvent,
@@ -1767,33 +1867,7 @@ class SessionRunner:
         needed (droop fired on the first sample at the current step)
         — caller continues with ``aborted=True`` per the existing
         skip-the-rest-of-this-step semantics."""
-        if self.ntfy is not None:
-            self.ntfy.with_body(
-                BATTERY_DROOP,
-                f"{event.aperture}: {event.triggered_count} of last "
-                f"{len(event.window_snapshot)} shots ≤ {event.threshold:+.1f} EV. "
-                f"Window: {event.window_snapshot!r}",
-            )
-        # Local audible alert in addition to ntfy: the user is at
-        # the rig with their hands on the rail when this fires;
-        # waiting for a phone notification to wake them is too slow.
-        # Best-effort — paplay or alert.wav missing must not block.
-        wav_path = getattr(self.config, "ALERT_WAV", None)
-        if wav_path is not None:
-            try:
-                play_alert(wav_path)
-            except Exception:                            # noqa: BLE001
-                log.exception("alert sound failed")
-        # Pause: user swaps batteries, presses ENTER.
-        ok = self.confirm(
-            f"\nBattery droop on {event.aperture}. "
-            "Swap flash batteries, wait for steady ready light, "
-            "then press ENTER to resume. q = abort: "
-        )
-        if not ok:
-            raise SessionAborted("user aborted at droop pause")
-        # Don't let the multi-minute battery swap poison the ETA EWMA.
-        self._eta_invalidate()
+        self._droop_alert_and_pause(event)
         # Find the earliest step (across all apertures) whose EV ≤
         # the firing trip threshold. ``window_snapshot`` is the
         # firing aperture's window only; ``earliest_underexposed_step``

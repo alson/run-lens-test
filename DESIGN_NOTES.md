@@ -1331,3 +1331,186 @@ no extension needed. The mid-run extrapolation was correctly
 flagged as truncated *at that moment* but doesn't generalise
 past it — useful as a sanity-check trigger, less useful as a
 specific position prediction.
+
+### 6.26 Coarse-to-fine focus probe (replaces uniform sweep)
+
+Buffer analysis on three high-mag MC 105 + extension sessions
+(2026-05-06_175727, _231805, _200150) showed **30-60 % of the
+user-jogged rail range carried no usable peak data** — the user
+deliberately jogged conservatively wide, the planner sized a
+uniform step over that range, and a third to half of the resulting
+captures were on out-of-focus tails. At ~75 s per rail step (5
+apertures × 3 replicas × ~5 s recycle) and ~150-step typical
+sweeps, that's 30+ minutes of wasted capture per lens config plus
+real flash-battery droop margin.
+
+The replacement is a two-pass adaptive probe:
+
+1. **Phase A** — sparse sweep at the *widest aperture only*
+   (smallest DOF, sharpest peak) across the user's jog. Single
+   replica per probe, all 17 crops cropped & analysed. Locates
+   per-crop peaks via parabola-fit-refined argmax.
+2. **Phase C** — dense forward sweep across a narrow window sized
+   from the observed crop-peak band, all K apertures, full
+   replicas. Reuses the existing ``_run_sweep`` body.
+3. **Phase D** — existing post-sweep RangeChecker.evaluate flow.
+   No change. Acts as the safety net for residual high-FC
+   outliers.
+
+#### Why coarse-to-fine, not binary search
+
+Pure binary search reverses rail direction every probe. Each
+reversal triggers backlash compensation (~1-3 mm overshoot +
+return) on the encoderless StackShot, plus accumulating position
+drift. 5 reversals would cost ~10-15 mm of leadscrew travel vs
+~2 mm for a single forward sweep. The chosen design uses **two
+monotonic forward passes with one retract between them**, so total
+rail motion is ≤ 1.5× a uniform sweep — comparable wear, no
+direction reversals during data capture.
+
+#### Field-curvature finding: corner spread varies wildly
+
+Surveyed 357 scenarios across 111 unique (date, lens, mag) groups
+in `~/shared/files/pics/digikam/test-raw-data` via
+``tools/curvature_survey.py``. Distribution of
+``corner_spread / FWHM_widest`` at the widest aperture:
+
+| percentile | spread / FWHM |
+|---|---|
+| p10 | 0.25 (essentially flat-field) |
+| p50 | 0.88 (typical) |
+| p90 | 2.20 |
+| p99 | 8.84 |
+| max | 9.37 (MC 105 + 61 mm clean) |
+
+The three live calibration sessions I initially tuned against were
+all at the **p95-max tail** of the distribution — extreme outliers,
+not representative of typical lens configs. Most lenses have ~10×
+tighter corner spread than what I'd been calibrating on.
+
+#### Asymmetric bracket window
+
+On high-FC configs (MC 105 + 61 mm at 1.92×) the corner peaks all
+sit on **one side of the centre crop** — e.g. on session 231805,
+all 16 non-centre crops peak at steps 155-213 while the centre
+peaks at step 228. A symmetric window centred on the centre crop
+loses every corner peak. The phase-C window therefore brackets
+``[min_peak − padding × FWHM, max_peak + padding × FWHM]``, not
+``centre ± half_spread``. Caught this only after watching every
+aperture on 231805 fail with 30 % rel-loss in the first simulator
+run.
+
+#### Sub-sample peak refinement
+
+With ~9 phase-A samples across a typical 1.5-3 mm jog, the
+phase-A spacing is ~170-330 µm — much larger than FWHM_widest
+(~90-140 µm). Picking the discrete argmax would round each crop's
+peak to the nearest phase-A sample, inflating apparent corner
+spread by up to one phase-A spacing. The runner refines via a
+parabolic fit through the (argmax-1, argmax, argmax+1) triplet for
+sub-sample resolution at no extra capture cost. Same trick as
+``sharpness.detect.estimate_peak_vertex`` but operating on the
+sparse phase-A sample set, not the smoothed series.
+
+#### Calibration journey: padding × FWHM = 1.5
+
+**First-pass calibration** (3 live sessions, ``probe_simulator
+--padding-sweep``):
+
+| padding | savings (231805/200150) | worst rel-loss |
+|---|---|---|
+| 1.0 | 43 % / 47 % | 8.3 % (corner missed) |
+| 1.5 | 38 % / 38 % | 2.0 % |
+| **2.0 (initial pick)** | 34 % / 29 % | 0.0 % |
+
+Looked safe. Then I extended the calibration with the corpus
+survey and realised those three sessions are at the worst-FC 1 %
+of the corpus — picking 2.0 was over-conservative for the typical
+case. ``tools/curvature_savings_model.py`` projected savings
+across the corpus distribution at user_jog = 15 × FWHM:
+
+| padding | corpus p50 savings | phase-D fires |
+|---|---|---|
+| 1.0 | 80 % | 1/327 (8 % loss possible) |
+| **1.5 (chosen)** | **74 %** | **1/327** |
+| 2.0 (initial) | 67 % | 1/327 |
+
+1.5 holds rel-loss ≤ 2 % on every measured live session and projects
+~74 % median savings vs 67 % at 2.0. The 0.3 % phase-D-fire rate
+is acceptable — phase D is the existing safety net for residual
+field-tilt outliers anyway.
+
+#### Calibration journey: phase-A density N=9
+
+Initially picked N=7 by heuristic from the plan doc. Sweep showed
+that was sub-optimal (caught only when explicitly asked how I'd
+arrived at 7). Cross-regime validation via
+``tools/probe_replay_corpus.py``:
+
+* **Live wide-jog regime** (3 sessions, jog ≈ 9-20 × FWHM):
+  N=3 unsafe (8 % loss), N=5-7 leave 2 % loss on a p95 corner,
+  **N=9 strictly dominates 7** on the max-FC clean case (44 % vs
+  38 % savings, same loss profile, +2 captures ≈ 10 s).
+* **Older corpus regime** (136 scenarios, jog ≈ 5 × FWHM —
+  *tighter* than live): phase A goes inconclusive on 51-80 % of
+  scenarios because sparse phase-A samples on a tight jog often
+  can't pass the dynamic-range gate. Algorithm degrades gracefully
+  to today's full sweep + the wasted phase-A captures.
+  Cross-aperture amortized overhead at N=9 = ~-2 % on the median;
+  success cases (top ~30 %) still save 30-40 %.
+
+So: **phase A only earns its keep when users jog wide.** The
+design intent assumes they will (jogging-wide is now cheap), but
+if they tight-jog the cost is bounded ~2 % per lens config.
+
+#### Implementation: phase A is structurally isolated
+
+Phase-A captures live under `<lens>/probe/<widest_ap>/`, written
+through a *separate* phase-A `LiveCollector` rooted at
+`<lens>/probe/`. Phase D (the existing post-sweep range checker)
+holds a reference to the per-lens collector, which never sees
+phase-A samples — so the smoothed-bell range check operates on a
+clean phase-C dataset only.
+
+The runner's `_run_sweep` and `_run_range_check_and_extend` accept
+a `start_step_index` parameter; phase C runs at the absolute rail-
+zero-relative step index of the phase-C window's lower bound, so
+file step numbers (`step_0125.jpg` etc.) stay anchored to rail-
+zero rather than restarting at 0. Far-side and near-side phase-D
+extensions land at absolute step indices beyond the phase-C window
+(not relative to step 0), via a `start_step_index` argument
+threaded through `_extension_step_index`.
+
+#### Tools that fell out of the calibration
+
+* ``tools/probe_simulator.py`` — replays a captured live session
+  through the probe algorithm, reports per-aperture savings + worst
+  rel-loss + phase-D-would-fire. Padding-sweep mode and
+  phase-A-density-sweep mode for calibration.
+* ``tools/curvature_survey.py`` — walks the offline corpus and
+  reports per-scenario ``corner_spread / FWHM_widest`` distribution.
+* ``tools/curvature_savings_model.py`` — takes the survey CSV and
+  projects savings at given padding × user-jog factor.
+* ``tools/probe_replay_corpus.py`` — replays the phase-A/phase-C
+  algorithm on each scenario in the older corpus, with cross-
+  aperture amortization (K=5 default). Used to validate N choice
+  against a tighter-jog regime than the live calibration sessions.
+
+#### Failure modes documented
+
+1. **Phase A inconclusive** (< 3 valid crops): runner falls back to
+   today's uniform sweep across the user-jogged range. Cost: N
+   wasted phase-A captures (~9 × 1 ap × 1 replica ≈ 45 s).
+2. **Tight user-jog** (range < ~5 × FWHM): often triggers (1).
+   Bounded ~2 % amortized overhead. The algorithm assumes users
+   jog generously now that phase A makes wide-jogging cheap.
+3. **Corner peak outside phase-C window** (rare, ~0.3 % of corpus
+   configs): phase D detects the truncation and prompts an
+   extension. Same path that catches today's
+   under-jogged-from-the-start sweeps.
+4. **Off-target crops** (window lands off the wafer): unchanged
+   from today — dynamic-range gate filters these out before the
+   bracket math.
+
+Default: `PROBE_ENABLED = True` from this session. Flip to False
+in `config.py` to revert to the uniform-sweep flow per lens config.

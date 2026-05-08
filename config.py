@@ -159,6 +159,56 @@ RANGE_CHECK_ENABLED = True
 RANGE_EXTENSION_FRACTION = 0.5
 RANGE_CHECK_PROBE_STEPS = 2
 
+# ---- Coarse-to-fine focus probe --------------------------------------------
+# Two-pass adaptive sweep: a sparse phase-A probe at the widest aperture
+# locates the per-crop peak band, then a narrower phase-C window captures
+# all apertures at full density. Replaces the uniform user-jog → full-sweep
+# flow when enabled. The post-sweep RangeChecker (phase D) is unchanged
+# and handles residual high-FC outliers.
+#
+# See ~/.claude/plans/imperative-sprouting-biscuit.md and
+# tools/probe_simulator.py (calibration tooling).
+PROBE_ENABLED = True
+PROBE_PHASE_A_POINTS = 9
+"""Phase-A probe density across the user-jogged range (single
+aperture, single replica). Validated against two regimes:
+
+**Live wide-jog regime** (3 calibration sessions, p95-max field
+curvature, jog ≈ 9-20 × FWHM):
+
+* N=3: 8 % rel-loss (unsafe).
+* N=5-7: 2 % rel-loss on a p95 corner.
+* **N=9 (chosen)**: best savings on the worst-FC clean case
+  (44 % vs 38 % at N=7); same loss profile.
+* N=11+: marginally worse savings (-2 to -3 %) for no safety gain.
+
+**Older corpus regime** (136 scenarios from 2025-07 → 2026-02 in
+``test-raw-data/``, validated via ``tools/probe_replay_corpus.py``,
+typical jog ≈ 5 × FWHM — tighter than live):
+
+* Phase A goes inconclusive on 51-80 % of scenarios (sparse phase-A
+  samples on a tight jog often can't pass the dynamic-range gate).
+  Algorithm degrades gracefully: falls back to today's full uniform
+  sweep + the wasted phase-A captures.
+* Cross-aperture amortized overhead at N=9: ~-2 % on the median
+  scenario — bounded, not catastrophic.
+* Success cases (top ~30 % of corpus) save 30-40 % regardless of N.
+* Rel-loss > 2 %: 2 / 136 at N=9 (caught by phase D extension).
+
+So phase A only pays off when users actually jog wide. The design
+intent assumes users will (since jogging-wide is now cheap), but if
+they jog tight the cost is bounded ~2 % per lens config.
+"""
+
+PROBE_PHASE_C_FWHM_PADDING = 1.5
+"""Padding × FWHM_widest on each side of the observed crop-peak
+bracket. Phase C window =
+``[min_peak − PADDING × FWHM, max_peak + PADDING × FWHM]``.
+1.5 was calibrated against a 327-scenario field-curvature corpus
+(``tools/curvature_survey.py``): holds rel-loss ≤ 2 % on every
+measured live session, projects ~74 % median savings, fires phase D
+on ~0.3 % of corpus configs."""
+
 # ---- Sharpness pipeline ----------------------------------------------------
 
 SHARPNESS_MAX_WORKERS = 8
