@@ -537,6 +537,8 @@ After the main sweep, the runner runs the sharpness analysis and the flow branch
 
 **B. Truncated bell that the probe didn't bracket**: The runner prompts: `Range still inadequate on <slug> (peak_side=…). [ENTER] extend by ~N mm (M steps) on the failing side, [s] skip and continue to lens change, [q] abort`. ENTER shoots another `extension_steps` worth of grid slots on the failing side(s), re-evaluates, and re-prompts; loops until peak brackets or you skip / abort. `range_check.json` records `extend_rounds` (count of times you pressed ENTER).
 
+  Edge case: if the probe leaves the advisor at `peak_side="centered"` but `verdict_ok=False` (no aperture is truncated, but at least one aperture's crops were classified `OFF_TARGET` — usually a corner that fell off the wafer), the runner now exits the extend-more loop cleanly with a `range_check.json` note rather than prompting. Rail extension can't recover off-wafer crops; the operator sees the centered-not-OK note and the per-aperture summary in `notes` and decides offline whether to re-shoot with a different jog / target. Pre-fix the loop fell through to extending the originally-failing side and burned rail indefinitely.
+
 **C. All apertures' curves are flat (`OFF_TARGET`)**: Every aperture's `max/min < DEFAULT_FLAT_RATIO` — the rail span almost certainly missed the focus zone or the wafer position lacks micro-detail. Runner sends `Sweep off-target` ntfy + chirp and prompts: `[ENTER] re-jog START / END and re-sweep, [s] skip and continue with this data, [q] abort`. ENTER reruns the jog UI; calibration is preserved. The discarded sweep's `phase ∈ {sweep, probe, extension, reshoot, aborted}` rows are dropped from `shots.csv` for that slug at the moment of re-jog.
 
 ### Verify the cropping kept up

@@ -534,6 +534,66 @@ class TestProbeFails:
         # 4th evaluate returned bracket).
         assert len(prompts) == 2
 
+    def test_centered_not_ok_exits_without_extending(
+        self, cfg, tmp_path
+    ) -> None:
+        # Edge case: the probe says peak_side='centered' (no aperture
+        # is truncated) but verdict is still not OK because at least
+        # one aperture's crops were classified OFF_TARGET (e.g. a
+        # corner fell off the wafer). Rail extension cannot recover
+        # an off-wafer crop — extending burns rail and flash power
+        # without ever converging. The runner must exit cleanly with
+        # a range_check.json that captures the situation, NOT prompt
+        # for another extension round.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        prompts: list[str] = []
+
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 20,
+            inputs={"steps": 3, "end_mm": 20.0},
+        )
+        runner.prompt_range_inadequate = (
+            lambda msg: (prompts.append(msg), "skip")[1]
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            # 1) first call: peak truncated past end → trigger probe.
+            RangeResult(ok=False, peak_side="end_side",
+                        needs_extension=True,
+                        notes="peak beyond end"),
+            # 2) after probe: no aperture truncated (peak_side=
+            #    'centered') but verdict still not OK because an
+            #    OFF_TARGET aperture was found. The fixed runner must
+            #    exit here rather than fall through to extending
+            #    indefinitely.
+            RangeResult(ok=False, peak_side="centered",
+                        needs_extension=False,
+                        peak_in_range_after_probe=False,
+                        notes="f/4: OK; f/8: OFF_TARGET — no focus signal"),
+        ])
+        _run_one_lens_config(runner)
+
+        # 1 cal + 3 sweep + 1 probe = 5 captures. NO extension rounds.
+        capture_count = sum(1 for k, _ in camera.history if k == "capture")
+        assert capture_count == 5
+
+        # No user prompt fired — the runner exits the loop on the
+        # centered branch instead of asking the operator.
+        assert prompts == []
+
+        rc = json.loads(
+            (runner.session_dir / "L" / "range_check.json").read_text()
+        )
+        # extension_applied tracks whether any extend-more rounds ran;
+        # here we exit before any, so it's False (extend_rounds=0).
+        assert rc["extension_applied"] is False
+        assert rc["extend_rounds"] == 0
+        assert "centered" in rc["notes"]
+        # The note carries the advisor's per-aperture breakdown so the
+        # operator can see which apertures were OFF_TARGET.
+        assert "OFF_TARGET" in rc["notes"]
+
     def test_abort_at_inadequate_prompt(self, cfg, tmp_path) -> None:
         # User picks 'abort' at the prompt → SessionAborted bubbles
         # out and the session.json reflects it.

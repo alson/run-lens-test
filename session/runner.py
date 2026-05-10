@@ -1533,9 +1533,40 @@ class SessionRunner:
             elif current_peak_side in ("end_side", "start_side"):
                 current_sides = [(current_peak_side, extension_steps)]
             else:
-                # peak_side is "centered" or None but the loop didn't
-                # exit — defensive fall-through using the original sides.
-                current_sides = list(sides)
+                # peak_side is "centered" or None: no aperture is
+                # truncated, so extending rail will not help. The
+                # advisor returned not-OK because some apertures are
+                # OFF_TARGET (every valid crop flat / cross-compare
+                # rejected) — those crops fell off the wafer entirely.
+                # Rail rail extension can't conjure a peak that isn't
+                # there; the cure is a different jog / target.
+                # Exit cleanly instead of falling through and burning
+                # extension rounds indefinitely.
+                self._announce(
+                    f"Range check on {slug}: peak_side="
+                    f"{current_peak_side!r} but verdict not OK — "
+                    "no apertures are truncated, so rail extension "
+                    "won't help. Likely cause: one or more apertures' "
+                    "valid crops were classified OFF_TARGET. "
+                    "Continuing with the data we have."
+                )
+                write_json(lens_dir / "range_check.json", {
+                    "ok": False,
+                    "extension_applied": extend_rounds > 0,
+                    **record_base,
+                    "extension_step_count": extension_step_count_per_side,
+                    "extend_rounds": extend_rounds,
+                    "notes": (
+                        f"peak_side={current_peak_side!r} after probe "
+                        f"(round {extend_rounds}); no aperture is "
+                        "truncated, but verdict is not OK because at "
+                        "least one aperture's crops are OFF_TARGET. "
+                        "Rail extension cannot recover off-wafer "
+                        "crops; operator review recommended. "
+                        f"Advisor notes: {result2.notes}"
+                    ),
+                })
+                return self._steps_from_zero_at(current_pos, step_size_mm)
             # Send ntfy on every prompt round, not just the first —
             # the user may be away from the rig and only check their
             # phone periodically; missing the second prompt because
