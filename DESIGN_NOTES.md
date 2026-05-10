@@ -1514,3 +1514,49 @@ threaded through `_extension_step_index`.
 
 Default: `PROBE_ENABLED = True` from this session. Flip to False
 in `config.py` to revert to the uniform-sweep flow per lens config.
+
+### 6.27 Soft lenses need a LOW_SIGNAL distinction
+
+The Viltrox 85mm f/2 EVO + 61mm extension session on 2026-05-10
+produced corner crops with peak max/min ratios of 1.04–1.22 (4–22 %
+dynamic range) and clearly-visible bell shapes in the rail data.
+The single-threshold validity gate at
+`SHARPNESS_CROP_DYNAMIC_RANGE_MIN = 0.25` flagged every such corner
+as `OFF_TARGET` (ostensibly "fell off the wafer"), so the advisor
+either reported the aperture `OFF_TARGET` outright or, if the centre
+crop alone was strong, surfaced confusing summary lines like
+`"f/4: OK (16 invalid crops: …)"` for what was really a soft lens
+with valid-but-weak corner peaks.
+
+Splitting the threshold into two regions distinguishes the two cases:
+
+* `dr < SHARPNESS_CROP_OFF_TARGET_RANGE = 0.05` → `OFF_TARGET`. The
+  window genuinely fell off the wafer; no peak detection runs and the
+  crop is `valid=False`.
+* `0.05 ≤ dr < 0.25` → peak detection runs; an in-range peak is
+  reported as the new `CropStatus.LOW_SIGNAL`. Truncation status
+  takes precedence (a truncated soft bell still earns
+  `TRUNCATED_START` / `TRUNCATED_END` and rail extension), but a
+  centred soft bell is `LOW_SIGNAL` rather than `OK`.
+* `dr ≥ 0.25` → unchanged: `OK` for centred peaks, truncation flags
+  for clipped ones.
+
+The advisor treats `LOW_SIGNAL` like `OK` for the per-aperture
+verdict (a real peak was located, so the rail bracketed the focus
+zone) and surfaces the count in `Recommendation.summary()` —
+`f/4: OK (12 LOW_SIGNAL crops, 1 off-target ignored)` — so the
+operator can spot rigs where most corners are barely above noise
+without inflicting a `NEEDS_RESHOOT` on every soft-corner aperture.
+
+The 0.05 floor sits comfortably above empty-frame JPEG noise
+(typically ≤ 0.03 on this rig) while still capturing the dimmest
+legitimate corners observed.
+
+Knock-on fix: the runner's extend-more loop had a defensive fall-
+through for `peak_side ∈ {"centered", None}` that re-extended the
+originally-failing side. With the new classifier the situation
+"centered peak_side but verdict not OK" becomes possible (an
+`OFF_TARGET` corner pulls the verdict to not-OK without truncating
+anything), and rail extension cannot recover an off-wafer crop. The
+loop now exits cleanly on that branch with a note, instead of
+burning rail and flash power forever.

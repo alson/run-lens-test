@@ -242,14 +242,16 @@ class TestMultiCropAggregation:
         # Centre + valid corner are bell-shaped (would normally be OK);
         # but a "rising" series in an *invalid* corner must NOT
         # promote the aperture to NEEDS_RESHOOT / EXTEND_FORWARD.
-        # Build a low-dynamic-range "rising" series so it's both
-        # rising and invalid (max ≈ 118 min = 100 → dr ≈ 0.15).
+        # Build a sub-OFF_TARGET-floor rising series (max=103 min=100
+        # ⇒ dr ≈ 0.029, below the 0.05 floor) so the crop is invalid
+        # and short-circuited to OFF_TARGET without peak detection.
         n = len(BELL)
-        invalid_rising = [100 + i for i in range(n)]
-        # Confirm the synthetic series stays under the validity floor.
+        # 3 levels spread across n steps so the series rises monotonically.
+        invalid_rising = [100 + (i * 3) // (n - 1) for i in range(n)]
+        # Confirm the synthetic series stays below the OFF_TARGET floor.
         assert (max(invalid_rising) - min(invalid_rising)) / max(
             invalid_rising
-        ) < 0.25
+        ) < 0.05
         crops = {
             "center": BELL,
             "left-edge": BELL,
@@ -294,6 +296,103 @@ class TestMultiCropAggregation:
         assert per["center"].valid is True
         assert per["top-left"].valid is False
         assert per["top-left"].dynamic_range < 0.25
+
+
+# --- LOW_SIGNAL aggregation (Fix 1 interaction with advisor) -------------
+
+
+# Low-signal bell at N steps long: dr ≈ 0.10, peak in the middle of
+# the range — this is the soft-corner regime (Viltrox 85mm + 61mm
+# extension produced corners with max/min ratios of 1.04–1.22 on
+# 2026-05-10).
+LOW_SIGNAL_BELL_19 = [
+    100, 102, 104, 106, 108,
+    109, 110, 111, 110, 109,
+    108, 106, 104, 102, 100,
+     98,  96,  94,  92,
+]
+assert len(LOW_SIGNAL_BELL_19) == N
+# Sanity-check the dr lands in the LOW_SIGNAL band.
+assert 0.05 <= (
+    (max(LOW_SIGNAL_BELL_19) - min(LOW_SIGNAL_BELL_19))
+    / max(LOW_SIGNAL_BELL_19)
+) < 0.25
+
+# Rising series with dr in the LOW_SIGNAL band — a soft-but-real bell
+# truncated past the far end. Aggregator must still flag NEEDS_RESHOOT.
+LOW_SIGNAL_RISING_19 = [100 + i for i in range(N)]
+assert 0.05 <= (
+    (max(LOW_SIGNAL_RISING_19) - min(LOW_SIGNAL_RISING_19))
+    / max(LOW_SIGNAL_RISING_19)
+) < 0.25
+
+
+class TestLowSignalAggregation:
+    def test_all_low_signal_aperture_is_ok(self) -> None:
+        # Every crop is a weak-but-real bell. Aperture verdict is OK
+        # (a peak was located in every crop) and the summary surfaces
+        # the LOW_SIGNAL count so the operator can flag the rig as
+        # soft.
+        crops = {
+            "center": LOW_SIGNAL_BELL_19,
+            "top-left": LOW_SIGNAL_BELL_19,
+            "top-right": LOW_SIGNAL_BELL_19,
+            "bottom-left": LOW_SIGNAL_BELL_19,
+            "bottom-right": LOW_SIGNAL_BELL_19,
+        }
+        rec = advise(_dataset({8.0: crops}))[8.0]
+        assert rec.verdict == Verdict.OK
+        assert rec.direction == Direction.NONE
+        # All five crops should be LOW_SIGNAL (no OK among them).
+        assert len(rec.low_signal_crops) == 5
+        # Summary mentions the LOW_SIGNAL count.
+        s = rec.summary()
+        assert "LOW_SIGNAL" in s
+        assert "5" in s
+
+    def test_mixed_ok_and_low_signal_aperture_is_ok(self) -> None:
+        # A clean centre bell with low-signal corners — the regime
+        # introduced by the Viltrox 85mm + 61mm extension session.
+        # Aperture verdict is OK; summary still flags the LOW_SIGNAL
+        # corner count.
+        crops = {
+            "center": BELL,
+            "top-left": LOW_SIGNAL_BELL_19,
+            "bottom-right": LOW_SIGNAL_BELL_19,
+        }
+        rec = advise(_dataset({8.0: crops}))[8.0]
+        assert rec.verdict == Verdict.OK
+        assert rec.direction == Direction.NONE
+        assert {c.crop_name for c in rec.low_signal_crops} == {
+            "top-left", "bottom-right",
+        }
+        assert "2 LOW_SIGNAL" in rec.summary()
+
+    def test_low_signal_with_truncation_yields_needs_reshoot(self) -> None:
+        # A weak bell truncated past the far end. Truncation takes
+        # precedence over LOW_SIGNAL — the aperture needs more rail
+        # even if the underlying signal is soft.
+        crops = {
+            "center": BELL,
+            "top-left": LOW_SIGNAL_RISING_19,
+        }
+        rec = advise(_dataset({8.0: crops}))[8.0]
+        assert rec.verdict == Verdict.NEEDS_RESHOOT
+        assert rec.direction == Direction.EXTEND_FORWARD
+        # The truncated soft bell drove the extension projection.
+        assert rec.extra_steps >= 2
+
+    def test_low_signal_does_not_get_flagged_as_invalid(self) -> None:
+        # LOW_SIGNAL crops are valid contributors — they should NOT
+        # appear in invalid_crops (that list is for sub-OFF_TARGET-floor
+        # window-off-the-wafer cases).
+        crops = {
+            "center": BELL,
+            "top-left": LOW_SIGNAL_BELL_19,
+        }
+        rec = advise(_dataset({8.0: crops}))[8.0]
+        assert rec.invalid_crops == ()
+        assert all(c.valid for c in rec.crop_analyses)
 
 
 # --- Recommendation public surface ---------------------------------------

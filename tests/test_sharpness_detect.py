@@ -289,14 +289,18 @@ class TestAnalyzeCrop:
         assert a.extra_steps_needed is None
 
     def test_dynamic_range_threshold_can_be_overridden(self) -> None:
-        # Same flat-ish series as above; with a permissive 1% floor it
-        # should now pass the gate and run normal detection.
+        # Same flat-ish series as above. The OFF_TARGET floor (0.05 by
+        # default) is what gates validity; lowering it lets the crop
+        # pass through to peak / truncation detection. With 0.05 default
+        # and dr ≈ 0.038 the crop is OFF_TARGET; with 0.01 it gets
+        # classified by its peak (here it sits below DYNAMIC_RANGE_MIN
+        # too, so the in-range peak becomes LOW_SIGNAL).
         noisy = [100, 101, 102, 103, 104, 103, 102, 101, 100, 102]
         a = analyze_crop(
             "top-left",
             noisy,
             flagged_off_target=False,
-            dynamic_range_min=0.01,
+            off_target_range=0.01,
         )
         assert a.valid is True
 
@@ -304,6 +308,105 @@ class TestAnalyzeCrop:
         a = analyze_crop("center", [], flagged_off_target=False)
         assert a.status == CropStatus.EMPTY
         assert a.valid is False
+
+
+# --- LOW_SIGNAL classifier (three-region threshold) ----------------------
+
+
+def _bell_at_scale(min_v: int, max_v: int, n: int = 19) -> list[int]:
+    """Build a bell-shaped series with the exact requested min and max.
+
+    Triangular profile so the peak lands at a deterministic centre
+    index — sufficient for status classification tests without
+    smearing into truncation edges.
+    """
+    mid = (n - 1) // 2
+    out: list[int] = []
+    for i in range(n):
+        # Distance from centre, normalised to [0, 1].
+        d = abs(i - mid) / mid
+        out.append(int(round(max_v - (max_v - min_v) * d)))
+    # Pin the exact extrema in case rounding nudged them.
+    out[mid] = max_v
+    out[0] = min_v
+    out[-1] = min_v
+    return out
+
+
+class TestThreeRegionClassifier:
+    """The dynamic-range classifier has three regions:
+
+    * dr < 0.05  → OFF_TARGET (window off the wafer)
+    * 0.05 ≤ dr < 0.25 → LOW_SIGNAL (real but weak bell)
+    * dr ≥ 0.25 → OK (high-signal bell)
+    """
+
+    def test_dr_below_off_target_floor_is_off_target(self) -> None:
+        # dr ≈ 0.03 — below the 0.05 floor.
+        series = _bell_at_scale(min_v=100, max_v=103)
+        assert (max(series) - min(series)) / max(series) < 0.05
+        a = analyze_crop("top-left", series, flagged_off_target=False)
+        assert a.status == CropStatus.OFF_TARGET
+        assert a.valid is False
+        # OFF_TARGET short-circuits — no peak detection runs.
+        assert a.peak_step is None
+        assert a.extra_steps_needed is None
+
+    def test_dr_in_low_signal_band_yields_low_signal(self) -> None:
+        # dr ≈ 0.10 — between OFF_TARGET (0.05) and OK (0.25).
+        series = _bell_at_scale(min_v=100, max_v=111)
+        dr = (max(series) - min(series)) / max(series)
+        assert 0.05 <= dr < 0.25
+        a = analyze_crop("top-left", series, flagged_off_target=False)
+        assert a.status == CropStatus.LOW_SIGNAL
+        # Peak detection ran — the centred bell is in-range.
+        assert a.peak_step is not None
+        # LOW_SIGNAL crops are *valid* contributors to the verdict.
+        assert a.valid is True
+        assert a.dynamic_range == pytest.approx(dr, abs=0.005)
+
+    def test_dr_above_ok_floor_yields_ok(self) -> None:
+        # dr ≈ 0.30 — at or above the 0.25 OK ceiling.
+        series = _bell_at_scale(min_v=70, max_v=100)
+        dr = (max(series) - min(series)) / max(series)
+        assert dr >= 0.25
+        a = analyze_crop("center", series, flagged_off_target=False)
+        assert a.status == CropStatus.OK
+        assert a.valid is True
+
+    def test_truncation_takes_precedence_over_low_signal(self) -> None:
+        # Rising half-bell in the LOW_SIGNAL dr band. Should be reported
+        # as TRUNCATED_END (a truncated weak peak still needs more rail),
+        # not LOW_SIGNAL.
+        rising = [100 + i for i in range(15)]   # max=114, min=100, dr≈0.123
+        dr = (max(rising) - min(rising)) / max(rising)
+        assert 0.05 <= dr < 0.25
+        a = analyze_crop("top-left", rising, flagged_off_target=False)
+        assert a.status == CropStatus.TRUNCATED_END
+        # Truncation also wins the extra_steps projection — the soft
+        # bell is still a peak the runner can chase by extending rail.
+        assert a.extra_steps_needed is not None
+        assert a.extra_steps_needed >= 2
+
+    def test_truncated_start_in_low_signal_band(self) -> None:
+        falling = [114 - i for i in range(15)]   # max=114, min=100
+        dr = (max(falling) - min(falling)) / max(falling)
+        assert 0.05 <= dr < 0.25
+        a = analyze_crop("bottom-left", falling, flagged_off_target=False)
+        assert a.status == CropStatus.TRUNCATED_START
+
+    def test_off_target_floor_can_be_overridden(self) -> None:
+        # Caller can loosen the off-target floor if they want every
+        # series classified by its peak (e.g. a soft-lens campaign).
+        series = _bell_at_scale(min_v=100, max_v=103)  # dr ≈ 0.03
+        a = analyze_crop(
+            "top-left", series,
+            flagged_off_target=False, off_target_range=0.01,
+        )
+        # Now the dr lands in the LOW_SIGNAL band (the OK floor is
+        # still the default 0.25, well above 0.03).
+        assert a.valid is True
+        assert a.status == CropStatus.LOW_SIGNAL
 
 
 # --- analyze_crops_for_aperture ------------------------------------------

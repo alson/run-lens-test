@@ -49,6 +49,7 @@ from sharpness.detect import (
     DEFAULT_DYNAMIC_RANGE_MIN,
     DEFAULT_EDGE_STEPS,
     DEFAULT_OFF_TARGET_FACTOR,
+    DEFAULT_OFF_TARGET_RANGE,
     CropAnalysis,
     CropStatus,
     analyze_crops_for_aperture,
@@ -100,6 +101,20 @@ class Recommendation:
         )
 
     @property
+    def low_signal_crops(self) -> tuple[CropAnalysis, ...]:
+        """Crops with a real but weak bell — dynamic range between the
+        OFF_TARGET floor and the OK ceiling, peak found in the middle
+        of the rail series. Count as ``OK`` for the per-aperture
+        verdict but surfaced separately so the operator can spot rigs
+        where most corners are barely above the noise floor (e.g. the
+        Viltrox 85 + 61 mm extension corner regime)."""
+        return tuple(
+            c
+            for c in self.crop_analyses
+            if c.status == CropStatus.LOW_SIGNAL
+        )
+
+    @property
     def invalid_crops(self) -> tuple[CropAnalysis, ...]:
         """Crops excluded from the verdict because their dynamic range
         was below ``SHARPNESS_CROP_DYNAMIC_RANGE_MIN`` — the window
@@ -122,9 +137,15 @@ class Recommendation:
         invalid_note = self._invalid_note()
         if self.verdict == Verdict.OK:
             n_off = len(self.off_target_crops)
+            n_low = len(self.low_signal_crops)
             base = f"f/{self.aperture:g}: OK"
+            qualifiers: list[str] = []
+            if n_low:
+                qualifiers.append(f"{n_low} LOW_SIGNAL crops")
             if n_off:
-                base += f" ({n_off} off-target crops ignored)"
+                qualifiers.append(f"{n_off} off-target crops ignored")
+            if qualifiers:
+                base += f" ({', '.join(qualifiers)})"
             return base + invalid_note
         if self.verdict == Verdict.OFF_TARGET:
             base = (
@@ -182,12 +203,17 @@ def _build_recommendation(
     aperture: float, analyses: list[CropAnalysis]
 ) -> Recommendation:
     # Only valid crops feed into the verdict / direction / extension.
-    # Invalid (low dynamic range) crops fell off the wafer; their
-    # near-constant series would otherwise look "non-truncated peak in
-    # range" purely as a numerical artifact.
+    # Invalid (below the OFF_TARGET floor) crops fell off the wafer;
+    # their near-constant series would otherwise look "non-truncated
+    # peak in range" purely as a numerical artifact.
     valid = [c for c in analyses if c.valid]
     truncated = tuple(c for c in valid if c.status.is_truncated)
     if truncated:
+        # Truncated crops always promote the aperture to
+        # NEEDS_RESHOOT — even if the truncated crop's underlying
+        # signal level was LOW_SIGNAL territory. A truncated weak
+        # bell is still a peak the runner can chase by extending
+        # rail.
         direction = _direction_for(truncated)
         extra = _extra_steps_for(truncated)
         return Recommendation(
@@ -197,12 +223,17 @@ def _build_recommendation(
             extra_steps=extra,
             crop_analyses=tuple(analyses),
         )
-    # No truncated crops among the valid ones. Distinguish "at least
-    # one valid crop has a real peak in range" (OK) from "every valid
-    # crop is flat / off-target, or no crop is valid at all"
-    # (OFF_TARGET). The latter is the runner's re-jog signal at the
-    # session level when *all* apertures land here.
-    has_real_peak = any(c.status == CropStatus.OK for c in valid)
+    # No truncated crops among the valid ones. "Real peak found"
+    # includes both OK (high-signal) and LOW_SIGNAL (weak but bell-
+    # shaped peak in range) — both signal that the rail bracketed the
+    # peak, so the verdict is OK. If neither kind of in-range peak
+    # is present (every valid crop is OFF_TARGET / EMPTY, or no crop
+    # is valid at all) we return OFF_TARGET. That's the runner's
+    # re-jog signal at the session level when *all* apertures land
+    # here.
+    has_real_peak = any(
+        c.status in (CropStatus.OK, CropStatus.LOW_SIGNAL) for c in valid
+    )
     if has_real_peak:
         return Recommendation(
             aperture=aperture,
@@ -229,6 +260,7 @@ def advise(
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
+    off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
     crop_names: tuple[str, ...] = CROP_NAMES,
 ) -> dict[float, Recommendation]:
     """Produce one ``Recommendation`` per aperture present in ``dataset``.
@@ -237,14 +269,17 @@ def advise(
     median before peak / truncation detection so the bell-curve
     primitives see one point per rail step, not N.
 
-    All crops with sufficient dynamic range
-    (``(max-min)/max >= dynamic_range_min``) feed independently into
-    the per-aperture aggregate: the verdict is OK only when every
-    valid crop is OK; truncation in any direction at any valid crop
-    promotes the aperture to ``NEEDS_RESHOOT``; if valid crops
-    disagree on truncation direction (e.g. centre rolls back while a
-    corner runs forward — classic field curvature) the aperture
-    direction collapses to ``BOTH`` so the runner extends bilaterally.
+    All crops above the ``off_target_range`` floor (default 0.05) feed
+    independently into the per-aperture aggregate. Within that band,
+    crops with dynamic range below ``dynamic_range_min`` (default 0.25)
+    are still classified — an in-range peak becomes ``LOW_SIGNAL``,
+    which the aggregator treats like ``OK`` for the verdict but
+    surfaces in the summary string. Truncation in any direction at any
+    valid crop promotes the aperture to ``NEEDS_RESHOOT``; if valid
+    crops disagree on truncation direction (e.g. centre rolls back
+    while a corner runs forward — classic field curvature) the
+    aperture direction collapses to ``BOTH`` so the runner extends
+    bilaterally.
     """
     aggregated = dataset.aggregated()
     out: dict[float, Recommendation] = {}
@@ -259,6 +294,7 @@ def advise(
             cross_compare_factor=cross_compare_factor,
             edge_steps=edge_steps,
             dynamic_range_min=dynamic_range_min,
+            off_target_range=off_target_range,
         )
         out[aperture] = _build_recommendation(aperture, analyses)
     return out

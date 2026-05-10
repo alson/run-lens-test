@@ -234,9 +234,10 @@ SHARPNESS_CROPPED_DIRNAME = "cropped"
 17 crops are persisted. Matches the user's offline-analysis layout."""
 
 SHARPNESS_CROP_DYNAMIC_RANGE_MIN = 0.25
-"""Per-crop validity floor as ``(max - min) / max`` over the rail
-series. Crops below this dynamic range are declared *invalid* for the
-aperture they belong to and excluded from the per-aperture verdict.
+"""Upper threshold for the per-crop signal classifier as
+``(max - min) / max`` over the rail series. Crops at or above this
+dynamic range are treated as high-signal: a real peak in the middle
+of the range becomes :data:`CropStatus.OK`.
 
 The wafer doesn't necessarily fill the frame, so corner crops can
 fall off onto a low-contrast background; their JPEG sizes barely
@@ -244,7 +245,31 @@ move across the focus sweep because there's nothing to focus on.
 A defocused wafer crop, by contrast, swings dramatically (typical
 on-target peak/trough ratios of 1.5–1.8 ⇒ dynamic range 0.33–0.44).
 0.25 sits comfortably below that band and well above empty-frame
-noise (typically ≤ 0.10)."""
+noise (typically ≤ 0.10).
+
+Crops with dynamic range between
+:data:`SHARPNESS_CROP_OFF_TARGET_RANGE` and this value are classified
+as ``LOW_SIGNAL`` — a real but weak bell. The aggregator treats those
+like ``OK`` for the per-aperture verdict (a peak was found), while
+still reporting the count so the operator can spot rigs where every
+corner is barely above the noise floor."""
+
+SHARPNESS_CROP_OFF_TARGET_RANGE = 0.05
+"""Lower threshold for the per-crop signal classifier. Crops with
+``(max - min) / max`` strictly below this value are short-circuited to
+``OFF_TARGET`` without peak / truncation detection — the window almost
+certainly fell off the wafer onto featureless background.
+
+Empirical motivation: the Viltrox 85mm f/2 EVO + 61mm extension combo
+(2026-05-10 rig session) produced corner crops with max/min ratios of
+1.04–1.22 (dynamic range 0.04–0.18) and clearly-visible bell shapes.
+The old single-threshold logic (everything below 0.25 → OFF_TARGET)
+classified every such corner as off-wafer, hiding the genuine soft
+bells. Splitting the threshold into a low ``OFF_TARGET`` floor and a
+higher ``OK`` ceiling lets soft-but-real bells be reported as
+``LOW_SIGNAL`` instead. 0.05 sits comfortably above empty-frame JPEG
+noise while still capturing the dimmest legitimate corners observed
+on the rig."""
 
 # ---- Step-numbering for capture filenames ----------------------------------
 

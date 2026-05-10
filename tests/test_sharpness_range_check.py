@@ -323,6 +323,32 @@ class TestMultiCropFieldCurvature:
         assert result.ok is False
         assert result.needs_extension is False
 
+    def test_all_low_signal_aperture_yields_ok_centered(self, cfg) -> None:
+        # Soft-lens regime: every crop has a real but weak bell with dr
+        # in the LOW_SIGNAL band (0.05–0.25). The advisor classifies
+        # them LOW_SIGNAL, the aggregator treats those like OK for the
+        # verdict, and the range-checker therefore reports
+        # peak_side='centered' / ok=True. This is the Fix-3 interaction
+        # path: LOW_SIGNAL crops do not trigger the "centered but not
+        # OK" off-target exit.
+        n = 11
+        # Bell with min=100 max=111 — dr ≈ 0.099, in the LOW_SIGNAL band.
+        soft_bell = _bell(n, peak_step=5, base=100, peak=111)
+        per_crop = {name: list(soft_bell) for name in CROP_NAMES}
+        samples = _samples_with_per_crop_series(8.0, per_crop)
+        checker = SharpnessRangeChecker(cfg, collector=FakeCollector(samples=samples))
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=1.0, apertures=["f/8"],
+        )
+        assert result.ok is True
+        assert result.peak_side == "centered"
+        assert result.needs_extension is False
+        assert result.all_off_target is False
+        # Notes call out the LOW_SIGNAL count so the operator can spot
+        # the soft-rig regime at a glance.
+        assert "LOW_SIGNAL" in result.notes
+
 
 class TestUnsetCollector:
     def test_evaluate_without_collector_raises(self, cfg) -> None:

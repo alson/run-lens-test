@@ -43,6 +43,7 @@ __all__ = [
     "DEFAULT_EDGE_STEPS",
     "DEFAULT_FLAT_RATIO",
     "DEFAULT_OFF_TARGET_FACTOR",
+    "DEFAULT_OFF_TARGET_RANGE",
     "analyze_crop",
     "analyze_crops_for_aperture",
     "dynamic_range",
@@ -75,13 +76,22 @@ DEFAULT_FLAT_RATIO = 1.15
 # below the dynamic-range floor (windows landing on low-contrast
 # background).
 DEFAULT_OFF_TARGET_FACTOR = 0.25
-# Minimum per-crop dynamic range ``(max - min) / max`` for the crop to
-# count as valid for its aperture's verdict. Below this we assume the
-# crop window fell off the wafer onto low-contrast background. Default
-# matches ``config.SHARPNESS_CROP_DYNAMIC_RANGE_MIN`` but is duplicated
-# here so the detector stays import-free of session config — callers
-# wire the configured value through ``analyze_crops_for_aperture``.
+# High-signal floor for per-crop dynamic range ``(max - min) / max``.
+# Crops at or above this threshold with a peak in the middle of the
+# rail series classify as :data:`CropStatus.OK`. Default matches
+# ``config.SHARPNESS_CROP_DYNAMIC_RANGE_MIN`` but is duplicated here so
+# the detector stays import-free of session config — callers wire the
+# configured value through ``analyze_crops_for_aperture``.
 DEFAULT_DYNAMIC_RANGE_MIN = 0.25
+# Off-target floor. Crops with dynamic range strictly below this value
+# are short-circuited to :data:`CropStatus.OFF_TARGET` (window fell off
+# the wafer / featureless background). Crops between
+# ``DEFAULT_OFF_TARGET_RANGE`` and ``DEFAULT_DYNAMIC_RANGE_MIN`` go
+# through peak / truncation detection but their in-range result is
+# marked :data:`CropStatus.LOW_SIGNAL` — a real but weak bell, common
+# on soft lenses (e.g. fast primes with external extension tubes)
+# where corner acutance lands at max/min ratios of 1.04–1.22.
+DEFAULT_OFF_TARGET_RANGE = 0.05
 
 
 # Backwards-compatible alias — the live module historically called this
@@ -206,17 +216,32 @@ def analyze_crop(
     flagged_off_target: bool,
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
+    off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
 ) -> CropAnalysis:
     """Per-crop bell-curve verdict for one aperture.
 
-    ``dynamic_range_min`` is the validity floor: crops whose rail
-    series has ``(max-min)/max < dynamic_range_min`` are flagged
-    invalid (window fell off the wafer or otherwise has no focus
-    signal) and short-circuited to ``CropStatus.OFF_TARGET`` without
-    running peak / truncation detection. ``flagged_off_target``
-    carries the cross-compare result and acts as a secondary
-    ``OFF_TARGET`` signal for crops that *do* swing across the rail
-    but whose peak is far weaker than the best crop in the aperture.
+    Per-crop dynamic range ``dr = (max - min) / max`` over the rail
+    series is the primary classifier:
+
+    * ``dr < off_target_range`` (default 0.05): short-circuit to
+      :data:`CropStatus.OFF_TARGET`. The window almost certainly fell
+      off the wafer onto featureless background; no peak detection is
+      run. ``valid=False``.
+    * ``off_target_range <= dr < dynamic_range_min`` (default 0.05 ≤
+      dr < 0.25): a real but weak bell. Peak / truncation detection
+      runs normally; an in-range peak becomes :data:`CropStatus.LOW_SIGNAL`
+      (the operator-facing "soft lens" status). Truncation is reported
+      as ``TRUNCATED_START`` / ``TRUNCATED_END`` exactly as for
+      high-signal crops — truncation status takes precedence over the
+      low-signal label so the runner still extends rail for these.
+      ``valid=True``.
+    * ``dr >= dynamic_range_min``: high signal. In-range peak becomes
+      :data:`CropStatus.OK`; truncation handled as usual. ``valid=True``.
+
+    ``flagged_off_target`` carries the cross-compare result and acts as
+    a secondary ``OFF_TARGET`` signal for crops that *do* swing across
+    the rail but whose peak is far weaker than the best crop in the
+    aperture.
     """
     n = len(sizes)
     if n == 0:
@@ -235,9 +260,9 @@ def analyze_crop(
         )
 
     dr = dynamic_range(sizes)
-    valid = dr >= dynamic_range_min
 
-    if not valid:
+    if dr < off_target_range:
+        # Below the OFF_TARGET floor — window fell off the wafer.
         return CropAnalysis(
             crop_name=crop_name,
             status=CropStatus.OFF_TARGET,
@@ -252,13 +277,36 @@ def analyze_crop(
             dynamic_range=dr,
         )
 
-    if flagged_off_target or is_flat(sizes):
-        # Cross-compare or legacy is_flat fallback. Crop has *some*
-        # dynamic range but its peak is much weaker than the best crop
-        # in the aperture, or it's still flat under the looser
-        # max/min<1.15 metric. Treat as OFF_TARGET but valid=True so
-        # diagnostics distinguish "fell off the wafer" (dynamic range
-        # below floor) from "weaker than peers".
+    if flagged_off_target:
+        # Cross-compare flagged: crop has *some* dynamic range but its
+        # peak is much weaker than the best crop in the aperture.
+        # Treat as OFF_TARGET but valid=True so diagnostics distinguish
+        # "fell off the wafer" (dynamic range below floor) from
+        # "weaker than peers".
+        return CropAnalysis(
+            crop_name=crop_name,
+            status=CropStatus.OFF_TARGET,
+            n_steps=n,
+            peak_step=None,
+            peak_pct=None,
+            estimated_peak_step=None,
+            extra_steps_needed=None,
+            max_size=max(sizes),
+            min_size=min(sizes),
+            valid=True,
+            dynamic_range=dr,
+        )
+
+    # is_flat() is the legacy max/min < 1.15 detector. For high-signal
+    # crops it's a useful safety net (a series that swings wildly but
+    # has a max/min ratio just barely above 1.15 is rare and probably
+    # noise); but in the LOW_SIGNAL band (dr < dynamic_range_min)
+    # max/min will routinely fall below 1.15 *by definition*
+    # (dr = 0.10 ⇔ max/min ≈ 1.11) — and we want those crops classified
+    # as LOW_SIGNAL via the dr-based logic, not silently OFF_TARGET via
+    # the ratio-based one. Only fall back to is_flat for crops that
+    # cleared the high-signal floor.
+    if dr >= dynamic_range_min and is_flat(sizes):
         return CropAnalysis(
             crop_name=crop_name,
             status=CropStatus.OFF_TARGET,
@@ -276,6 +324,11 @@ def analyze_crop(
     pk = peak_index(sizes)
     pct = pk / max(1, n - 1)
     status = truncation_status(pk, n, edge_steps=edge_steps)
+    # Demote an in-range OK to LOW_SIGNAL when the dynamic range is
+    # below the high-signal floor. Truncation status (start/end/empty)
+    # is untouched — truncated soft bells still need rail extension.
+    if status == CropStatus.OK and dr < dynamic_range_min:
+        status = CropStatus.LOW_SIGNAL
     vertex = estimate_peak_vertex(sizes) if status.is_truncated else None
     extra = extra_steps_needed(sizes, status, n)
 
@@ -300,6 +353,7 @@ def analyze_crops_for_aperture(
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
+    off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
 ) -> list[CropAnalysis]:
     """Run the full per-crop analysis for one aperture.
 
@@ -307,14 +361,16 @@ def analyze_crops_for_aperture(
     The returned list has one ``CropAnalysis`` per crop, in the
     iteration order of ``crop_sizes``.
 
-    Cross-compare is computed only over the crops that pass the
-    dynamic-range gate so a swarm of off-wafer corners can't drag
-    down the reference max and falsely flag the few valid crops.
+    Cross-compare is computed only over the crops that clear the
+    OFF_TARGET floor (``dynamic_range >= off_target_range``); a swarm
+    of off-wafer corners can't drag down the reference max and
+    falsely flag the few real crops. LOW_SIGNAL crops still
+    participate in cross-compare — they are real signal, just weak.
     """
     valid_maxes: dict[str, int] = {
         name: max(sizes)
         for name, sizes in crop_sizes.items()
-        if sizes and dynamic_range(sizes) >= dynamic_range_min
+        if sizes and dynamic_range(sizes) >= off_target_range
     }
     flagged = off_target_by_cross_compare(valid_maxes, factor=cross_compare_factor)
     return [
@@ -324,6 +380,7 @@ def analyze_crops_for_aperture(
             flagged_off_target=name in flagged,
             edge_steps=edge_steps,
             dynamic_range_min=dynamic_range_min,
+            off_target_range=off_target_range,
         )
         for name, sizes in crop_sizes.items()
     ]

@@ -298,11 +298,26 @@ All tunable constants are at the top of `config.py`. Notable ones:
   bench rig is ~89 ms for 17 crops at 45 MP.
 - `SHARPNESS_CROPPED_DIRNAME` — subdir name under each
   `<lens>/<aperture>/` where the 17 crops are persisted.
-- `SHARPNESS_CROP_DYNAMIC_RANGE_MIN` — per-crop validity floor
-  (default 0.25). A crop whose `(max - min) / max` size series
-  falls below this is treated as "off the wafer" and excluded
-  from the per-aperture verdict. Defocused-but-on-wafer crops
-  swing 0.33–0.44, so 0.25 is comfortably below.
+- `SHARPNESS_CROP_DYNAMIC_RANGE_MIN` — high-signal floor for the
+  per-crop dynamic range `(max - min) / max` (default 0.25). At or
+  above this threshold, a crop with a peak in the middle of the
+  rail series is classified as `OK`. Below it (but above
+  `SHARPNESS_CROP_OFF_TARGET_RANGE`) the crop is `LOW_SIGNAL` —
+  a real-but-weak bell, common on soft lenses (e.g. fast primes
+  with external extension tubes where corner acutance is poor).
+  The advisor treats `LOW_SIGNAL` like `OK` for the per-aperture
+  verdict but surfaces the count in the summary so the operator
+  can spot soft-rig regimes.
+- `SHARPNESS_CROP_OFF_TARGET_RANGE` — off-wafer floor for the
+  per-crop dynamic range (default 0.05). Strictly below this
+  value, the crop's window almost certainly fell off the wafer
+  onto featureless background; the advisor short-circuits to
+  `OFF_TARGET` without running peak detection. Empirical
+  motivation: the Viltrox 85mm f/2 EVO + 61mm extension produced
+  legitimate corner crops with dynamic range 0.04–0.22 that the
+  pre-2026-05 single-threshold logic falsely rejected as off-wafer;
+  splitting the threshold lets soft-but-real bells be reported
+  as `LOW_SIGNAL` instead.
 - `OUTPUT_ROOT` — where session directories are created.
 - `NTFY_TOPIC` / `NTFY_BASE_URL` — ntfy.sh topic + endpoint. Set the
   topic once per laptop.
