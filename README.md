@@ -210,6 +210,67 @@ Ctrl-C also works — the program issues a StackShot stop, closes
 connections, and exits cleanly without dumping a traceback. Any
 in-progress shot may be lost.
 
+### Tail-extension workflow (multi-session merging)
+
+When a lens-config's data lands with some crops' peaks past either end
+of the captured range (e.g. soft corners on a non-macro lens + heavy
+extension tubes), the practical remedy is a *short follow-up session*
+that covers just the missing tail with small overlap into the prior
+session — not a full re-do.
+
+Recipe:
+
+1. Skip out of the current session (`s` at the range-inadequate prompt
+   or `q` at the next lens-config prompt).
+2. Restart `python -m session.runner` so any config edits / code
+   changes load. **Set `PROBE_ENABLED = False` in `config.py`** for
+   tail-extension scenarios — phase-A's bracket assumes the widest
+   aperture peaks somewhere inside the user-jogged range, which is
+   false when you're deliberately jogging *outside* that range.
+   Re-enable `PROBE_ENABLED = True` afterward for normal sweeps.
+3. New lens-config name (≥5 chars). Reuse the same name across the
+   prior session and the follow-up if you want a single dataset, or
+   suffix with `extension`, `tail`, etc. for clearer audit.
+4. At the START prompt, use the numeric jog (`:` then a typed mm
+   target) to place the rail with overlap into the prior session's
+   coverage. *Sign convention*: in a backward-jog session (START is
+   less-negative, END is more-negative), more-negative target positions
+   are deeper into the captured range. To extend **deeper than the
+   previous END**, set the new START a few hundred µm *before* (i.e.
+   *less* negative than) the previous END so phase-D's first frames
+   overlap. To extend **shallower than the previous START** (i.e. closer
+   to the camera than the previous START), set the new START a few
+   hundred µm *past* the previous START in the away-from-camera
+   direction.
+5. Press `s` to zero at the new START. The new session's coordinate
+   system has its own origin; you have to track the offset to the
+   prior session manually.
+6. At the END prompt, use `:` again to type the relative target. **The
+   END sign must match the jog direction**: typing `-1.0` with `s` at
+   step 4 zeroing-then-jogging-backward will end the new range 1 mm
+   deeper than START; typing `+1.0` will end 1 mm shallower. Mis-signed
+   END is the most common operator mistake here — re-verify the sign
+   before pressing `e`.
+7. Same magnification as the prior session.
+8. Calibration re-runs (~30–60 s — unavoidable; calibration data is
+   per-lens-config). Phase A, if enabled, will probably go inconclusive
+   because the widest aperture's bell is already past peak in the new
+   range; that's fine — the runner falls back to uniform sweep.
+
+**Range-adequacy prompts can flag single-session truncations that
+your *prior* session already covers**. If the prompt says
+`peak_side=both` but your other session covers one of those sides
+densely, accepting the proposed extension means duplicating data on
+the already-covered side. Either accept once and skip on the second
+round, or skip immediately and live with the single-session "truncation"
+that you know is captured elsewhere.
+
+Merge offline: combine the JPEGs / shots.csv across sessions per
+`(lens_config_slug, step_index, aperture, replica)`. The per-session
+rail-zero is tracked in `session.json` only implicitly (the rail was
+wherever the user left it before pressing `s`); record the offsets
+in your own notes or a sidecar file.
+
 ## Output
 
 Per-session directory under `OUTPUT_ROOT`, named with a timestamp:

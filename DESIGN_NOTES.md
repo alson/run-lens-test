@@ -1560,3 +1560,73 @@ originally-failing side. With the new classifier the situation
 anything), and rail extension cannot recover an off-wafer crop. The
 loop now exits cleanly on that branch with a note, instead of
 burning rail and flash power forever.
+
+### 6.28 Multi-session merging for tail-extension follow-ups
+
+Single sessions can't always bracket all 17 crops × all 7 apertures
+at once. The Viltrox 85 mm + 61 mm extension on 2026-05-10/11 needed
+four sessions:
+
+* **Session A** — original sweep across the user-jogged range. Auto-
+  extension flow doesn't help here because the per-aperture peak
+  positions span ~5 mm of rail (centre at ~−2 mm; some corners at
+  ~−4 to −5 mm). A's phase-C window was sized for the
+  widest-aperture peak and captured roughly 1 mm of rail at
+  non-widest apertures; the corner peaks ended up at one edge.
+* **Session B** — attempted phase-A-driven tail extension. Failed:
+  phase-A probed at f/2 (widest), which is already past peak in the
+  tail-extension range; the resulting phase-C window placed itself
+  back inside the overlap region and captured nothing new. Fix:
+  disable `PROBE_ENABLED` for tail-extension sessions.
+* **Session C** — uniform 3 mm sweep into the deep tail with
+  `PROBE_ENABLED=False`. Filled the corner peaks for sessions A's
+  truncated-end side.
+* **Session D** — short 1 mm sweep into the shallow tail (closer-to-
+  camera direction). Filled the corner peaks for sessions A's
+  truncated-other-end side.
+
+The four sessions together cover ~5 mm of rail, well beyond what one
+session can capture with the planner's step-size choice. The merge
+happens offline by combining `shots.csv` rows and JPEG paths across
+session directories.
+
+**Coordinate frames**: each session zeroes the rail at the user's
+`s` press at the START prompt, so each session's `rail_position_mm`
+column is in its own coordinate frame. To merge, the operator must
+record the offset between each follow-up session's zero and the
+prior session's frame — there's no machine-readable record.
+Convention: in the prior session's frame, write down the absolute
+rail position where you press `s` in the follow-up. The recipe used
+on the Viltrox run was:
+
+* prior session ended at rail position X mm
+* before pressing `s` in the follow-up, use numeric jog (`:` then
+  typed mm) to move to a position 0.5–1.0 mm *inside* prior
+  coverage (gives phase-D some overlap for sanity-checking exposure
+  parity and rail backlash across sessions)
+
+**Sign-of-END trap**: the most common operator mistake is mis-signing
+the END position. With backward-jog convention (END is more negative
+than START), to extend *deeper than the prior END* the new END
+must be at a *more negative* mm than START; to extend *shallower
+than the prior START* the new END is at a *less negative* (more
+positive) mm. The numeric jog accepts both signs but the user has
+to pick the right one — there's no validation. Recorded as a
+specific failure mode here so the next operator doesn't repeat it.
+
+**`peak_side="both"` is ambiguous across sessions**: the runner's
+range-adequacy verdict is computed from single-session data only,
+so a tail-extension session that genuinely captures one side and
+"truncates" the other is flagged `both`. Accepting the auto-
+extension proposal duplicates data on the already-covered side
+(harmless but wasteful) and adds useful new data on the genuinely-
+truncated side. Operator's call whether to accept once-and-skip or
+skip immediately based on the merged-data view they're tracking
+offline.
+
+**PROBE_ENABLED toggle as session-time concern**: phase-A's probe-
+then-window flow assumes the user-jogged range contains the
+widest-aperture peak. Tail-extension sessions violate that
+assumption by design, so `PROBE_ENABLED` becomes a per-session knob
+the operator flips in `config.py` between runs. Worth wiring as a
+prompt-time toggle eventually; not yet implemented.

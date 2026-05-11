@@ -571,6 +571,20 @@ ls <session>/<lens>/f_16/step_*.jpg | wc -l   # = expected (with all replicas)
 
 With `SHOTS_PER_STEP_APERTURE > 1` (default 3), each `step_NNNN.jpg` source appears alongside `step_NNNN_b.jpg`, `step_NNNN_c.jpg`, … and the cropped output has the same per-replica filenames. The advisor collapses replicas via per-crop median before peak detection, so the verdict is computed against one point per (step, aperture), not N.
 
+### Tail-extension follow-up sessions
+
+**Validated 2026-05-10/11** with Viltrox 85mm f/2 EVO + 61mm extension (soft corners + low acutance everywhere — see DESIGN_NOTES §6.27).
+
+For lens configs whose data lands with truncated corners or extreme-aperture centres past one or both ends of the user-jogged range, the practical fix is a *follow-up short session* covering just the missing tail with small overlap into the prior session's coverage. Don't re-run the full sweep — it duplicates data and burns flash power.
+
+Operational recipe in README → "Tail-extension workflow (multi-session merging)". Key points specific to validation here:
+
+* **Set `PROBE_ENABLED = False`** in `config.py` for follow-up sessions where the widest aperture's bell is already past peak in the new range. Otherwise phase-A's bracket places phase-C in the overlap region (chasing f/2's peak which is back in the prior session) instead of sweeping the full new range. Re-enable for normal sessions.
+* **Don't accept the auto-extension prompt** when `peak_side=both` and the *other* side is already densely covered by the prior session. The runner only sees single-session data and can't know about prior coverage; accepting wastes ~half the shots on already-captured rail. Either accept once and skip on the second round, or skip immediately.
+* **Numeric jog `:`** is the safe way to place START and END with reproducible offsets to the prior session's coordinate frame. Sign of END must match the jog direction — typing `-1.0` after a backward-jog START moves *deeper* (more negative); typing `+1.0` moves *shallower* (less negative, toward camera). Inverting the sign is the most common operator mistake.
+
+Validated session sequence: 4 sessions × ~30–45 min each combined to cover all 17 crops × 7 apertures of the Viltrox 85 mm + 61 mm extension setup. Per-crop peaks are all bracketed in the merged dataset; no single session would have sufficed because the lens's depth-of-field at this magnification + corner-vs-centre focus shift exceeds the single-session rail budget.
+
 ---
 
 ## 9. Graceful Ctrl-C
