@@ -1,15 +1,17 @@
-"""Merge two macro-lens-test sessions into one folder with a unified
+"""Merge macro-lens-test sessions into one folder with a unified
 coordinate frame and metadata. Useful when the rail's mechanical START
 position differs between sessions but the underlying optical setup
 (wafer, lens, magnification) is the same — e.g. you covered the inner
 crops' bells in one session, then re-jogged with a deeper START to
 catch the outer corners' bells in the second.
 
-Output is a *new* directory; the two source sessions stay untouched.
+Output is a *new* directory; the source sessions stay untouched.
 JPEGs and crops are symlinked rather than copied, so the merge is
 nearly free in disk space.
 
-Usage::
+Two CLIs are supported.
+
+**Two-session merge** (legacy)::
 
     python -m tools.merge_sessions \\
         --prev ~/macro-lens-test-output/2026-05-08_175556 \\
@@ -19,20 +21,37 @@ Usage::
         --output ~/macro-lens-test-output/merged_24-120_2026-05-08 \\
         --overlap-strategy cur
 
-The ``--cur-offset-mm`` argument is the value that, when *added* to a
-CUR ``rail_position_mm``, gives the equivalent PREV-frame position.
-For "CUR's rail-zero is at PREV's −2.93 mm", pass ``--cur-offset-mm
--2.93``.
+``--cur-offset-mm``: value to *add* to a CUR ``rail_position_mm`` to
+land in the PREV frame. ``cur`` strategy keeps CUR in the overlap.
 
-Overlap strategies (where both sessions captured the same rail-mm
-range):
+**N-session merge** (any number of sessions, each with its own
+lens-config slug and rail-zero offset)::
 
-* ``cur`` (default): drop PREV rows that fall inside CUR's captured
-  range. Pick this when CUR has fresher calibration / more replicas
-  / denser sampling in the shared region, which is the typical case.
-* ``prev``: drop CUR rows that fall inside PREV's captured range.
-* ``both``: keep all rows from both sources. Downstream analysis must
-  handle duplicates / cross-session calibration drift.
+    python -m tools.merge_sessions \\
+        --source ~/.../session_A:"slug A":0.0:A \\
+        --source ~/.../session_B:"slug B":-5.0:B \\
+        --source ~/.../session_C:"slug C":-5.0:C \\
+        --source ~/.../session_D:"slug D":-3.5:D \\
+        --output-slug "Viltrox 85mm merged" \\
+        --output ~/macro-lens-test-output/merged_viltrox_85_2026-05-10
+
+``--source`` format: ``PATH:SLUG:OFFSET_MM[:LABEL]`` (repeatable).
+Use ``\\:`` to escape literal colons in the slug. Priority is the
+order of ``--source`` flags: the *first* source wins in overlap
+zones, the next wins where it adds new coverage past the first, etc.
+Each source's positions are translated by its ``OFFSET_MM`` into the
+merged frame; pass ``0.0`` for the anchor session whose native
+frame should be the canonical merged frame. Priority is independent
+of frame choice.
+
+``--output-slug`` is the lens-config directory name in the merged
+output. Source slugs vary per session (one session per tail
+extension typically uses a distinct slug); the merged dataset
+collapses to one.
+
+Filenames are prefixed with the source's ``LABEL`` (or its session
+timestamp when label is omitted) so the four sessions' identical
+``step_NNNN.jpg`` filenames don't collide in the merged folder.
 """
 
 from __future__ import annotations
@@ -385,6 +404,209 @@ def merge_sessions(
     return summary
 
 
+# ---- N-source merge -------------------------------------------------------
+
+
+def _parse_source_spec(spec: str) -> dict:
+    """``PATH:SLUG:OFFSET_MM[:LABEL]`` → dict. ``\\:`` escapes colons
+    inside SLUG."""
+    # Replace escaped colons with a sentinel so split('/').replace works.
+    sentinel = "\x00"
+    safe = spec.replace("\\:", sentinel)
+    parts = safe.split(":")
+    if not (3 <= len(parts) <= 4):
+        raise argparse.ArgumentTypeError(
+            f"--source needs PATH:SLUG:OFFSET_MM[:LABEL], got {spec!r}"
+        )
+    path, slug, offset_str, *label_rest = parts
+    label = label_rest[0] if label_rest else ""
+    try:
+        offset_mm = float(offset_str)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--source OFFSET_MM must be a number, got {offset_str!r}"
+        ) from exc
+    return {
+        "path": Path(path.replace(sentinel, ":")),
+        "slug": slug.replace(sentinel, ":"),
+        "offset_mm": offset_mm,
+        "label": (label or "").replace(sentinel, ":"),
+    }
+
+
+def merge_sessions_n(
+    *,
+    sources: list[dict],
+    output_dir: Path,
+    output_slug: str,
+) -> dict:
+    """Merge N sessions into ``output_dir``. ``sources`` is a list of
+    dicts (PATH/SLUG/OFFSET_MM/LABEL); the first source has the
+    highest priority — its rows survive intact, subsequent sources
+    contribute only rows that don't overlap any earlier source's
+    captured range.
+
+    Each source's ``rail_position_mm`` values are translated by its
+    ``offset_mm`` into the merged coordinate frame. The source whose
+    offset is 0.0 (typically the "anchor" session, often the
+    oldest) keeps its native frame as canonical — but the merge
+    doesn't require it to be listed first; priority is independent
+    of frame choice. If no source has offset 0.0, the merged frame
+    is whatever the offsets implicitly define; positions are
+    consistent across the merged dataset regardless.
+    """
+    if not sources:
+        raise ValueError("need at least one --source")
+
+    output_lens_dir = output_dir / output_slug
+    output_lens_dir.mkdir(parents=True, exist_ok=True)
+
+    merged: list[dict] = []
+    # Each source's captured-range (in canonical frame) — used to drop
+    # subsequent sources' rows that fall inside higher-priority sources'
+    # ranges.
+    earlier_ranges: list[tuple[float, float]] = []
+    row_counts: list[dict] = []
+    for src in sources:
+        src_csv = src["path"] / "shots.csv"
+        if not src_csv.exists():
+            raise FileNotFoundError(f"missing shots.csv: {src_csv}")
+        src_lens_dir = src["path"] / src["slug"]
+        if not src_lens_dir.exists():
+            raise FileNotFoundError(
+                f"missing source lens dir: {src_lens_dir}"
+            )
+
+        slug = src["slug"]
+        all_rows = [
+            r for r in _read_rows(src_csv)
+            if r.get("lens_config_slug") == slug
+        ]
+        kept = []
+        for r in all_rows:
+            if r.get("phase") == "calibration":
+                kept.append(r)
+                continue
+            pos = _parse_pos(r)
+            if pos is None:
+                kept.append(r)
+                continue
+            canonical_pos = pos + src["offset_mm"]
+            # Drop if any earlier source covered this position.
+            inside_earlier = any(
+                lo <= canonical_pos <= hi for lo, hi in earlier_ranges
+            )
+            if inside_earlier:
+                continue
+            kept.append(r)
+
+        # Compute this source's captured range BEFORE filtering — so
+        # later sources see the full coverage, not the post-filter
+        # subset (a later source can still contribute rows past this
+        # range, which is the whole point of the merge).
+        full_range = _captured_range(all_rows, offset_mm=src["offset_mm"])
+        if full_range is not None:
+            earlier_ranges.append(full_range)
+
+        label = src["label"] or _safe_label_from_path(src["path"])
+        for r in kept:
+            merged.append(_merge_one_row(
+                row=r,
+                source_session=label,
+                source_lens_dir=src_lens_dir,
+                output_lens_dir=output_lens_dir,
+                rail_offset_mm=src["offset_mm"],
+            ))
+        row_counts.append({
+            "label": label,
+            "session_id": _read_session_id(src["path"]),
+            "slug": slug,
+            "offset_mm": src["offset_mm"],
+            "captured_range_canonical_mm": (
+                list(full_range) if full_range else None
+            ),
+            "input_rows": len(all_rows),
+            "kept_rows": len(kept),
+        })
+
+    # Sort by aperture, then rail_position_mm.
+    def _sort_key(r: dict):
+        pos = _parse_pos(r)
+        return (r.get("aperture", ""), pos if pos is not None else 0.0)
+
+    merged.sort(key=_sort_key)
+
+    fieldnames = SHOT_COLUMNS + ("source_session",)
+    out_csv_path = output_dir / "shots.csv"
+    with out_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in merged:
+            writer.writerow({k: r.get(k, "") for k in fieldnames})
+
+    # Symlink calibration.json + range_check.json from the
+    # highest-priority source.
+    primary_lens_dir = sources[0]["path"] / sources[0]["slug"]
+    for fname in ("calibration.json", "range_check.json"):
+        src_file = primary_lens_dir / fname
+        if src_file.exists():
+            _symlink(src_file, output_lens_dir / fname)
+
+    # Compose merged session.json.
+    primary_session = json.loads(
+        (sources[0]["path"] / "session.json").read_text()
+    )
+    summary = {
+        "merged": True,
+        "merge_created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "merge_mode": "n-source",
+        "source_sessions": row_counts,
+        "overlap_strategy": "priority-first-wins",
+        "lens_configs": [output_slug],
+        "output_slug": output_slug,
+        "baseline_median_luminance": primary_session.get(
+            "baseline_median_luminance"
+        ),
+        "ntfy_topic": primary_session.get("ntfy_topic"),
+        "row_counts": {
+            **{src["label"] or _safe_label_from_path(src["path"]):
+               {"input": rc["input_rows"], "kept": rc["kept_rows"]}
+               for src, rc in zip(sources, row_counts)},
+            "merged_total": len(merged),
+        },
+        "notes": (
+            f"N-source merge of {len(sources)} sessions into "
+            f"slug {output_slug!r}. Highest-priority source first: "
+            + ", ".join(
+                f"{rc['label']} ({rc['session_id']})"
+                for rc in row_counts
+            )
+            + ". JPEGs and crops are symlinks into the source sessions; "
+            "originals are retained on disk."
+        ),
+    }
+    (output_dir / "session.json").write_text(
+        json.dumps(summary, indent=2)
+    )
+    return summary
+
+
+def _safe_label_from_path(p: Path) -> str:
+    """Fallback label from a session path — strip the timestamp dir
+    name. Replace any path separators with ``_``."""
+    return p.name.replace("/", "_").replace(":", "_") or "src"
+
+
+def _read_session_id(session_dir: Path) -> str | None:
+    js = session_dir / "session.json"
+    if not js.exists():
+        return None
+    try:
+        return json.loads(js.read_text()).get("session_id")
+    except (OSError, ValueError):
+        return None
+
+
 # ---- CLI ------------------------------------------------------------------
 
 def main() -> None:
@@ -392,46 +614,83 @@ def main() -> None:
         description=__doc__.splitlines()[0] if __doc__ else "",
     )
     parser.add_argument(
-        "--prev", required=True, type=Path,
-        help="Anchor session dir — its coordinate frame is preserved",
+        "--prev", type=Path,
+        help="(2-session) Anchor session dir — its frame is preserved",
     )
     parser.add_argument(
-        "--cur", required=True, type=Path,
-        help="Offset session dir — positions translated into PREV frame",
+        "--cur", type=Path,
+        help="(2-session) Offset session dir",
     )
     parser.add_argument(
-        "--cur-offset-mm", required=True, type=float,
+        "--cur-offset-mm", type=float,
         help=(
-            "Offset to ADD to CUR rail_position_mm so it lands in PREV "
-            "coordinates. If CUR_0 == PREV_-2.93, pass -2.93."
+            "(2-session) Offset to ADD to CUR rail_position_mm so it "
+            "lands in PREV coordinates."
         ),
     )
     parser.add_argument(
-        "--lens-config-slug", required=True, type=str,
-        help="Lens-config slug (directory name) common to both sessions",
+        "--lens-config-slug", type=str,
+        help="(2-session) Lens-config slug shared by both sessions",
+    )
+    parser.add_argument(
+        "--overlap-strategy", choices=OVERLAP_STRATEGIES, default="cur",
+        help=(
+            "(2-session) Where both sessions captured the same rail-mm "
+            "range, which session's data wins. Default 'cur'."
+        ),
+    )
+    parser.add_argument(
+        "--source", action="append", default=[], metavar="SPEC",
+        help=(
+            "(N-session) PATH:SLUG:OFFSET_MM[:LABEL] — repeat for each "
+            "session. First --source = highest priority, defines the "
+            "canonical coordinate frame (offset must be 0.0). Escape "
+            "literal colons inside SLUG as ``\\:``."
+        ),
+    )
+    parser.add_argument(
+        "--output-slug", type=str,
+        help=(
+            "(N-session) Lens-config directory name in the merged "
+            "output. Sources may have different per-session slugs."
+        ),
     )
     parser.add_argument(
         "--output", required=True, type=Path,
         help="Output merged session directory (created if absent)",
     )
-    parser.add_argument(
-        "--overlap-strategy", choices=OVERLAP_STRATEGIES, default="cur",
-        help=(
-            "Where both sessions captured the same rail-mm range, which "
-            "session's data wins. 'cur' (default) drops PREV in the "
-            "overlap; 'prev' drops CUR; 'both' keeps everything."
-        ),
-    )
     args = parser.parse_args()
 
-    summary = merge_sessions(
-        prev_dir=args.prev,
-        cur_dir=args.cur,
-        cur_offset_mm=args.cur_offset_mm,
-        lens_config_slug=args.lens_config_slug,
-        output_dir=args.output,
-        overlap_strategy=args.overlap_strategy,
-    )
+    if args.source:
+        if not args.output_slug:
+            parser.error("--source mode requires --output-slug")
+        sources = [_parse_source_spec(s) for s in args.source]
+        summary = merge_sessions_n(
+            sources=sources,
+            output_dir=args.output,
+            output_slug=args.output_slug,
+        )
+    else:
+        required = [
+            ("--prev", args.prev),
+            ("--cur", args.cur),
+            ("--cur-offset-mm", args.cur_offset_mm),
+            ("--lens-config-slug", args.lens_config_slug),
+        ]
+        missing = [name for name, v in required if v is None]
+        if missing:
+            parser.error(
+                f"2-session mode requires {missing}; or use --source for "
+                "N-session merge"
+            )
+        summary = merge_sessions(
+            prev_dir=args.prev,
+            cur_dir=args.cur,
+            cur_offset_mm=args.cur_offset_mm,
+            lens_config_slug=args.lens_config_slug,
+            output_dir=args.output,
+            overlap_strategy=args.overlap_strategy,
+        )
     json.dump(summary, sys.stdout, indent=2)
     sys.stdout.write("\n")
 
