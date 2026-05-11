@@ -350,6 +350,72 @@ class TestMultiCropFieldCurvature:
         assert "LOW_SIGNAL" in result.notes
 
 
+class TestSubsampleFactorWiring:
+    """Subsample factors injected via :meth:`set_subsample_factors`
+    must reach the advisor and scale ``extra_steps_max`` into rail-step
+    units. Without this the runner extends by sample-index units at
+    sparse apertures and the reshoot probes land off-grid (the f/16
+    infinite-loop bug)."""
+
+    def test_sparse_aperture_extra_steps_max_in_rail_steps(self, cfg) -> None:
+        # f/16 strictly rising — TRUNCATED_END. With stride=4 the
+        # advisor's projection must be at least 2 sample-strides past
+        # the projected vertex, expressed in rail steps. Without the
+        # wiring fix, extra_steps_max would be the raw sample-index
+        # count (~2), and the runner's probes at rail steps not
+        # divisible by 4 would never fire for f/16.
+        dataset = FakeCollector(
+            samples=_samples_for_aperture(16.0, _rising(10))
+        )
+        checker = SharpnessRangeChecker(cfg, collector=dataset)
+        checker.set_subsample_factors({16.0: 4})
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=0.05, apertures=["f/16"],
+        )
+        assert result.peak_side == "end_side"
+        assert result.needs_extension is True
+        # At stride 4, the floor is at least 2 sample-strides past
+        # the projected vertex — 2 × 4 = 8 rail steps minimum.
+        assert result.extra_steps_max >= 2 * 4
+
+    def test_dense_aperture_unaffected_by_wiring(self, cfg) -> None:
+        # f/4 stride=1: extra_steps_max stays in rail-step units (same
+        # as legacy behaviour). The new floor adds a few extra rail
+        # steps but doesn't introduce a 4× jump.
+        dataset = FakeCollector(
+            samples=_samples_for_aperture(4.0, _rising(10))
+        )
+        checker = SharpnessRangeChecker(cfg, collector=dataset)
+        checker.set_subsample_factors({4.0: 1})
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=0.05, apertures=["f/4"],
+        )
+        # Sane: the dense recommendation is bounded by the input
+        # series length (10), not stride-amplified.
+        assert result.extra_steps_max >= 2
+        assert result.extra_steps_max <= 10
+
+    def test_unset_factors_falls_back_to_dense(self, cfg) -> None:
+        # Default state (set_subsample_factors never called) — adapter
+        # falls back to subsample_factors=None, advisor treats every
+        # aperture as stride 1. Backwards compatible with existing
+        # tests / fixtures.
+        dataset = FakeCollector(
+            samples=_samples_for_aperture(16.0, _rising(10))
+        )
+        checker = SharpnessRangeChecker(cfg, collector=dataset)
+        # No set_subsample_factors call.
+        result = checker.evaluate(
+            lens_dir=Path("."), end_mm=10.0,
+            step_size_mm=0.05, apertures=["f/16"],
+        )
+        # Without stride info we treat this as a dense aperture, so
+        # the extra_steps_max is bounded by the input length.
+        assert result.extra_steps_max <= 10
+
+
 class TestUnsetCollector:
     def test_evaluate_without_collector_raises(self, cfg) -> None:
         checker = SharpnessRangeChecker(cfg, collector=None)

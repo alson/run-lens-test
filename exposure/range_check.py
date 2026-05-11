@@ -126,6 +126,24 @@ class RangeChecker:
         """
         return None
 
+    def set_subsample_factors(
+        self, factors: dict[float, int] | None
+    ) -> None:  # noqa: ARG002
+        """Hook called by the session runner to publish the current
+        lens config's per-aperture rail-step stride (float aperture →
+        ``subsample_factor``).
+
+        The stub doesn't need it; the sharpness adapter overrides
+        this and passes the factors into :func:`sharpness.advise` so
+        the per-crop ``extra_steps_needed`` (in per-aperture sample-
+        index units) is scaled into rail-step units before reaching
+        :attr:`RangeResult.extra_steps_max`. Without this, sparse
+        apertures' extension recommendations would be off by a factor
+        of ``stride`` and the runner's probes would land on rail
+        positions that aren't on the aperture's capture grid.
+        """
+        return None
+
     def evaluate(
         self,
         lens_dir: Path,

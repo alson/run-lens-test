@@ -1332,6 +1332,27 @@ flagged as truncated *at that moment* but doesn't generalise
 past it — useful as a sanity-check trigger, less useful as a
 specific position prediction.
 
+**Stride-aware extension (2026-05-11 follow-up).**
+`sharpness.detect.extra_steps_needed` returns counts in per-aperture
+*sample-index* units; for sparse apertures (e.g. f/16 with
+`subsample_factor=4`) one sample equals N rail steps, so the runner's
+direct consumption of `RangeResult.extra_steps_max` as a rail-step
+count was off by a factor of stride and the reshoot probes landed on
+rail positions that aren't on the aperture's `_should_capture` grid
+— `evaluate()` then re-returned the same TRUNCATED_END verdict and
+the runner re-prompted indefinitely. Fix wires the per-lens-config
+stride lookup (`SamplePlan.subsample_factors`) from the runner
+through a new `RangeChecker.set_subsample_factors` hook into
+`sharpness.advise(subsample_factors=...)`; the advisor's
+`_extra_steps_for` multiplies the worst-case per-crop sample-index
+projection by `max(1, stride)` and floors it at
+`MIN_POST_PEAK_SAMPLES * stride` (currently 3 sample-strides past the
+projected vertex) so a truncated sparse aperture always extends far
+enough to land multiple confirmed post-peak samples on its own grid,
+rather than barely clipping the parabolic-fit vertex and risking a
+noise-peak declaration. Detector stays index-agnostic; only the
+advisor knows about rail strides.
+
 ### 6.26 Coarse-to-fine focus probe (replaces uniform sweep)
 
 Buffer analysis on three high-mag MC 105 + extension sessions
@@ -1630,3 +1651,22 @@ widest-aperture peak. Tail-extension sessions violate that
 assumption by design, so `PROBE_ENABLED` becomes a per-session knob
 the operator flips in `config.py` between runs. Worth wiring as a
 prompt-time toggle eventually; not yet implemented.
+
+### 6.29 PROBE_ENABLED global-disable timeline (2026-05-10 → 2026-05-11)
+
+`PROBE_ENABLED` was globally flipped to `False` during the Viltrox
+85 mm + 61 mm tail-extension work (sessions B–D on 2026-05-10/11)
+because phase-A's probe-then-window flow placed the phase-C window
+back inside the prior-session overlap region and captured nothing
+new (see §6.28, Session B). The disable was kept across the
+follow-up sessions C and D since both were tail extensions on the
+same lens config.
+
+Re-enabled on 2026-05-11 after the 24-120 + 45mm extension session,
+alongside the stride-aware extension fix (§6.25 follow-up). Going
+forward, the operator should flip `PROBE_ENABLED = False` only for
+tail-extension sessions and restore it to `True` afterwards. If
+probe-related regressions show up specifically on Viltrox 85 mm +
+extension tubes again, the failure mode is the one documented in
+§6.28 Session B — investigate that geometry before disabling
+globally.

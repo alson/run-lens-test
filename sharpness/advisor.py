@@ -181,6 +181,26 @@ class Recommendation:
 # --- internals -----------------------------------------------------------
 
 
+# Floor on the number of post-peak *aperture samples* the extension
+# should reach in the truncated aperture's own sample grid. Two
+# concerns drive this above the raw ``DEFAULT_EDGE_STEPS=2`` buffer
+# that :func:`sharpness.detect.extra_steps_needed` already builds in:
+#
+# 1. The vertex projection is parabolic-fit on a noisy half-bell; the
+#    true peak can drift a sample or two either way of the fit. We
+#    want to land *past* the actual peak, not at the fit's vertex.
+# 2. A single post-peak sample at a sparse aperture is one rail-grid
+#    point that happens to be downhill — could still be a noise dip on
+#    the way up. Two or three post-peak samples form a confirmed
+#    decline, which is what the user wants before declaring the bell
+#    captured.
+#
+# Three samples is the minimum that "confirmed decline" buys us; lower
+# values revert to "barely past projected vertex" and reintroduce the
+# noise-peak failure mode the bug fix is meant to close out.
+MIN_POST_PEAK_SAMPLES = 3
+
+
 def _direction_for(crops: tuple[CropAnalysis, ...]) -> Direction:
     has_start = any(c.status == CropStatus.TRUNCATED_START for c in crops)
     has_end = any(c.status == CropStatus.TRUNCATED_END for c in crops)
@@ -193,14 +213,35 @@ def _direction_for(crops: tuple[CropAnalysis, ...]) -> Direction:
     return Direction.NONE
 
 
-def _extra_steps_for(crops: tuple[CropAnalysis, ...]) -> int:
-    """Worst-case extension across all truncated crops."""
+def _extra_steps_for(crops: tuple[CropAnalysis, ...], stride: int) -> int:
+    """Worst-case extension across all truncated crops, in **rail-step
+    units**.
+
+    Each ``CropAnalysis.extra_steps_needed`` is in per-aperture
+    sample-index units (one index == one sample in the aperture's
+    own sub-sampled series). For dense apertures (stride=1) that's
+    already a rail-step count; for sparse apertures (e.g. f/16 with
+    stride=4) one sample == 4 rail steps and we have to scale, or
+    the runner's extension lands on rail positions that aren't on
+    this aperture's capture grid and the reshot probes never fire.
+
+    The returned count is also floored at
+    ``MIN_POST_PEAK_SAMPLES * stride`` so the extension reaches a
+    confirmed-decline region of the aperture's own grid (multiple
+    post-peak samples) rather than barely clipping the projected
+    vertex — the bell could otherwise be confirmed only by curve fit
+    and the runner can re-extend chasing noise.
+    """
     values = [c.extra_steps_needed for c in crops if c.extra_steps_needed is not None]
-    return max(values) if values else 0
+    if not values:
+        return 0
+    worst_samples = max(values)
+    samples_with_floor = max(worst_samples, MIN_POST_PEAK_SAMPLES)
+    return samples_with_floor * max(1, stride)
 
 
 def _build_recommendation(
-    aperture: float, analyses: list[CropAnalysis]
+    aperture: float, analyses: list[CropAnalysis], *, stride: int = 1,
 ) -> Recommendation:
     # Only valid crops feed into the verdict / direction / extension.
     # Invalid (below the OFF_TARGET floor) crops fell off the wafer;
@@ -215,7 +256,7 @@ def _build_recommendation(
         # bell is still a peak the runner can chase by extending
         # rail.
         direction = _direction_for(truncated)
-        extra = _extra_steps_for(truncated)
+        extra = _extra_steps_for(truncated, stride=stride)
         return Recommendation(
             aperture=aperture,
             verdict=Verdict.NEEDS_RESHOOT,
@@ -262,6 +303,7 @@ def advise(
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
     off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
     crop_names: tuple[str, ...] = CROP_NAMES,
+    subsample_factors: dict[float, int] | None = None,
 ) -> dict[float, Recommendation]:
     """Produce one ``Recommendation`` per aperture present in ``dataset``.
 
@@ -280,9 +322,17 @@ def advise(
     while a corner runs forward — classic field curvature) the
     aperture direction collapses to ``BOTH`` so the runner extends
     bilaterally.
+
+    ``subsample_factors`` is the per-aperture rail-step stride
+    (``SamplePlan.subsample_factors``); ``Recommendation.extra_steps``
+    is rail-step count, so a sparse aperture's sample-index extra
+    projection is scaled by its stride before being returned. Pass
+    ``None`` (or omit) for dense-sampling tests where 1 sample == 1
+    rail step at every aperture.
     """
     aggregated = dataset.aggregated()
     out: dict[float, Recommendation] = {}
+    factors = subsample_factors or {}
     for aperture, samples in aggregated.by_aperture().items():
         crop_sizes: dict[str, list[int]] = {}
         for name in crop_names:
@@ -296,5 +346,6 @@ def advise(
             dynamic_range_min=dynamic_range_min,
             off_target_range=off_target_range,
         )
-        out[aperture] = _build_recommendation(aperture, analyses)
+        stride = max(1, int(factors.get(aperture, 1)))
+        out[aperture] = _build_recommendation(aperture, analyses, stride=stride)
     return out

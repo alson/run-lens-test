@@ -395,6 +395,85 @@ class TestLowSignalAggregation:
         assert all(c.valid for c in rec.crop_analyses)
 
 
+# --- Stride scaling & post-peak floor (sparse-aperture regression) -------
+
+
+class TestStrideScaling:
+    """``Recommendation.extra_steps`` must be in **rail-step** units,
+    not per-aperture sample-index units. For sparse apertures (e.g.
+    f/16 with subsample_factor=4) one sample == 4 rail steps; without
+    stride scaling the runner extends by N rail steps but the probe
+    only fires every Nth step → probes don't land on the aperture's
+    capture grid and the runner re-prompts indefinitely (the f/16
+    infinite-loop failure mode).
+    """
+
+    def test_dense_aperture_extra_steps_unchanged(self) -> None:
+        # stride=1: the legacy behaviour, extra_steps_needed already
+        # in rail-step units (modulo the new post-peak floor).
+        ds = _dataset({4.0: {"center": RISING_19, "left-edge": RISING_19}})
+        rec = advise(ds, subsample_factors={4.0: 1})[4.0]
+        assert rec.verdict == Verdict.NEEDS_RESHOOT
+        assert rec.extra_steps >= 2
+
+    def test_sparse_aperture_extra_steps_scales_by_stride(self) -> None:
+        # f/16 with stride=4. The advisor's stride scaling must lift
+        # the rail-step count to at least 2 sample-strides past the
+        # vertex so the next probe lands on the aperture's grid.
+        ds = _dataset({16.0: {"center": RISING_19, "left-edge": RISING_19}})
+        dense = advise(ds, subsample_factors={16.0: 1})[16.0]
+        sparse = advise(ds, subsample_factors={16.0: 4})[16.0]
+        # The sparse-aperture recommendation must be roughly stride×
+        # larger than the dense one — the unit-mismatch was a 4×
+        # under-extension at stride 4.
+        assert sparse.extra_steps >= dense.extra_steps * 4
+        # And large enough to land on at least two of the aperture's
+        # own grid steps past the projection — that's the floor the
+        # bug fix is meant to enforce.
+        assert sparse.extra_steps >= 2 * 4
+
+    def test_truncated_sparse_aperture_floors_at_min_samples_times_stride(
+        self,
+    ) -> None:
+        # Field scenario the bug surfaced from: a TRUNCATED_END at f/16
+        # where the parabolic vertex sits only a sample or two past
+        # the captured edge. Sample-index extra_steps would be ~2;
+        # rail-step extension must be at least N_floor * stride so
+        # the reshoot probes land on this aperture's capture grid
+        # AND we land multiple post-peak samples (confirmed decline)
+        # rather than barely past the projected vertex.
+        # Bell that has rolled just barely over the top — vertex
+        # within 1–2 samples of the end.
+        near_end_bell = [50, 60, 70, 80, 90, 100, 108, 113, 116, 117]
+        stride = 4
+        ds = _dataset({16.0: {"center": near_end_bell, "left-edge": near_end_bell}})
+        rec = advise(ds, subsample_factors={16.0: stride})[16.0]
+        assert rec.verdict == Verdict.NEEDS_RESHOOT
+        # Floor: at least 2 sample-strides past the projection (the
+        # bug-fix requirement). The advisor's MIN_POST_PEAK_SAMPLES
+        # currently sits at 3 → 12 rail steps at stride 4.
+        assert rec.extra_steps >= 2 * stride
+
+    def test_missing_subsample_factor_defaults_to_dense(self) -> None:
+        # When the planner doesn't list an aperture (⅓-stops that
+        # didn't make it into the stride lookup), the advisor falls
+        # back to stride=1 — the dense default.
+        ds = _dataset({22.0: {"center": RISING_19, "left-edge": RISING_19}})
+        rec = advise(ds, subsample_factors={})[22.0]
+        # Same recommendation as the stride=1 case.
+        rec_explicit = advise(ds, subsample_factors={22.0: 1})[22.0]
+        assert rec.extra_steps == rec_explicit.extra_steps
+
+    def test_subsample_factors_none_is_dense_default(self) -> None:
+        # ``subsample_factors=None`` (or omitted) is the legacy call
+        # path for tests using dense uniform sweeps; must behave as
+        # stride 1 at every aperture.
+        ds = _dataset({11.0: {"center": RISING_19, "left-edge": RISING_19}})
+        rec_none = advise(ds, subsample_factors=None)[11.0]
+        rec_default = advise(ds)[11.0]
+        assert rec_none.extra_steps == rec_default.extra_steps
+
+
 # --- Recommendation public surface ---------------------------------------
 
 

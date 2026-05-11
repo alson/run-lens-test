@@ -587,6 +587,9 @@ class SessionRunner:
         self._subsample_factors = self._build_subsample_lookup(apertures, plan)
         if self.range_checker is not None:
             self.range_checker.set_collector(self._sharpness_collector)
+            self.range_checker.set_subsample_factors(
+                self._float_keyed_subsample_factors()
+            )
         try:
             self._run_one_lens_config_inner(
                 slug=slug,
@@ -608,6 +611,7 @@ class SessionRunner:
                 log.exception("sharpness collector shutdown failed")
             if self.range_checker is not None:
                 self.range_checker.set_collector(None)
+                self.range_checker.set_subsample_factors(None)
             self._sharpness_collector = None
             self._subsample_factors = {}
 
@@ -639,6 +643,20 @@ class SessionRunner:
         no droop push, no replicas."""
         factor = self._subsample_factors.get(aperture, 1)
         return step_index % factor == 0
+
+    def _float_keyed_subsample_factors(self) -> dict[float, int]:
+        """Translate the string-keyed ``_subsample_factors`` (``"f/16"``
+        → 4) into the float-keyed shape the advisor expects (``16.0`` →
+        4). Apertures that fail to parse are dropped — the advisor
+        defaults missing keys to stride 1, which is the safe choice."""
+        out: dict[float, int] = {}
+        for ap_str, factor in self._subsample_factors.items():
+            try:
+                ap_float = _parse_fnum(ap_str)
+            except ValueError:
+                continue
+            out[ap_float] = max(1, int(factor))
+        return out
 
     def _jog_and_plan(
         self,
@@ -889,6 +907,10 @@ class SessionRunner:
                     self._subsample_factors = self._build_subsample_lookup(
                         apertures, plan
                     )
+                    if self.range_checker is not None:
+                        self.range_checker.set_subsample_factors(
+                            self._float_keyed_subsample_factors()
+                        )
                     continue
             break
 
@@ -2213,6 +2235,9 @@ class SessionRunner:
         self._sharpness_collector = self.sharpness_collector_factory(lens_dir)
         if self.range_checker is not None:
             self.range_checker.set_collector(self._sharpness_collector)
+            self.range_checker.set_subsample_factors(
+                self._float_keyed_subsample_factors()
+            )
         # Drop the discarded sweep's shots.csv rows for this slug —
         # JPEGs at those step indices are about to be overwritten by
         # the new sweep, and any phase=sweep / probe / extension /

@@ -181,12 +181,20 @@ def extra_steps_needed(
     status: CropStatus,
     n: int,
 ) -> int | None:
-    """Suggested extension in rail-step units, given a truncated curve.
+    """Suggested extension in **per-aperture sample-index units**,
+    given a truncated curve.
 
-    Uses ``estimate_peak_vertex`` to guess where the actual peak sits,
-    then returns the number of rail steps the user would need to add
-    in the truncation direction to land on the peak with a
-    ``DEFAULT_EDGE_STEPS`` buffer past it.
+    Returns the number of additional samples-in-this-series that
+    would need to be added in the truncation direction to land on
+    the projected peak with a ``DEFAULT_EDGE_STEPS`` buffer past it.
+
+    Important: the unit is the input series' own sampling step, not
+    the underlying rail step. Densely-sampled apertures
+    (``subsample_factor=1``) have one sample per rail step so the two
+    coincide; sparse apertures (e.g. f/16 with ``subsample_factor=4``)
+    have one sample per N rail steps and the consumer must scale by
+    that stride before issuing a rail extension. See
+    :func:`sharpness.advisor._extra_steps_for` for the stride scaling.
 
     The returned count is conservative: at minimum ``DEFAULT_EDGE_STEPS``
     (so a borderline truncation still earns an extension big enough to

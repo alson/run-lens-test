@@ -74,9 +74,20 @@ class SharpnessRangeChecker(RangeChecker):
     def __init__(self, config, collector: LiveCollector | None = None) -> None:
         super().__init__(config=config)
         self.collector = collector
+        self.subsample_factors: dict[float, int] | None = None
 
     def set_collector(self, collector) -> None:  # type: ignore[override]
         self.collector = collector
+
+    def set_subsample_factors(  # type: ignore[override]
+        self, factors: dict[float, int] | None
+    ) -> None:
+        """Capture the per-lens-config aperture stride lookup so
+        :meth:`evaluate` can scale advisor projections into rail-step
+        units. ``None`` (default) means "stride is 1 everywhere" — used
+        by tests with dense uniform sweeps.
+        """
+        self.subsample_factors = factors
 
     # ---- RangeChecker contract ------------------------------------------
 
@@ -123,6 +134,7 @@ class SharpnessRangeChecker(RangeChecker):
             dataset,
             dynamic_range_min=dr_min,
             off_target_range=off_target_range,
+            subsample_factors=self.subsample_factors,
         )
 
         if probe_data is None:
