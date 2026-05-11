@@ -168,7 +168,7 @@ RANGE_CHECK_PROBE_STEPS = 2
 #
 # See ~/.claude/plans/imperative-sprouting-biscuit.md and
 # tools/probe_simulator.py (calibration tooling).
-PROBE_ENABLED = True
+PROBE_ENABLED = False
 PROBE_PHASE_A_POINTS = 9
 """Phase-A probe density across the user-jogged range (single
 aperture, single replica). Validated against two regimes:
