@@ -35,7 +35,11 @@ from sharpness.advisor import (
     advise,
 )
 from sharpness.collector import CollectedDataset, LiveCollector
-from sharpness.detect import DEFAULT_DYNAMIC_RANGE_MIN, DEFAULT_OFF_TARGET_RANGE
+from sharpness.detect import (
+    DEFAULT_DYNAMIC_RANGE_MIN,
+    DEFAULT_OFF_TARGET_RANGE,
+    DEFAULT_PARTIAL_FRAME_FACTOR,
+)
 
 
 # Crop name used to derive the canonical per-aperture sharpness curve
@@ -130,8 +134,14 @@ class SharpnessRangeChecker(RangeChecker):
             "SHARPNESS_CROP_OFF_TARGET_RANGE",
             DEFAULT_OFF_TARGET_RANGE,
         )
+        partial_frame_factor = getattr(
+            self.config,
+            "SHARPNESS_PARTIAL_FRAME_FACTOR",
+            DEFAULT_PARTIAL_FRAME_FACTOR,
+        )
         recs = advise(
             dataset,
+            partial_frame_factor=partial_frame_factor,
             dynamic_range_min=dr_min,
             off_target_range=off_target_range,
             subsample_factors=self.subsample_factors,

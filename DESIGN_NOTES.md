@@ -1671,6 +1671,80 @@ extension tubes again, the failure mode is the one documented in
 §6.28 Session B — investigate that geometry before disabling
 globally.
 
+### 6.30 PARTIAL_FRAME — absolute-size peer-compare detector
+
+The existing per-crop classifier has two strong-signal branches —
+`OFF_TARGET` (dr < 0.05: window fell off the wafer, no bell at all)
+and `LOW_SIGNAL` (0.05 ≤ dr < 0.25: real but weak bell). Between
+them sat a **silent failure mode**: a crop whose window straddles
+the wafer / target edge so part of the window is on-wafer with
+genuine focus signal, part is dark background. The on-wafer portion
+still produces a bell as the rail sweeps, so dynamic range stays
+roughly normal (the bell amplitude is suppressed but not flat), but
+the *absolute* JPEG-size metric runs ~30 % lower than positionally
+similar peers because dark background fillers compress to a fraction
+of the size of detailed wafer pattern in the same crop area.
+
+This was caught by hand on the 24-120 + 35 mm extension session
+(2026-05-11_185420): `range_check.json` reported `ok: true,
+peak_side: centered` with 12-14 LOW_SIGNAL crops per aperture and
+no diagnostic raising the flag, but the user noticed the bottom-left
+corner looked off in the framing and a manual check confirmed
+bottom-left at 31-33 KB vs 41-49 KB for the other three corners —
+~30 % smaller across every rail step, every aperture. The wafer's
+lower-left edge fell partly outside the crop window.
+
+The new detector (`lens_test_detect_core.partial_frame_by_peer_compare`)
+adds a third invalid-crop branch routing to a new `PARTIAL_FRAME`
+status. Operator remedy differs from OFF_TARGET — **re-frame**, not
+**re-jog** — so the status is distinct in the enum and called out
+by name in the summary string (`[PARTIAL_FRAME: bottom-left,
+bottom-edge — reframe needed]`).
+
+**Peer-group structure.** Comparison is per-position-class — 4
+full-frame corners against each other, 4 full-frame edges, 4 DX
+corners, 4 DX edges. Centre has no peer (singleton, skipped).
+An all-17-crops comparison would false-positive every corner against
+the centre because corners are naturally lower-detail; the per-class
+grouping keeps the comparison apples-to-apples.
+
+**Reference = peer-group median, not best.** OFF_TARGET cross-compare
+uses the *best* peer as reference (catches "much weaker than the
+strongest"); PARTIAL_FRAME uses the *median* (catches "much smaller
+than your similarly-positioned peers"). Median is robust to one
+outlier — typical lens decentering produces one slightly-soft corner
+which the median absorbs, while a partial-frame corner falls far
+enough below to flag cleanly even at the 0.80 cutoff.
+
+**Threshold calibration.** On both the 35 mm and 45 mm sessions,
+non-partial corners clustered at ≥ 0.95 of peer-group median; the
+35 mm bottom-left sat at 0.72-0.79 across all five apertures. 0.80
+sits cleanly between, and the consistency across apertures gives
+high confidence — geometry doesn't change with aperture, so a real
+partial-frame crop fires at every f-stop, not just one. 0.70 was
+the initial draft but was too tight (worst BL aperture was 0.717,
+single byte above threshold); 0.80 leaves a 5 % gap to the lowest
+partial-frame ratio and a 15 % gap to the highest normal ratio.
+
+**Layering.** `lens_test_detect_core.partial_frame_by_peer_compare`
+is the pure primitive (takes `{crop_name: peak_size}` + peer-group
+lists, returns flagged-crop set). `sharpness.crops.CROP_PEER_GROUPS`
+defines the four 4-member groups for this rig's crop layout.
+`sharpness.detect.analyze_crops_for_aperture` accepts a `peer_groups`
+parameter and threads the flag through to `analyze_crop`, which
+routes flagged crops to `CropStatus.PARTIAL_FRAME` (valid=False —
+excluded from verdict / direction / extension decisions, mirroring
+the OFF_TARGET treatment). The config knob is
+`SHARPNESS_PARTIAL_FRAME_FACTOR` (default 0.80).
+
+**Bonus diagnosis.** Re-running the detector against the sibling
+24-120 + 45 mm session (which had been reported as visually OK)
+surfaced `dx-right-edge` flagged consistently at 0.76-0.78 across
+all apertures — a real partial-frame on the right side of the DX
+inner crop that the operator hadn't noticed. That's the detector
+doing its job: catching the silent failure mode the existing
+dr-based classification missed.
+
 ### 6.31 Manual-aperture mode — design decisions (2026-05)
 
 Adds support for non-CPU lenses (AI-S, pre-AI). The mechanics are

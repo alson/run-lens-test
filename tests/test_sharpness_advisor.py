@@ -474,6 +474,142 @@ class TestStrideScaling:
         assert rec_none.extra_steps == rec_default.extra_steps
 
 
+# --- Partial-frame absolute-size cross-compare ---------------------------
+
+
+class TestPartialFrameDetection:
+    """Absolute-size peer-compare detector: crops whose peak file size
+    is consistently below their peer-group median (corners vs corners,
+    edges vs edges) are routed to ``PARTIAL_FRAME`` instead of
+    OK/LOW_SIGNAL — the wafer / target edge cuts through the crop
+    window so part of the area is dark background.
+
+    Distinct from OFF_TARGET (window entirely off the wafer) because
+    the operator remedy differs: re-frame vs re-jog. The detector's
+    job is to surface that distinction so the user knows which
+    corrective action to take.
+    """
+
+    # Scale BELL so different crops can be assigned different peak
+    # magnitudes (the partial-frame detector keys on absolute size,
+    # not bell shape). Multiplying preserves dr and peak position.
+    @staticmethod
+    def _scaled(scale: float) -> list[int]:
+        return [max(1, int(round(v * scale))) for v in BELL]
+
+    def test_partial_frame_corner_excluded_from_verdict(self) -> None:
+        # Three healthy corners + one partial-frame corner. The
+        # partial-frame crop must not contribute to the OK verdict
+        # (it's invalid=False, just like an OFF_TARGET crop), and
+        # the other three must still produce a valid bell so the
+        # aperture verdict is OK.
+        partial_frame = self._scaled(0.50)  # half-size — well below the 0.80 cutoff
+        ds = _dataset({
+            8.0: {
+                "center": BELL,
+                "top-left": BELL,
+                "top-right": BELL,
+                "bottom-right": BELL,
+                "bottom-left": partial_frame,
+            }
+        })
+        rec = advise(ds)[8.0]
+        # bottom-left should be PARTIAL_FRAME, valid=False.
+        per = rec.per_crop()
+        assert per["bottom-left"].status == CropStatus.PARTIAL_FRAME
+        assert per["bottom-left"].valid is False
+        # The other crops keep their original status (OK or LOW_SIGNAL).
+        for name in ("center", "top-left", "top-right", "bottom-right"):
+            assert per[name].status in (CropStatus.OK, CropStatus.LOW_SIGNAL)
+        # Verdict stays OK because three healthy corners + centre have
+        # in-range peaks.
+        assert rec.verdict == Verdict.OK
+
+    def test_partial_frame_surfaced_in_summary(self) -> None:
+        # The summary must call the partial-frame crop out by name so
+        # the operator knows which side to re-frame. Hidden in the
+        # invalid-crops bag would let the user miss the action item.
+        partial = self._scaled(0.50)
+        ds = _dataset({
+            8.0: {
+                "center": BELL,
+                "top-left": BELL,
+                "top-right": BELL,
+                "bottom-right": BELL,
+                "bottom-left": partial,
+            }
+        })
+        summary = advise(ds)[8.0].summary()
+        assert "PARTIAL_FRAME" in summary
+        assert "bottom-left" in summary
+        assert "reframe" in summary.lower()
+
+    def test_partial_frame_does_not_double_count_in_invalid_note(
+        self,
+    ) -> None:
+        # PARTIAL_FRAME crops are valid=False but the dynamic-range
+        # "invalid crops" note must skip them — those report % dr
+        # which is meaningless for partial-frame (the dr is roughly
+        # normal; the issue is absolute size). Otherwise the user
+        # sees the same crop twice in the summary.
+        partial = self._scaled(0.50)
+        ds = _dataset({
+            8.0: {
+                "center": BELL,
+                "top-left": BELL,
+                "top-right": BELL,
+                "bottom-right": BELL,
+                "bottom-left": partial,
+            }
+        })
+        summary = advise(ds)[8.0].summary()
+        # "invalid crops" rollup must NOT include bottom-left.
+        # It only lists OFF_TARGET dr<0.05 crops; partial-frame goes
+        # to its own [PARTIAL_FRAME:] note instead.
+        assert "invalid crops" not in summary
+
+    def test_normal_corner_softness_not_flagged(self) -> None:
+        # 10% corner falloff (typical lens asymmetry) stays above the
+        # 0.80 threshold and is NOT flagged. Confirms the detector
+        # targets framing, not optical performance.
+        slightly_soft = self._scaled(0.90)
+        ds = _dataset({
+            8.0: {
+                "center": BELL,
+                "top-left": BELL,
+                "top-right": BELL,
+                "bottom-right": BELL,
+                "bottom-left": slightly_soft,
+            }
+        })
+        rec = advise(ds)[8.0]
+        per = rec.per_crop()
+        assert per["bottom-left"].status != CropStatus.PARTIAL_FRAME
+
+    def test_partial_frame_crops_property(self) -> None:
+        # ``Recommendation.partial_frame_crops`` exposes the flagged
+        # crops for downstream consumers (UI, logging). Two-corner
+        # case: bottom-left + bottom-edge partial (the 35mm
+        # session's full diagnosis — wafer shifted up-and-right).
+        partial = self._scaled(0.50)
+        ds = _dataset({
+            8.0: {
+                "center": BELL,
+                "top-left": BELL,
+                "top-right": BELL,
+                "bottom-left": partial,
+                "bottom-right": BELL,
+                "top-edge": BELL,
+                "left-edge": BELL,
+                "right-edge": BELL,
+                "bottom-edge": partial,
+            }
+        })
+        rec = advise(ds)[8.0]
+        names = {c.crop_name for c in rec.partial_frame_crops}
+        assert names == {"bottom-left", "bottom-edge"}
+
+
 # --- Recommendation public surface ---------------------------------------
 
 

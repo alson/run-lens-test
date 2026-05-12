@@ -44,12 +44,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sharpness.collector import CollectedDataset
-from sharpness.crops import CROP_NAMES
+from sharpness.crops import CROP_NAMES, CROP_PEER_GROUPS
 from sharpness.detect import (
     DEFAULT_DYNAMIC_RANGE_MIN,
     DEFAULT_EDGE_STEPS,
     DEFAULT_OFF_TARGET_FACTOR,
     DEFAULT_OFF_TARGET_RANGE,
+    DEFAULT_PARTIAL_FRAME_FACTOR,
     CropAnalysis,
     CropStatus,
     analyze_crops_for_aperture,
@@ -101,6 +102,22 @@ class Recommendation:
         )
 
     @property
+    def partial_frame_crops(self) -> tuple[CropAnalysis, ...]:
+        """Crops where the wafer / target edge cuts through the crop
+        window — peer-compare detected substantially lower absolute
+        peak file size than positionally similar peers. Distinct from
+        OFF_TARGET (window entirely off the wafer): partial-frame
+        means re-frame, off-target means re-jog. ``valid=False`` so
+        these crops don't contribute to truncation / extension
+        decisions, but they're surfaced in the summary so the
+        operator knows to recompose."""
+        return tuple(
+            c
+            for c in self.crop_analyses
+            if c.status == CropStatus.PARTIAL_FRAME
+        )
+
+    @property
     def low_signal_crops(self) -> tuple[CropAnalysis, ...]:
         """Crops with a real but weak bell — dynamic range between the
         OFF_TARGET floor and the OK ceiling, peak found in the middle
@@ -135,6 +152,7 @@ class Recommendation:
         terminal output of the session runner.
         """
         invalid_note = self._invalid_note()
+        partial_note = self._partial_frame_note()
         if self.verdict == Verdict.OK:
             n_off = len(self.off_target_crops)
             n_low = len(self.low_signal_crops)
@@ -146,13 +164,13 @@ class Recommendation:
                 qualifiers.append(f"{n_off} off-target crops ignored")
             if qualifiers:
                 base += f" ({', '.join(qualifiers)})"
-            return base + invalid_note
+            return base + partial_note + invalid_note
         if self.verdict == Verdict.OFF_TARGET:
             base = (
                 f"f/{self.aperture:g}: OFF_TARGET — no focus signal in "
                 "this sweep (every valid crop flat or no crop valid)"
             )
-            return base + invalid_note
+            return base + partial_note + invalid_note
         crops = ", ".join(c.crop_name for c in self.truncated_crops)
         if self.direction == Direction.EXTEND_FORWARD:
             arrow = "extend forward (further past start position)"
@@ -163,10 +181,14 @@ class Recommendation:
         return (
             f"f/{self.aperture:g}: NEEDS_RESHOOT — {arrow} by ~{self.extra_steps} "
             f"rail step(s); truncated crops: {crops}"
-        ) + invalid_note
+        ) + partial_note + invalid_note
 
     def _invalid_note(self) -> str:
-        invalid = self.invalid_crops
+        # PARTIAL_FRAME crops are surfaced via _partial_frame_note;
+        # don't double-count them in the "invalid" rollup.
+        invalid = tuple(
+            c for c in self.invalid_crops if c.status != CropStatus.PARTIAL_FRAME
+        )
         if not invalid:
             return ""
         # Compact "(2 invalid crops: top-left 4%, bottom-right 6%)" so
@@ -176,6 +198,17 @@ class Recommendation:
             for c in invalid
         )
         return f" [{len(invalid)} invalid crops: {details}]"
+
+    def _partial_frame_note(self) -> str:
+        partial = self.partial_frame_crops
+        if not partial:
+            return ""
+        # The operator action for partial-frame is "reframe" not
+        # "re-jog", so the message is intentionally specific —
+        # listing crop names tells them which side of the frame
+        # extends past the wafer edge.
+        names = ", ".join(c.crop_name for c in partial)
+        return f" [PARTIAL_FRAME: {names} — reframe needed]"
 
 
 # --- internals -----------------------------------------------------------
@@ -299,10 +332,12 @@ def advise(
     dataset: CollectedDataset,
     *,
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
+    partial_frame_factor: float = DEFAULT_PARTIAL_FRAME_FACTOR,
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
     off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
     crop_names: tuple[str, ...] = CROP_NAMES,
+    peer_groups: tuple[tuple[str, ...], ...] = CROP_PEER_GROUPS,
     subsample_factors: dict[float, int] | None = None,
 ) -> dict[float, Recommendation]:
     """Produce one ``Recommendation`` per aperture present in ``dataset``.
@@ -342,6 +377,8 @@ def advise(
         analyses = analyze_crops_for_aperture(
             crop_sizes,
             cross_compare_factor=cross_compare_factor,
+            partial_frame_factor=partial_frame_factor,
+            peer_groups=peer_groups,
             edge_steps=edge_steps,
             dynamic_range_min=dynamic_range_min,
             off_target_range=off_target_range,

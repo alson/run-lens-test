@@ -49,6 +49,34 @@ CROP_NAMES_DX = (
 
 CROP_NAMES = CROP_NAMES_FULL_FRAME + CROP_NAMES_DX
 
+# Peer groups for absolute-size cross-compare (partial-frame detection).
+# Each group lists crops at the same *position class* — corners-with-
+# corners, edges-with-edges — so the comparison is apples-to-apples.
+# Centre has no peer group (singleton) and is omitted. See
+# ``lens_test_detect_core.partial_frame_by_peer_compare`` for the
+# detection logic.
+#
+# **Full-frame only.** The DX inner corners and edges are deliberately
+# excluded. By geometry, any DX inner crop sits *inside* the
+# corresponding full-frame outer crop's strip — so if a DX inner crop
+# were partial-frame (wafer edge cutting through it), the full-frame
+# outer crop would necessarily be partial-or-worse. The full-frame
+# peer groups catch every real partial-frame condition; adding DX
+# peer groups only contributes false positives from wafer pattern-
+# density asymmetry. Empirical case: the 24-120 + 45 mm extension
+# session (2026-05-11_161129) showed dx-right-edge at 0.76-0.79 of
+# its 4-member DX-edge peer median across all five apertures, while
+# the corresponding full-frame right-edge sat at 0.82-0.94 (normal
+# range). The asymmetry was the DX peer group's two vertical edges
+# (dx-top-edge, dx-bottom-edge) carrying ~20 % more detail than the
+# horizontal edges, dragging the median up. Same ratio at both 35 mm
+# and 45 mm magnifications confirmed the signal was pattern density,
+# not geometry.
+CROP_PEER_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("top-left", "top-right", "bottom-left", "bottom-right"),
+    ("top-edge", "bottom-edge", "left-edge", "right-edge"),
+)
+
 
 @dataclass(frozen=True)
 class CropBox:

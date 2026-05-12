@@ -31,6 +31,7 @@ from lens_test_detect_core import (
     CropStatus,
     is_flat,
     off_target_by_cross_compare,
+    partial_frame_by_peer_compare,
     peak_index,
     smooth,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "DEFAULT_FLAT_RATIO",
     "DEFAULT_OFF_TARGET_FACTOR",
     "DEFAULT_OFF_TARGET_RANGE",
+    "DEFAULT_PARTIAL_FRAME_FACTOR",
     "analyze_crop",
     "analyze_crops_for_aperture",
     "dynamic_range",
@@ -51,6 +53,7 @@ __all__ = [
     "extra_steps_needed",
     "is_flat",
     "off_target_by_cross_compare",
+    "partial_frame_by_peer_compare",
     "peak_index",
     "smooth",
     "truncation_status",
@@ -92,6 +95,24 @@ DEFAULT_DYNAMIC_RANGE_MIN = 0.25
 # on soft lenses (e.g. fast primes with external extension tubes)
 # where corner acutance lands at max/min ratios of 1.04–1.22.
 DEFAULT_OFF_TARGET_RANGE = 0.05
+# Partial-frame cutoff: a crop's peak file size below
+# ``factor × peer-group median`` is flagged
+# :data:`CropStatus.PARTIAL_FRAME` (window extends past the wafer edge,
+# part of the crop is dark background). Peer groups (4 corners vs 4
+# corners, 4 edges vs 4 edges) keep the comparison apples-to-apples so
+# natural corner softness vs centre detail doesn't false-positive
+# every corner.
+#
+# Calibrated against the 24-120 + 35 mm extension session
+# (2026-05-11_185420) where bottom-left was confirmed partially
+# off-frame: its ratio sat at 0.72-0.79 of peer-corner median across
+# all five apertures, while normal non-partial corners on the same
+# session and the sibling 24-120 + 45 mm session clustered at
+# ≥ 0.95. 0.80 cleanly separates the two regimes; a one-off
+# borderline aperture won't fire unless the geometry actually cuts
+# off frame. See ``partial_frame_by_peer_compare`` for the
+# full rationale.
+DEFAULT_PARTIAL_FRAME_FACTOR = 0.80
 
 
 # Backwards-compatible alias — the live module historically called this
@@ -222,6 +243,7 @@ def analyze_crop(
     sizes: list[int],
     *,
     flagged_off_target: bool,
+    flagged_partial_frame: bool = False,
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
     off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
@@ -250,6 +272,17 @@ def analyze_crop(
     a secondary ``OFF_TARGET`` signal for crops that *do* swing across
     the rail but whose peak is far weaker than the best crop in the
     aperture.
+
+    ``flagged_partial_frame`` carries the absolute-size peer-compare
+    result and routes to :data:`CropStatus.PARTIAL_FRAME` (the crop
+    window extends past the wafer / target edge — distinct from
+    OFF_TARGET in that the on-wafer portion still has real focus
+    signal, but the dark-background filler dilutes the absolute size
+    metric below peer-group median). Takes precedence over
+    ``flagged_off_target`` because the diagnosis is more specific
+    (re-frame vs re-jog), but only after the dr-floor OFF_TARGET
+    check — a crop with no signal at all is still OFF_TARGET, even
+    if it would also satisfy the peer-compare criterion.
     """
     n = len(sizes)
     if n == 0:
@@ -274,6 +307,27 @@ def analyze_crop(
         return CropAnalysis(
             crop_name=crop_name,
             status=CropStatus.OFF_TARGET,
+            n_steps=n,
+            peak_step=None,
+            peak_pct=None,
+            estimated_peak_step=None,
+            extra_steps_needed=None,
+            max_size=max(sizes),
+            min_size=min(sizes),
+            valid=False,
+            dynamic_range=dr,
+        )
+
+    if flagged_partial_frame:
+        # Absolute-size peer-compare flagged: the crop has real
+        # dynamic range (it cleared the dr floor above) but its peak
+        # absolute size is well below positionally similar peers,
+        # consistent with the wafer / target edge cutting through the
+        # crop window. Distinct from OFF_TARGET — the operator remedy
+        # is reframing, not re-jogging.
+        return CropAnalysis(
+            crop_name=crop_name,
+            status=CropStatus.PARTIAL_FRAME,
             n_steps=n,
             peak_step=None,
             peak_pct=None,
@@ -359,6 +413,8 @@ def analyze_crops_for_aperture(
     crop_sizes: dict[str, list[int]],
     *,
     cross_compare_factor: float = DEFAULT_OFF_TARGET_FACTOR,
+    partial_frame_factor: float = DEFAULT_PARTIAL_FRAME_FACTOR,
+    peer_groups: list[list[str]] | tuple[tuple[str, ...], ...] = (),
     edge_steps: int = DEFAULT_EDGE_STEPS,
     dynamic_range_min: float = DEFAULT_DYNAMIC_RANGE_MIN,
     off_target_range: float = DEFAULT_OFF_TARGET_RANGE,
@@ -374,6 +430,14 @@ def analyze_crops_for_aperture(
     of off-wafer corners can't drag down the reference max and
     falsely flag the few real crops. LOW_SIGNAL crops still
     participate in cross-compare — they are real signal, just weak.
+
+    ``peer_groups`` enables the absolute-size partial-frame detector.
+    Each group is a list of crop names at the same *position class*
+    (e.g. the 4 full-frame corners). A crop whose peak absolute size
+    falls below ``partial_frame_factor × group_median`` is routed to
+    :data:`CropStatus.PARTIAL_FRAME` instead of OK/LOW_SIGNAL. Pass an
+    empty tuple to disable (callers that don't know the crop layout
+    — e.g. ad-hoc tests — can skip the detector this way).
     """
     valid_maxes: dict[str, int] = {
         name: max(sizes)
@@ -381,11 +445,20 @@ def analyze_crops_for_aperture(
         if sizes and dynamic_range(sizes) >= off_target_range
     }
     flagged = off_target_by_cross_compare(valid_maxes, factor=cross_compare_factor)
+    if peer_groups:
+        flagged_partial = partial_frame_by_peer_compare(
+            valid_maxes,
+            [list(g) for g in peer_groups],
+            factor=partial_frame_factor,
+        )
+    else:
+        flagged_partial = set()
     return [
         analyze_crop(
             name,
             sizes,
             flagged_off_target=name in flagged,
+            flagged_partial_frame=name in flagged_partial,
             edge_steps=edge_steps,
             dynamic_range_min=dynamic_range_min,
             off_target_range=off_target_range,
