@@ -1670,3 +1670,121 @@ probe-related regressions show up specifically on Viltrox 85 mm +
 extension tubes again, the failure mode is the one documented in
 §6.28 Session B — investigate that geometry before disabling
 globally.
+
+### 6.31 Manual-aperture mode — design decisions (2026-05)
+
+Adds support for non-CPU lenses (AI-S, pre-AI). The mechanics are
+documented in `macro_lens_test_plan.md` §14; the rationale below
+captures *why* each decision went the way it did so future
+maintainers don't re-litigate.
+
+**Flash mode = Manual, not AA.** AA flash on the SB-5000 commander
+relies on the body telling the flash the current aperture so the
+commander can set the quench threshold. On the Z7 the body has no
+mechanism for non-CPU lenses to communicate actual aperture —
+only the registered max aperture in the Non-CPU lens data slot,
+which doesn't change as the user turns the ring. Verified
+empirically: AA mode with a non-CPU lens silently mis-meters every
+shot. M flash mode (commander-set fixed power per group) is the
+only working option. Consequence: FEC and EC are inert; ISO and
+power are the only exposure knobs.
+
+**Aperture convention = lens-internal effective, not total.** The
+2026-01 / 2026-02 datasets had a mixed convention: CPU lenses used
+EXIF (which reports lens-internal effective — bellows of the helix
+but not of external tubes), while MF lenses with PK-13 had folder
+names manually script-bumped to *total* effective (including the
+tube). Going forward, **all lenses use lens-internal effective**
+for the file label (= the `aperture` column in shots.csv). This
+matches what the CPU EXIF gives natively; analysis-time
+reconstruction of total effective is straightforward from the new
+`magnification_indicated` + `f_ring` + `magnification` metadata.
+The 2026-01 MF folder labels (script-bumped) are a one-stop off
+the new convention — re-analysis joining the two datasets needs a
+downstream re-bump on the old MF data, applied uniformly.
+
+**`MAX_FSTOP` bound on rounded label, not raw effective.** For the
+55 AIS at 1:1 + PK-13, ring f/11 has raw effective 16.5 — over
+the 16.0 cap if compared strictly. Rounded to the 1/3-stop scale,
+it's `"16"` — at the cap. The bound checks the rounded label so
+ring f/11 is included; the captured folder is F16. Ring f/16 would
+round to `"25"` and is correctly excluded.
+
+**Display: ring stop, not effective.** During capture the operator
+needs to know what to dial on the lens ring. The effective label
+is metadata for the analysis side. Mixing them in capture-time
+prompts caused confusion in early runs — the inverse computation
+showed e.g. "f/2.7" for ring f/2.8 (label "4" → 4/1.5=2.67 →
+"2.7") which isn't a real ring marking. Fixed by passing the
+actual ring stop into `prompt_turn_ring` and dropping the
+"(effective f/X at m=Y)" parenthetical entirely.
+
+**Brute-force solver replaces strict-soft-cap logic.** The
+original `target_for_next_aperture` clamped power at the soft cap
+(1/2) the moment naive_power fell below it, then bumped ISO by
+the deficit. With `MANUAL_ISO_FLOOR=50` the next ISO ladder entry
+is 100 — a *full stop* for a 0.03-stop deficit, so the algorithm
+over-corrected by ~1 stop. Real-rig run hit this at the f/13
+step: +0.6 EV over baseline despite all four prior apertures
+landing within ±0.1 EV. Replaced with a NumPy-vectorised
+brute-force search over the full (power × ISO) lattice, scored as
+`|light_change − target| + soft_cap_penalty + iso_floor_penalty`
+(weights 0.10 and 0.02 EV per stop respectively). On the same
+55 AIS configuration, all 5 apertures now land within ±0.075 EV
+in 1 capture each. The brute-force solver also takes a
+`prev_ev_delta` parameter so each subsequent aperture pulls
+residual error toward zero rather than just compensating for the
+aperture step.
+
+**`MANUAL_ISO_FLOOR = 100`, not 50.** Original choice was 50 (Z7
+Lo 1 extended-low) to give the cascade a one-stop fine-tune below
+ISO 100 when the calibrated flash power slightly over-exposes.
+Empirically that interacted badly with the ISO ladder gap from
+50 to 100 (a full stop, no in-between settings) — the cascade
+would over-shoot by 1 stop when needing a small ISO adjustment.
+Plus Lo 1 has slightly worse colour response than native-floor
+ISO 100. The cascade now prefers staying at 100; if flash at
+1/128 is *still* over-exposing, that's a lighting problem to
+fix at the rig, not silently work around with extended-low ISO.
+
+**`MANUAL_FLASH_TOLERANCE_EV = 0.2`, vs auto-mode's 0.5.** AA's
+closed-loop FEC absorbs minor residuals — half-stop tolerance is
+fine. Manual mode's predictive solver can miss by 0.2-0.3 EV
+when pupil-magnification or IGBT-timing non-linearities diverge
+from the simple `(1+m)²` / linear-power models. Verified on the
+55 AIS f/16 step: predicted delta -0.02 EV, actual -0.28 EV.
+Tighter tolerance triggers an ISO fine-tune retry (cost: ~1
+extra capture per aperture, worst case) and the cascade lands
+much closer to baseline.
+
+**Phase A sharpness probe per aperture, not just at widest.** Auto
+mode runs Phase A once at the widest aperture (assuming focus
+shift across apertures is small enough that the same Phase C
+window works for all). Manual mode runs Phase A at every aperture
+because (a) each aperture has its own independent rail sweep
+anyway, so the extra probe cost is per-aperture not per-config,
+and (b) it provides a sanity check that the operator hasn't
+accidentally moved the rig between ring turns.
+
+**Range advisor per aperture, not per lens-config.** Same reasoning
+— each aperture is an independent sweep, so the truncated-peak
+detection has to fire per aperture too. Verified post-hoc on a
+real 5-aperture session: 0 off-target, 0 truncated; the range
+advisor's job in manual mode is to catch the next session where
+that's *not* the case.
+
+**Three new ntfy notifications.** `MANUAL_APERTURE_READY` for
+mid-sweep "next prompt is up" pings (operator can step away
+during multi-minute rail sweeps); `MANUAL_CASCADE_ABORTED` for
+Phase 1 safety termination (subject too bright/dim);
+`CALIBRATION_NOT_CONVERGED` for soft-fail when ISO fine-tune
+saturates without landing in tolerance. The first one is
+default-priority FYI; the other two are `high` priority with
+warning tags.
+
+**Manual flash labels match SB-5000 display format.** Initial
+prompts rendered fractional power as `-1/3` / `-2/3`; the
+commander itself shows decimal `-0.3` / `-0.7`. Switched to the
+decimal form so the operator can read the prompt and dial the
+commander without mental conversion. Same logic for the prompt
+order — A before C, matching the SB-5000's group display order.

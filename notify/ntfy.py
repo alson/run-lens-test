@@ -45,6 +45,39 @@ FLASH_POWER_LIMIT = Notification(
     priority="default",
     tags=("warning",),
 )
+MANUAL_APERTURE_READY = Notification(
+    title="Next aperture ready",
+    body="",
+    priority="default",
+    tags=("camera_with_flash",),
+)
+"""Sent at the start of each per-aperture cascade iteration in
+manual-aperture mode. The rail has just finished sweeping the
+previous aperture and the rig is about to prompt for the next
+ring turn + flash power. Useful for stepping away during the
+multi-minute sweep and getting pinged when attention is needed."""
+
+MANUAL_CASCADE_ABORTED = Notification(
+    title="Manual cascade aborted",
+    body="",
+    priority="high",
+    tags=("warning", "rotating_light"),
+)
+"""Sent when the first-aperture coarse search exhausts the SB-5000
+power range (either still over-exposed at 1/128 or still
+under-exposed at 1/1) — the rig can't calibrate without operator
+intervention (reduce ambient / add ND / change flash position)."""
+
+CALIBRATION_NOT_CONVERGED = Notification(
+    title="Calibration did not converge",
+    body="",
+    priority="high",
+    tags=("warning",),
+)
+"""Sent when a manual-aperture cascade completes with
+hit_tolerance=False — the final EV delta from baseline is outside
+the ⅓-stop tolerance. The session continues; this is a
+quality-flag, not a hard abort."""
 
 
 HttpPost = Callable[[str, dict, bytes], object]

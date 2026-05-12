@@ -60,6 +60,13 @@ SHOT_COLUMNS: tuple[str, ...] = (
     "filename",
     "phase",
     "notes",
+    # ---- Manual-aperture / non-CPU mode metadata ------------------
+    # Populated only when the session is run with --manual-aperture
+    # and only for the lens-configs in that session. Auto-mode
+    # (CPU lens) rows leave these blank.
+    "magnification_indicated",
+    "f_ring",
+    "focal_length_mm",
 )
 
 
@@ -79,6 +86,10 @@ class ShotRow:
     filename: str
     phase: Phase
     notes: str = ""
+    # ---- Manual-aperture metadata (None for auto mode) ------------
+    magnification_indicated: float | None = None
+    f_ring: float | None = None
+    focal_length_mm: float | None = None
 
     def to_csv_row(self) -> dict[str, str]:
         d = asdict(self)
@@ -87,6 +98,11 @@ class ShotRow:
 
 
 def _csv_str(value: Any) -> str:
+    if value is None:
+        # Blank cell — used by the manual-aperture columns when the
+        # session is auto-mode, so the column stays present but the
+        # value is unambiguously "n/a".
+        return ""
     if isinstance(value, float):
         # Stable formatting; downstream analysis parses these.
         return f"{value:.6g}"

@@ -49,6 +49,14 @@ def cfg():
         EC_STEP_EV=1.0 / 3.0,
         TEST_SHOT_TOLERANCE_EV=1.0 / 3.0,
         TEST_SHOT_MAX_RETRIES=6,
+        # Manual-aperture flash-M cascade constants.
+        MANUAL_ISO_FLOOR=100,
+        MANUAL_FLASH_SOFT_CAP_STOPS=1.0,
+        MANUAL_FLASH_HARD_CAP_STOPS=0.0,
+        MANUAL_FLASH_INITIAL_POWER_STOPS=5.0,
+        MANUAL_FLASH_SEARCH_TOLERANCE_EV=1.0,
+        MANUAL_FLASH_BUMP_SANITY_EV=0.5,
+        MANUAL_FLASH_MAX_SEARCH_ITERATIONS=15,
     )
 
 
@@ -409,3 +417,351 @@ class TestMultiAperture:
         )
         aperture_calls = [v for k, v in camera.history if k == "aperture"]
         assert aperture_calls == ["f/4", "f/8", "f/11"]
+
+
+# ---- Manual-aperture mode (non-CPU lens) ----------------------------------
+
+
+class TestCalibrateSingleAperture:
+    def test_returns_single_entry_result(self, camera, cfg, tmp_path) -> None:
+        calib = make_calibrator(camera, cfg, medians=[100.0])
+        result = calib.calibrate_single_aperture(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+        )
+        assert list(result.per_aperture.keys()) == ["f/4"]
+        assert result.per_aperture["f/4"].hit_tolerance is True
+
+    def test_set_aperture_via_camera_false_skips_camera_setter(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """For non-CPU lenses the diaphragm is mechanical — the camera's
+        aperture widget either errors or is a no-op. Calling
+        :meth:`set_aperture` in that case is wrong (or, at best,
+        wastes a PTP round-trip). With ``set_aperture_via_camera=False``
+        the Calibrator must not touch ``camera.set_aperture``."""
+        calib = make_calibrator(camera, cfg, medians=[100.0])
+        calib.calibrate_single_aperture(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            set_aperture_via_camera=False,
+            flash_mode="manual",
+        )
+        aperture_calls = [v for k, v in camera.history if k == "aperture"]
+        assert aperture_calls == [], (
+            f"manual mode must not call set_aperture, got {aperture_calls}"
+        )
+
+    def test_set_aperture_via_camera_true_still_calls_camera(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """Default behaviour (auto / CPU lens) is unchanged."""
+        calib = make_calibrator(camera, cfg, medians=[100.0])
+        calib.calibrate_single_aperture(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            # set_aperture_via_camera defaults True; flash_mode='aa'.
+        )
+        aperture_calls = [v for k, v in camera.history if k == "aperture"]
+        assert aperture_calls == ["f/4"]
+
+
+class TestManualFlashCascade:
+    def test_iso_only_no_fec_writes_for_underexposure(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """Manual flash cascade should NEVER touch FEC for adjustment;
+        only ISO bumps. We seed an under-exposed median sequence so
+        the cascade must do something — and verify it bumped ISO."""
+        # First shot: -1 EV under (median 50 vs baseline 100). Second
+        # shot: in tolerance. FEC writes only happen at the initial
+        # reset (one set_fec(0.0) per aperture); no per-step FEC moves.
+        calib = make_calibrator(
+            camera, cfg, medians=[50.0, 100.0],
+        )
+        result = calib.calibrate_single_aperture(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            set_aperture_via_camera=False,
+            flash_mode="manual",
+        )
+        # Aperture not set: see above.
+        # FEC writes: exactly one — the initial reset to 0.0 at the
+        # start of the aperture. No cascade-driven FEC bumps.
+        fec_writes = [v for k, v in camera.history if k == "fec"]
+        assert fec_writes == [0.0], (
+            f"manual mode should leave FEC at 0, got writes {fec_writes}"
+        )
+        # ISO writes: initial set_iso, then a bump after the under-
+        # exposed shot. Order: [100, bumped].
+        iso_writes = [v for k, v in camera.history if k == "iso"]
+        assert iso_writes[0] == 100, f"initial ISO should be 100, got {iso_writes[0]}"
+        assert iso_writes[-1] > 100, (
+            f"manual cascade must bump ISO on under-exposure, "
+            f"got writes {iso_writes}"
+        )
+        # Converged on the second capture.
+        ap = result.per_aperture["f/4"]
+        assert ap.hit_tolerance is True
+        assert ap.fec_ev == 0.0
+        assert ap.iso_bumped is True
+
+    def test_iso_drop_on_overexposure(self, camera, cfg, tmp_path) -> None:
+        """Over-exposed (median > baseline) should drop ISO, not
+        bump it. Confirms the manual cascade goes both directions
+        unlike the AA cascade where ISO only goes up as a range
+        extender."""
+        # Use an aperture whose initial ISO is > floor so we have
+        # somewhere to drop to. f/8 → ISO 100 per fixture; need an
+        # aperture with initial ISO 200 to test drop. f/11.
+        calib = make_calibrator(
+            camera, cfg, medians=[400.0, 100.0],
+        )
+        result = calib.calibrate_single_aperture(
+            aperture="f/11",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            set_aperture_via_camera=False,
+            flash_mode="manual",
+        )
+        iso_writes = [v for k, v in camera.history if k == "iso"]
+        assert iso_writes[0] == 200, (
+            f"f/11 starts at ISO 200 per RANGE_EXTENSION; got {iso_writes[0]}"
+        )
+        assert iso_writes[-1] < 200, (
+            f"manual cascade must drop ISO on over-exposure, "
+            f"got writes {iso_writes}"
+        )
+        ap = result.per_aperture["f/11"]
+        assert ap.hit_tolerance is True
+
+    def test_baseline_setting_on_first_capture(self, camera, cfg, tmp_path) -> None:
+        """First call with baseline=None should set the baseline from
+        the first capture's median (same behaviour as AA cascade)."""
+        calib = make_calibrator(camera, cfg, medians=[123.0])
+        result = calib.calibrate_single_aperture(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=None,
+            set_aperture_via_camera=False,
+            flash_mode="manual",
+        )
+        assert result.baseline_median == pytest.approx(123.0)
+        ap = result.per_aperture["f/4"]
+        assert ap.hit_tolerance is True
+        assert ap.test_shots_taken == 1
+        assert ap.fec_ev == 0.0
+
+
+# ---- First-aperture manual-flash cascade ----------------------------------
+
+
+def _power_prompt_recorder():
+    """Returns (callable, list-of-recorded-args)."""
+    recorded: list[dict] = []
+
+    def _prompt(*, power_c_label, power_a_label, context=""):
+        recorded.append(
+            dict(
+                power_c_label=power_c_label,
+                power_a_label=power_a_label,
+                context=context,
+            )
+        )
+        return True
+
+    return _prompt, recorded
+
+
+class TestCalibrateFirstApertureManual:
+    def test_converges_with_phase_1_in_one_iter(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """Initial power 1/32 (5.0 stops), first capture lands within
+        ±1 EV of baseline → Phase 1 exits in 1 iter. Phase 2 ISO
+        fine-tune skipped (already within ±1/3). Phase 3 back-calc
+        keeps power. Phase 4 verifies in 1 iter."""
+        # Medians: phase 1 capture (close to baseline) + phase 4
+        # verification (close to baseline).
+        calib = make_calibrator(camera, cfg, medians=[105.0, 102.0])
+        prompt, recorded = _power_prompt_recorder()
+        result, final_power, final_iso = (
+            calib.calibrate_first_aperture_manual(
+                aperture="f/2.8",
+                lens_dir=tmp_path,
+                lens_slug="lens",
+                session_id="s",
+                baseline_median=100.0,
+                prompt_set_flash_power=prompt,
+            )
+        )
+        ap = result.per_aperture["f/2.8"]
+        assert ap.hit_tolerance is True
+        # Phase 1 settled at 5.0 (1/32) with delta = +0.157 EV
+        # (median 105 vs baseline 100). Phase 3 back-calc with the
+        # new brute-force solver picks (power=5.33, iso=125) which
+        # nudges the residual +0.157 EV closer to baseline (light
+        # change ≈ -0.008 EV). Phase 4 verifies at the new target.
+        assert ap.flash_power_stops_below_full == pytest.approx(16 / 3)
+        assert final_power == pytest.approx(16 / 3)
+        assert final_iso == 125
+        # Two prompts: phase 1 coarse search step 1 (1/32), phase 4
+        # verify at the back-calc target (1/32 -0.3).
+        assert len(recorded) == 2
+        assert recorded[0]["power_c_label"] == "1/32"
+        assert recorded[0]["power_a_label"] == "1/32 -0.3"
+        assert recorded[1]["power_c_label"] == "1/32 -0.3"
+
+    def test_phase_1_bumps_up_on_underexposure(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """First capture is heavily under-exposed → Phase 1 bumps
+        power one stop up (e.g. 1/32 → 1/16). Second capture is
+        within ±1 EV → exit Phase 1."""
+        # Medians:
+        #   [0] phase 1 step 1 (power 1/32): 30 → -3.82 EV, bump
+        #   [1] phase 1 step 2 (power 1/16): 90 → -0.33 EV, exit phase 1
+        #   [2] phase 2 ISO bump 50→100 verification: 95 → in tol
+        #   [3] phase 4 verification (back-calc may bump power): 100
+        calib = make_calibrator(
+            camera, cfg, medians=[30.0, 90.0, 95.0, 100.0],
+        )
+        prompt, recorded = _power_prompt_recorder()
+        result, final_power, _ = calib.calibrate_first_aperture_manual(
+            aperture="f/2.8",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            prompt_set_flash_power=prompt,
+        )
+        # Phase 1 settled at 4.0 (1/16) after a +1-stop bump. Phase 2
+        # ISO fine-tune needed +1/3 stop (ISO 100→125) to pull the
+        # -0.33 EV under into tolerance. Phase 3 back-calc absorbs
+        # the 1/3-stop ISO overhang into power: 4.0 - 1/3 = 11/3 ≈
+        # 3.667 (= "1/8 -2/3"). Phase 4 verifies at the new power
+        # with ISO back to floor 100.
+        assert final_power == pytest.approx(11 / 3)
+        labels = [r["power_c_label"] for r in recorded]
+        # phase 1 step 1, phase 1 step 2, phase 4 verify.
+        assert labels == ["1/32", "1/16", "1/8 -0.7"]
+
+    def test_phase_1_safety_termination_too_dim(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """If even 1/1 power is still too dim, abort with
+        SessionAborted instead of looping forever or returning
+        garbage."""
+        # All captures very dim — even at 1/1 the search won't
+        # converge.
+        calib = make_calibrator(camera, cfg, medians=[5.0] * 20)
+        prompt, _ = _power_prompt_recorder()
+        from errors import SessionAborted
+        with pytest.raises(SessionAborted, match="still under-exposed"):
+            calib.calibrate_first_aperture_manual(
+                aperture="f/2.8",
+                lens_dir=tmp_path,
+                lens_slug="lens",
+                session_id="s",
+                baseline_median=100.0,
+                prompt_set_flash_power=prompt,
+            )
+
+    def test_phase_1_safety_termination_too_bright(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """If even 1/128 is still too bright, abort."""
+        calib = make_calibrator(camera, cfg, medians=[250.0] * 20)
+        prompt, _ = _power_prompt_recorder()
+        from errors import SessionAborted
+        with pytest.raises(SessionAborted, match="still over-exposed"):
+            calib.calibrate_first_aperture_manual(
+                aperture="f/2.8",
+                lens_dir=tmp_path,
+                lens_slug="lens",
+                session_id="s",
+                baseline_median=100.0,
+                prompt_set_flash_power=prompt,
+            )
+
+
+# ---- Subsequent-aperture manual-flash cascade -----------------------------
+
+
+class TestCalibrateSubsequentApertureManual:
+    def test_uses_target_for_next_aperture(self, camera, cfg, tmp_path) -> None:
+        """Calls the deterministic target_for_next_aperture helper
+        and prompts the user once with the resulting label."""
+        # Prev: 1/4 (2.0 stops), ISO 100 (= 1 stop above MANUAL_ISO_FLOOR).
+        # diff = 1 stop aperture.
+        # iso_above_floor = log2(100/50) = 1.
+        # total_boost = 1 + 1 = 2.
+        # naive_power = 2 - 2 = 0 (= 1/1).
+        # 0 < soft_cap=1.0, hold at soft_cap. iso_stops = 1.
+        # iso = 50 * 2^1 = 100. So target = (1/2, 100).
+        calib = make_calibrator(camera, cfg, medians=[100.0])
+        prompt, recorded = _power_prompt_recorder()
+        result, final_power, final_iso = (
+            calib.calibrate_subsequent_aperture_manual(
+                aperture="f/4",
+                lens_dir=tmp_path,
+                lens_slug="lens",
+                session_id="s",
+                baseline_median=100.0,
+                prev_power_stops=2.0,    # 1/4
+                prev_iso=100,
+                prev_ev_delta=0.0,
+                aperture_stops_diff=1.0,
+                prompt_set_flash_power=prompt,
+            )
+        )
+        # Target should be power=1/2 (1.0 stops), ISO 100.
+        assert final_power == pytest.approx(1.0)
+        assert final_iso == 100
+        assert len(recorded) == 1
+        assert recorded[0]["power_c_label"] == "1/2"
+        ap = result.per_aperture["f/4"]
+        assert ap.flash_power_stops_below_full == pytest.approx(1.0)
+        assert ap.hit_tolerance is True
+
+    def test_sanity_check_fires_on_large_initial_delta(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        """If the first capture is more than
+        MANUAL_FLASH_BUMP_SANITY_EV off baseline, the cascade
+        re-prompts the user to verify the power / ring setting."""
+        # First capture: median 30 → delta = -3.43 EV (huge).
+        # Re-prompt fires. Retry capture: 100 (in tol).
+        calib = make_calibrator(camera, cfg, medians=[30.0, 100.0])
+        prompt, recorded = _power_prompt_recorder()
+        calib.calibrate_subsequent_aperture_manual(
+            aperture="f/4",
+            lens_dir=tmp_path,
+            lens_slug="lens",
+            session_id="s",
+            baseline_median=100.0,
+            prev_power_stops=2.0,
+            prev_iso=100,
+            prev_ev_delta=0.0,
+            aperture_stops_diff=1.0,
+            prompt_set_flash_power=prompt,
+        )
+        # Two prompts: initial target, then SANITY re-prompt.
+        assert len(recorded) == 2
+        assert "SANITY" in recorded[1]["context"]

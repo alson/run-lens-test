@@ -530,3 +530,155 @@ The program should also do a **one-time FEC sanity check** on the first session 
 - Automatic SU-800 / flash power adjustment (not possible — physical buttons only).
 - Sharpness analysis itself — this script only collects the data; sharpness measurement is a downstream tool the user already has.
 - A GUI. Terminal only.
+
+## 14. Manual-aperture mode (non-CPU lenses)
+
+Added 2026-05 to support AI-S / pre-AI lenses on the Z7 via FTZ
+(e.g., Micro-Nikkor 55mm f/2.8 AIS, Micro-Nikkor Auto 55mm f/3.5
++ K-tubes). These lenses have **mechanical aperture rings** and
+**no electronic communication of aperture to the body**, which
+breaks two assumptions of v1:
+
+1. The camera can't drive the diaphragm, so the inner-loop
+   "aperture changes are free" design (§2.6) becomes "the user
+   physically turns a ring K times per rail step" — untenable.
+2. The body can't tell the flash the actual aperture, so AA / TTL
+   flash modes mis-quench. **Manual flash mode is the only
+   working choice** on Z7 + non-CPU. FEC and EC are inert; ISO is
+   the only programmatic exposure knob.
+
+CLI: `--manual-aperture` (per-session boolean). The plan that drove
+the design is at `~/.claude/plans/rustling-tumbling-moonbeam.md`;
+the design-note follow-ups are in `DESIGN_NOTES.md` §6.31 and §6.32.
+
+### 14.1 Inverted capture loop
+
+Outer = apertures (one rail sweep per ring turn), inner = rail
+steps — the reverse of §2.6's auto-mode order. Between apertures
+the rail returns to position 0; the user is prompted to turn the
+ring to the next stop. Implementation:
+:meth:`SessionRunner._run_manual_aperture_sweep` in
+`session/runner.py`.
+
+### 14.2 Flash-power cascade (`session/flash_power.py`)
+
+Replaces the AA + FEC closed-loop calibration (§2.2) with a
+**user-driven Manual flash protocol**:
+
+- **First aperture (4 phases).** Coarse power search (full-stop
+  steps from `MANUAL_FLASH_INITIAL_POWER_STOPS = 5.0` = 1/8 1/4
+  power equivalent, biased low to favour ISO room above floor) →
+  ISO fine-tune at the settled power → back-calc target power
+  via :func:`target_for_next_aperture` → user dials the target
+  → verification capture + ISO fine-tune.
+- **Subsequent apertures.** Deterministic per-step (power, ISO)
+  target via the same `target_for_next_aperture` solver, using
+  the previous aperture's final (power, iso, ev_delta). The
+  algorithm searches the full ⅓-stop power ladder × ISO-ladder
+  with a vectorised NumPy score = `|light_change − target| +
+  soft_cap_penalty + iso_floor_penalty` (penalty weights in
+  `_SOFT_CAP_PENALTY_PER_STOP = 0.10`, `_ISO_PENALTY_PER_STOP =
+  0.02`). Sanity check fires if the first capture at the new
+  aperture is more than `MANUAL_FLASH_BUMP_SANITY_EV = 0.5` EV
+  off baseline (catches "did the user actually turn the ring?").
+
+Group C is the **left** flash; group A is the **right** flash
+running 1/3 stop lower (subject-distance offset). Prompts list
+A before C to match the SB-5000 commander's display order. Power
+labels render as the commander shows them (`"1/2 -0.3"`,
+`"1/4 -0.7"`, …) per `power_label` / `parse_power_label`.
+
+### 14.3 Aperture conventions
+
+`session/manual_aperture.py` walks **ring whole stops** from the
+lens's marked widest (`f_ring`) upward, computing the **lens-internal
+effective label** as `f_ring × (1 + m_indicated)` rounded to the
+1/3-stop scale (`config.ONE_THIRD_STOP_SCALE`). The bound check is
+on the *rounded label* against `MAX_FSTOP` — not the raw effective
+— so e.g. ring f/11 on the 55 AIS at 1:1 + PK-13 (raw effective
+16.5) renders to label `"16"` which equals MAX_FSTOP and is
+included.
+
+The effective label is the canonical file-path / shots.csv
+identifier (matches the auto-mode CPU EXIF convention where the
+lens reports its own internal-helix-corrected effective). It is
+**never displayed during capture** — operator-facing prompts and
+the per-aperture breakdown only show ring f-numbers, since
+effective aperture is downstream-analysis metadata. See `_announce`
+calls in `_run_manual_aperture_sweep` and `_announce_subsample_breakdown`
+in `runner.py`.
+
+### 14.4 Tolerance
+
+Manual-mode ISO fine-tune uses `MANUAL_FLASH_TOLERANCE_EV = 0.2`
+(tighter than auto-mode's `TEST_SHOT_TOLERANCE_EV = 0.5`). Auto
+mode's slack works because AA flash absorbs minor residuals via
+the closed-loop quench; manual mode's predictive solver can miss
+by 0.2-0.3 EV when pupil-magnification or IGBT-timing
+non-linearities bend the simple `(1+m)²` / linear-power models,
+so the cascade needs a tighter target to trigger an ISO fine-tune
+retry instead of declaring the first capture "in tolerance".
+
+### 14.5 Range advisor
+
+Runs per-aperture (vs auto-mode's per-lens-config) — each
+aperture's sweep is independent so the truncated-peak /
+off-target detection has to fire per aperture too. Calls
+`_run_range_check_and_extend` after every `_run_sweep` in the
+manual-mode inverted loop.
+
+### 14.6 Notifications
+
+Three new `Notification` constants in `notify/ntfy.py`:
+
+- `MANUAL_APERTURE_READY` — fires at the top of each per-aperture
+  iteration (except the first), so an operator stepping away
+  during the multi-minute sweep gets pinged when the next
+  ring-turn / flash-power prompt is ready.
+- `MANUAL_CASCADE_ABORTED` — fires when the first-aperture
+  coarse search exhausts the SB-5000 range or any cascade step
+  raises `SessionAborted`.
+- `CALIBRATION_NOT_CONVERGED` — soft-fail flag when a cascade
+  completes with `hit_tolerance=False`. Session continues; the
+  notification just surfaces the quality issue.
+
+### 14.7 Slug parsing
+
+`session/manual_aperture.py::parse_lens_slug` regex-extracts
+`focal_length_mm` and `f_ring` from the lens-config slug (all
+slugs in `analyse-lens-test/reshoot-plan-2026-05.md` parse
+cleanly). Fallback prompts in `ui/prompts.py` cover slugs that
+don't match (`prompt_focal_length`, `prompt_max_aperture`).
+`magnification_indicated` (lens-barrel reading) is always
+prompted — see §14.8 below for why.
+
+### 14.8 Per-shot metadata
+
+New columns in `shots.csv` and per-lens-config fields in
+`session.json::lens_configs`:
+
+- `magnification_indicated` — lens barrel reading; what the lens
+  itself "thinks" its magnification is. Required for downstream
+  external-tube correction (when a tube was added on top of the
+  lens, `m_total > m_indicated` and the difference is the tube's
+  contribution).
+- `f_ring` — marked widest aperture (from slug or prompt).
+- `focal_length_mm` — parsed from slug; populated for both
+  manual and auto mode rows when extractable.
+
+The effective aperture stored in the `aperture` column is the
+**lens-internal** effective (`f_ring × (1 + m_indicated)`),
+matching the CPU EXIF convention. **External tubes are not in
+the label** — that's analysis-time computation from `m_total`
+(automated wafer-square measurement, future tooling) and
+`m_indicated`.
+
+### 14.9 Out of scope (deferred)
+
+- Mixing manual and auto lenses in the same session: the
+  `--manual-aperture` flag is per-session.
+- Automated wafer-square measurement of `m_total` to populate
+  `magnification_measured` in metadata.
+- Per-aperture range advisor "extend before / after" handling
+  inside `_RejogRequested` (currently propagates up; session
+  abort cleanup catches it).

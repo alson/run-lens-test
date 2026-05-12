@@ -358,3 +358,158 @@ class TestConfirm:
         def _eof(_p: str) -> str:
             raise EOFError
         assert confirm("Press ENTER: ", input_func=_eof) is False
+
+
+class TestPromptMagnificationIndicated:
+    def test_accepts_ratio(self) -> None:
+        from ui.prompts import prompt_magnification_indicated
+        result = prompt_magnification_indicated(
+            default=1.0, input_func=lambda _: "1:2",
+        )
+        assert result == 0.5
+
+    def test_accepts_bare_float(self) -> None:
+        from ui.prompts import prompt_magnification_indicated
+        result = prompt_magnification_indicated(
+            default=1.0, input_func=lambda _: "0.5",
+        )
+        assert result == 0.5
+
+    def test_empty_returns_default(self) -> None:
+        from ui.prompts import prompt_magnification_indicated
+        result = prompt_magnification_indicated(
+            default=0.7, input_func=lambda _: "",
+        )
+        assert result == 0.7
+
+    def test_whitespace_returns_default(self) -> None:
+        """Trimmed empty input is treated as empty → default."""
+        from ui.prompts import prompt_magnification_indicated
+        result = prompt_magnification_indicated(
+            default=0.3, input_func=lambda _: "   ",
+        )
+        assert result == 0.3
+
+    def test_reprompts_on_bad_input(self, capsys) -> None:
+        from ui.prompts import prompt_magnification_indicated
+        seq = iter(["abc", "0", "1:2"])
+        result = prompt_magnification_indicated(
+            default=1.0, input_func=lambda _: next(seq),
+        )
+        assert result == 0.5
+        captured = capsys.readouterr()
+        assert captured.out.count("try e.g.") >= 2
+
+    def test_eof_reraises(self) -> None:
+        from ui.prompts import prompt_magnification_indicated
+        def _eof(_p: str) -> str:
+            raise EOFError
+        with pytest.raises(EOFError):
+            prompt_magnification_indicated(default=1.0, input_func=_eof)
+
+
+class TestPromptFocalLength:
+    def test_accepts_integer(self) -> None:
+        from ui.prompts import prompt_focal_length
+        assert prompt_focal_length(input_func=lambda _: "55") == 55.0
+
+    def test_accepts_decimal(self) -> None:
+        from ui.prompts import prompt_focal_length
+        assert prompt_focal_length(input_func=lambda _: "55.5") == 55.5
+
+    def test_reprompts_on_non_number(self, capsys) -> None:
+        from ui.prompts import prompt_focal_length
+        seq = iter(["abc", "55"])
+        result = prompt_focal_length(input_func=lambda _: next(seq))
+        assert result == 55.0
+        out = capsys.readouterr().out
+        assert "not a number" in out
+
+    def test_reprompts_on_nonpositive(self, capsys) -> None:
+        from ui.prompts import prompt_focal_length
+        seq = iter(["0", "-5", "55"])
+        result = prompt_focal_length(input_func=lambda _: next(seq))
+        assert result == 55.0
+        out = capsys.readouterr().out
+        assert "must be > 0" in out
+
+    def test_eof_reraises(self) -> None:
+        from ui.prompts import prompt_focal_length
+        def _eof(_p: str) -> str:
+            raise EOFError
+        with pytest.raises(EOFError):
+            prompt_focal_length(input_func=_eof)
+
+
+class TestPromptMaxAperture:
+    def test_accepts_decimal(self) -> None:
+        from ui.prompts import prompt_max_aperture
+        assert prompt_max_aperture(input_func=lambda _: "2.8") == 2.8
+
+    def test_accepts_f_prefix(self) -> None:
+        from ui.prompts import prompt_max_aperture
+        assert prompt_max_aperture(input_func=lambda _: "f/2.8") == 2.8
+        assert prompt_max_aperture(input_func=lambda _: "F2.8") == 2.8
+
+    def test_reprompts_on_non_number(self, capsys) -> None:
+        from ui.prompts import prompt_max_aperture
+        seq = iter(["abc", "2.8"])
+        result = prompt_max_aperture(input_func=lambda _: next(seq))
+        assert result == 2.8
+        out = capsys.readouterr().out
+        assert "not a number" in out
+
+
+class TestPromptTurnRing:
+    def test_enter_confirms(self) -> None:
+        from ui.prompts import prompt_turn_ring
+        result = prompt_turn_ring(
+            "4",
+            ring_stop=2.8,
+            m_indicated=0.5,
+            input_func=lambda _: "",
+        )
+        assert result is True
+
+    def test_q_aborts(self) -> None:
+        from ui.prompts import prompt_turn_ring
+        result = prompt_turn_ring(
+            "4",
+            ring_stop=2.8,
+            m_indicated=0.5,
+            input_func=lambda _: "q",
+        )
+        assert result is False
+
+    def test_message_shows_only_ring_stop(self) -> None:
+        """The prompt names only the ring f-number the user dials.
+        The effective label is metadata for the file path / analysis
+        and is intentionally omitted from the capture-time prompt
+        to keep the operator focused on the action."""
+        from ui.prompts import prompt_turn_ring
+        seen_prompts: list[str] = []
+        prompt_turn_ring(
+            "4",
+            ring_stop=2.8,
+            m_indicated=0.5,
+            input_func=lambda p: seen_prompts.append(p) or "",
+        )
+        assert seen_prompts, "prompt was never invoked"
+        msg = seen_prompts[0]
+        assert "f/2.8" in msg
+        assert "effective" not in msg
+        assert "m_indicated" not in msg
+
+    def test_whole_stop_ring_renders_without_decimal(self) -> None:
+        from ui.prompts import prompt_turn_ring
+        seen_prompts: list[str] = []
+        prompt_turn_ring(
+            "11",
+            ring_stop=8.0,
+            m_indicated=0.5,
+            input_func=lambda p: seen_prompts.append(p) or "",
+        )
+        msg = seen_prompts[0]
+        assert "f/8" in msg
+        assert "f/8.0" not in msg
+        assert "effective" not in msg

@@ -30,7 +30,10 @@ from exposure.droop import DroopDetector, DroopEvent
 from exposure.range_check import RangeChecker
 from notify.ntfy import (
     BATTERY_DROOP,
+    CALIBRATION_NOT_CONVERGED,
     LENS_CHANGE_REQUIRED,
+    MANUAL_APERTURE_READY,
+    MANUAL_CASCADE_ABORTED,
     NtfyClient,
     Notification,
 )
@@ -42,6 +45,11 @@ from session.calibrate import (
     next_iso,
 )
 from session.filenames import step_filename
+from session.manual_aperture import (
+    aperture_sequence_for_manual_mode,
+    parse_lens_slug,
+    ring_and_label_sequence,
+)
 from session.log import (
     Phase,
     SessionMetadata,
@@ -57,11 +65,16 @@ from sharpness.planner import SamplePlan, plan_sweep
 from ui.prompts import (
     OTHER,
     confirm,
+    prompt_focal_length,
     prompt_lens_config,
     prompt_lens_config_from_plan,
     prompt_magnification,
+    prompt_magnification_indicated,
+    prompt_max_aperture,
     prompt_off_target,
     prompt_range_inadequate,
+    prompt_set_flash_power,
+    prompt_turn_ring,
     slugify_lens_config,
 )
 from ui.reshoot_plan import PlanEntry, load_plan
@@ -279,6 +292,31 @@ class SessionRunner:
     sharpness_collector_factory: SharpnessCollectorFactory = field(
         default=_null_sharpness_collector_factory
     )
+    manual_aperture: bool = False
+    """Per-session flag enabling manual-aperture mode for non-CPU
+    lenses. Inverts the capture-order loop (apertures outer, rail
+    inner — one rail sweep per ring turn), parses focal_length /
+    f_ring from the slug, prompts for ``magnification_indicated``,
+    synthesises an aperture sequence from ring whole stops, and
+    drives :class:`session.calibrate.Calibrator` with the manual-
+    flash (ISO-only) cascade. See
+    ``~/.claude/plans/rustling-tumbling-moonbeam.md`` for context."""
+    prompt_magnification_indicated: Callable[[float], float] | None = None
+    """Manual-aperture prompt for ``m_indicated``. Takes the default
+    (= ``m_total``) and returns the user-entered value. ``None``
+    when manual_aperture is False; defaulted at start() when True."""
+    prompt_focal_length: Callable[[], float] | None = None
+    """Manual-aperture fallback prompt when the slug regex misses."""
+    prompt_max_aperture: Callable[[], float] | None = None
+    """Manual-aperture fallback prompt when the slug regex misses."""
+    prompt_turn_ring: Callable[..., bool] | None = None
+    """Manual-aperture per-ring-turn prompt. Signature:
+    ``(aperture_label, *, f_ring, m_indicated) -> bool``."""
+    prompt_set_flash_power: Callable[..., bool] | None = None
+    """Manual-aperture flash-power prompt. Signature:
+    ``(*, power_c_label, power_a_label, context='') -> bool``.
+    Injected so tests can scripted-respond; production wires
+    :func:`ui.prompts.prompt_set_flash_power`."""
     """Per-lens-config sharpness collector factory.
 
     Default is a no-op so existing tests stay opaque to sharpness; the
@@ -339,6 +377,20 @@ class SessionRunner:
     """Slugs already successfully acquired in past sessions, plus any
     completed in the current session. Drives the ``[done]`` marker in
     the menu."""
+    _current_focal_length_mm: float | None = None
+    _current_f_ring: float | None = None
+    _current_magnification_indicated: float | None = None
+    """Per-lens-config manual-aperture metadata, set in
+    :meth:`_run_one_lens_config` when ``manual_aperture`` is True
+    and read by :meth:`_log_shot` to populate the new shots.csv
+    columns. ``None`` in auto mode (the row writer drops them as
+    empty cells)."""
+    _current_ring_stops: list[float] = field(default_factory=list)
+    """Per-lens-config ring f-numbers walked by the manual-mode
+    aperture sequence (e.g. ``[2.8, 4.0, 5.6, 8.0]`` for the 55 AIS
+    at 1:1 + PK-13). Used by :meth:`_run_manual_aperture_sweep` to
+    compute per-step aperture EV differences for the flash-power
+    cascade. Empty in auto mode."""
 
     # ---- public entry points ---------------------------------------------
 
@@ -405,8 +457,13 @@ class SessionRunner:
 
         # FEC sanity check (skip if the camera doesn't expose it —
         # e.g. fakes used in tests; production NikonZ7 always has it).
+        # Also skip in manual-aperture mode: the flash is in M (manual
+        # power) on the commander, so FEC has no effect on the flash
+        # output — the sanity check would always fail (drop ≈ 0 EV
+        # between FEC=0 and FEC=-2). Per
+        # ``rustling-tumbling-moonbeam.md``.
         sanity_check = getattr(self.camera, "fec_sanity_check", None)
-        if sanity_check is not None:
+        if sanity_check is not None and not self.manual_aperture:
             try:
                 sanity_check(
                     baseline_fec=0.0,
@@ -542,6 +599,14 @@ class SessionRunner:
         lens_dir = self.session_dir / slug
         lens_dir.mkdir(parents=True, exist_ok=True)
 
+        # Clear per-lens-config manual-mode state at the start of
+        # every call so leftover values from a previous lens config
+        # don't contaminate this one (defensive — also cleared in the
+        # finally clause below).
+        self._current_focal_length_mm = None
+        self._current_f_ring = None
+        self._current_magnification_indicated = None
+
         # Magnification is asked once per lens config; the sweep
         # plan is a function of M, the lens's widest aperture, and
         # the jogged range. When the caller picked a preset from the
@@ -550,15 +615,22 @@ class SessionRunner:
         if magnification is None:
             magnification = self.prompt_magnification()
 
-        apertures = aperture_sequence(
-            self.camera.list_apertures(),
-            whole_stop_scale=self.config.WHOLE_STOP_SCALE,
-            max_fstop=self.config.MAX_FSTOP,
-        )
-        if not apertures:
-            raise RuntimeError("camera reports no apertures; aborting")
-        widest_aperture_str = apertures[0]
-        widest_aperture = _parse_fnum(widest_aperture_str)
+        if self.manual_aperture:
+            apertures, widest_aperture_str, widest_aperture = (
+                self._prepare_manual_aperture_config(
+                    slug=slug, magnification_total=magnification,
+                )
+            )
+        else:
+            apertures = aperture_sequence(
+                self.camera.list_apertures(),
+                whole_stop_scale=self.config.WHOLE_STOP_SCALE,
+                max_fstop=self.config.MAX_FSTOP,
+            )
+            if not apertures:
+                raise RuntimeError("camera reports no apertures; aborting")
+            widest_aperture_str = apertures[0]
+            widest_aperture = _parse_fnum(widest_aperture_str)
 
         # Jog → planner → check refuse loop. The user can re-jog as
         # many times as they want until the range yields the
@@ -614,6 +686,13 @@ class SessionRunner:
                 self.range_checker.set_subsample_factors(None)
             self._sharpness_collector = None
             self._subsample_factors = {}
+            # Clear manual-mode per-lens metadata so a follow-on
+            # auto-mode lens config (or just a re-entry of this method
+            # via the lens-config loop) starts fresh.
+            self._current_focal_length_mm = None
+            self._current_f_ring = None
+            self._current_magnification_indicated = None
+            self._current_ring_stops = []
 
     def _build_subsample_lookup(
         self, apertures: list[str], plan: SamplePlan,
@@ -658,6 +737,72 @@ class SessionRunner:
             out[ap_float] = max(1, int(factor))
         return out
 
+    def _prepare_manual_aperture_config(
+        self,
+        *,
+        slug: str,
+        magnification_total: float,
+    ) -> tuple[list[str], str, float]:
+        """Build a manual-mode aperture sequence + record per-lens-config
+        metadata on ``self``.
+
+        Returns ``(apertures, widest_aperture_str, widest_aperture)`` —
+        same shape as the camera-driven auto-mode path so the caller
+        can use them identically. ``apertures`` are the effective
+        (lens-internal) labels rounded to the 1/3-stop scale, in
+        widest-first order.
+        """
+        focal, f_ring = parse_lens_slug(slug)
+        if focal is None:
+            focal = (
+                self.prompt_focal_length()
+                if self.prompt_focal_length is not None
+                else prompt_focal_length()
+            )
+        if f_ring is None:
+            f_ring = (
+                self.prompt_max_aperture()
+                if self.prompt_max_aperture is not None
+                else prompt_max_aperture()
+            )
+        m_indicated = (
+            self.prompt_magnification_indicated(magnification_total)
+            if self.prompt_magnification_indicated is not None
+            else prompt_magnification_indicated(default=magnification_total)
+        )
+
+        # Record per-lens-config state so _log_shot picks it up.
+        self._current_focal_length_mm = float(focal)
+        self._current_f_ring = float(f_ring)
+        self._current_magnification_indicated = float(m_indicated)
+
+        pairs = ring_and_label_sequence(
+            f_ring_max=float(f_ring),
+            m_indicated=float(m_indicated),
+            whole_stop_scale=self.config.WHOLE_STOP_SCALE,
+            max_fstop=self.config.MAX_FSTOP,
+            one_third_stop_scale=self.config.ONE_THIRD_STOP_SCALE,
+        )
+        if not pairs:
+            raise RuntimeError(
+                f"manual-mode aperture sequence empty for slug={slug!r} "
+                f"(f_ring={f_ring}, m_indicated={m_indicated}). "
+                f"Effective widest already exceeds MAX_FSTOP="
+                f"{self.config.MAX_FSTOP}?"
+            )
+        self._current_ring_stops = [r for r, _ in pairs]
+        apertures = [label for _, label in pairs]
+        widest_aperture_str = apertures[0]
+        widest_aperture = _parse_fnum(widest_aperture_str)
+        self._announce(
+            f"Manual-mode lens config: focal={focal:g}mm, "
+            f"f_ring={f_ring:g}, m_total={magnification_total:g}, "
+            f"m_indicated={m_indicated:g}; "
+            f"ring stops to walk: "
+            f"{', '.join(f'{r:g}' for r in self._current_ring_stops)}"
+        )
+        return apertures, widest_aperture_str, widest_aperture
+
     def _jog_and_plan(
         self,
         *,
@@ -687,8 +832,15 @@ class SessionRunner:
             )
             positions = plan.rail_positions or 0
             if positions >= min_positions:
+                # In manual mode, show the ring f-number (what the
+                # operator dials) for "widest" rather than the
+                # effective label. Effective is metadata-only.
+                if self.manual_aperture and self._current_ring_stops:
+                    widest_display = f"f/{self._current_ring_stops[0]:g}"
+                else:
+                    widest_display = widest_aperture_str
                 self._announce(
-                    f"Plan: M={magnification:g}, widest={widest_aperture_str}, "
+                    f"Plan: M={magnification:g}, widest={widest_display}, "
                     f"rail_step={plan.rail_step_mm:.3f} mm, "
                     f"positions={positions}, "
                     f"replicas={plan.replicas_per_position}"
@@ -712,6 +864,331 @@ class SessionRunner:
                 raise SessionAborted("user aborted at tiny-range prompt")
             # Loop: re-jog, recompute plan.
 
+    def _run_manual_aperture_sweep(
+        self,
+        *,
+        slug: str,
+        lens_dir: Path,
+        end_mm: float,
+        steps: int,
+        step_size_mm: float,
+        apertures: list[str],
+        magnification: float,
+        plan: SamplePlan,
+    ) -> None:
+        """Inverted loop for non-CPU lenses: one rail sweep per aperture.
+
+        For each aperture in widest-first order:
+
+        1. Rail returns to position 0 (skip on first iteration).
+        2. Prompt the user to turn the lens ring to the target.
+        3. Per-aperture flash-power cascade:
+           - First aperture: coarse power search + back-calc + verify
+             + ISO fine-tune
+             (:meth:`Calibrator.calibrate_first_aperture_manual`).
+           - Subsequent apertures: deterministic power target from
+             previous (power, iso) + aperture diff + ISO fine-tune
+             (:meth:`Calibrator.calibrate_subsequent_aperture_manual`).
+        4. Per-aperture Phase A sharpness probe (new — auto mode only
+           probes the widest aperture).
+        5. Single-aperture rail sweep.
+
+        After all apertures: rail returns to 0, ``calibration.json``
+        and session metadata are written, lens-change recovery is
+        triggered.
+        """
+        calibrator = Calibrator(
+            camera=self.camera,
+            measure=self._measure,
+            config=self.config,
+            shots_csv=self.shots_csv,
+            now=self.now,
+        )
+        aggregate = CalibrationResult(
+            baseline_median=self.baseline_median or 0.0
+        )
+        probe_enabled = bool(getattr(self.config, "PROBE_ENABLED", False))
+        m_indicated = self._current_magnification_indicated or 0.0
+        ring_stops = self._current_ring_stops or []
+        forward_steps_done = 0
+        last_step_size = step_size_mm
+        last_phase_c_steps = steps
+        # Per-aperture flash-power state — carries forward between
+        # ring turns so the subsequent-aperture cascade can compute
+        # its deterministic target.
+        prev_power_stops: float | None = None
+        prev_iso: int | None = None
+        prev_ev_delta: float = 0.0
+
+        set_flash_power = (
+            self.prompt_set_flash_power
+            if self.prompt_set_flash_power is not None
+            else prompt_set_flash_power
+        )
+
+        for index, aperture in enumerate(apertures):
+            if index > 0 and forward_steps_done != 0:
+                self._announce(
+                    f"Returning rail to start before next aperture "
+                    f"(ring f/{ring_stops[index]:g})..."
+                )
+                self._return_rail_to_zero(
+                    forward_steps_done * last_step_size
+                )
+                forward_steps_done = 0
+            # Between apertures: ping the operator that the next
+            # ring-turn / flash-power prompt is coming. Skip on
+            # index==0 (operator just kicked off the session and is
+            # at the rig anyway).
+            if index > 0 and self.ntfy is not None:
+                self.ntfy.with_body(
+                    MANUAL_APERTURE_READY,
+                    f"{slug}: ring f/{ring_stops[index]:g} "
+                    f"({index + 1}/{len(apertures)})",
+                )
+
+            # Prompt the user to turn the ring.
+            turn_ring = (
+                self.prompt_turn_ring
+                if self.prompt_turn_ring is not None
+                else prompt_turn_ring
+            )
+            ring_stop = ring_stops[index] if index < len(ring_stops) else 0.0
+            ok = turn_ring(
+                aperture,
+                ring_stop=ring_stop,
+                m_indicated=m_indicated,
+            )
+            if not ok:
+                raise SessionAborted(
+                    f"user aborted at ring-turn prompt for {aperture}"
+                )
+
+            # Per-aperture cascade dispatch: first vs subsequent.
+            # SessionAborted from a safety termination (coarse search
+            # exhausted, etc.) gets a notification before re-raising
+            # so an away-from-rig operator finds out without watching
+            # the terminal.
+            try:
+                if index == 0 or prev_power_stops is None or prev_iso is None:
+                    self._announce(
+                        f"Calibrating {slug} @ ring f/{ring_stop:g} "
+                        f"(first aperture: coarse search → back-calc → "
+                        f"verify, flash-M)..."
+                    )
+                    cal_one, used_power, used_iso = (
+                        calibrator.calibrate_first_aperture_manual(
+                            aperture=aperture,
+                            lens_dir=lens_dir,
+                            lens_slug=slug,
+                            session_id=self.session_id,
+                            baseline_median=(
+                                aggregate.baseline_median
+                                if aggregate.baseline_median > 0
+                                else None
+                            ),
+                            prompt_set_flash_power=set_flash_power,
+                        )
+                    )
+                else:
+                    # ring_stops list matches apertures 1:1 (built
+                    # from the same iteration in
+                    # _prepare_manual_aperture_config).
+                    prev_ring = ring_stops[index - 1]
+                    curr_ring = ring_stops[index]
+                    # 2·log2(f_new / f_old) gives the EV stops light
+                    # loss for the smaller aperture (positive).
+                    aperture_stops_diff = 2.0 * math.log2(curr_ring / prev_ring)
+                    self._announce(
+                        f"Calibrating {slug} @ ring f/{ring_stop:g} "
+                        f"(subsequent: +{aperture_stops_diff:.2f} EV "
+                        f"step, flash-M)..."
+                    )
+                    cal_one, used_power, used_iso = (
+                        calibrator.calibrate_subsequent_aperture_manual(
+                            aperture=aperture,
+                            lens_dir=lens_dir,
+                            lens_slug=slug,
+                            session_id=self.session_id,
+                            baseline_median=aggregate.baseline_median,
+                            prev_power_stops=prev_power_stops,
+                            prev_iso=prev_iso,
+                            prev_ev_delta=prev_ev_delta,
+                            aperture_stops_diff=aperture_stops_diff,
+                            prompt_set_flash_power=set_flash_power,
+                        )
+                    )
+            except SessionAborted as exc:
+                if self.ntfy is not None:
+                    self.ntfy.with_body(
+                        MANUAL_CASCADE_ABORTED,
+                        f"{slug} @ ring f/{ring_stop:g}: {exc}",
+                    )
+                raise
+
+            # Carry state into the next aperture: the (power, iso) the
+            # cascade actually used, plus the final delta — so the
+            # next call's target search can pull residual error toward
+            # zero rather than just compensating for the aperture step.
+            prev_power_stops = used_power
+            prev_iso = used_iso
+            prev_ev_delta = cal_one.per_aperture[aperture].final_ev_delta
+
+            if (
+                aggregate.baseline_median == 0
+                and cal_one.baseline_median > 0
+            ):
+                aggregate.baseline_median = cal_one.baseline_median
+            aggregate.per_aperture[aperture] = (
+                cal_one.per_aperture[aperture]
+            )
+            self.baseline_median = aggregate.baseline_median
+            self._announce_calibration(cal_one)
+
+            # Soft-fail notification: cascade completed but ISO
+            # fine-tune couldn't pull the delta inside ⅓ EV. Captures
+            # at this aperture will still happen — operator can
+            # decide whether to accept the data or re-run.
+            ap_cal = cal_one.per_aperture[aperture]
+            if not ap_cal.hit_tolerance and self.ntfy is not None:
+                self.ntfy.with_body(
+                    CALIBRATION_NOT_CONVERGED,
+                    f"{slug} @ ring f/{ring_stop:g}: final delta "
+                    f"{ap_cal.final_ev_delta:+.2f} EV, "
+                    f"ISO {ap_cal.iso}",
+                )
+
+            # Per-aperture phase A + sweep.
+            droop = self._make_droop_detector()
+            phase_c_start = 0
+            phase_c_steps = steps
+            if probe_enabled:
+                phase_a_result = self._run_phase_a(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    end_mm=end_mm,
+                    widest_aperture=aperture,
+                    calibration=cal_one,
+                    n_probes=int(
+                        getattr(self.config, "PROBE_PHASE_A_POINTS", 7)
+                    ),
+                    droop=droop,
+                )
+                phase_c_plan = self._plan_phase_c(
+                    phase_a_result,
+                    end_mm=end_mm,
+                    rail_step_mm=step_size_mm,
+                    fwhm_mm=plan.estimated_fwhm_mm_widest,
+                    n_probes=int(
+                        getattr(self.config, "PROBE_PHASE_A_POINTS", 7)
+                    ),
+                    padding_x_fwhm=float(
+                        getattr(
+                            self.config,
+                            "PROBE_PHASE_C_FWHM_PADDING",
+                            1.5,
+                        )
+                    ),
+                )
+                if phase_c_plan is None:
+                    self._announce(
+                        f"Phase A inconclusive at {aperture} — falling "
+                        f"back to uniform sweep across the jogged range."
+                    )
+                    self._return_rail_to_zero(end_mm)
+                else:
+                    phase_c_start, phase_c_steps = phase_c_plan
+                    target_mm = phase_c_start * step_size_mm
+                    self._announce(
+                        f"Phase C at {aperture}: {phase_c_steps} steps "
+                        f"from step {phase_c_start} ({target_mm:+.3f} mm)."
+                    )
+                    self._move_to(end_mm, target_mm)
+
+            self._announce(
+                f"Sweeping {slug} @ ring f/{ring_stop:g}: "
+                f"{phase_c_steps} steps..."
+            )
+            self._eta_sweep_apertures = (aperture,)
+            self._eta_sweep_step_count = phase_c_steps
+            self._eta_lens_interval_sum = 0.0
+            self._eta_lens_interval_count = 0
+            self._eta_last_shot_at = None
+            self._run_sweep(
+                lens_dir=lens_dir,
+                slug=slug,
+                steps=phase_c_steps,
+                step_size_mm=step_size_mm,
+                calibration=cal_one,
+                apertures=[aperture],
+                start_step_index=phase_c_start,
+                droop=droop,
+            )
+            forward_steps_done = phase_c_start + phase_c_steps - 1
+            last_step_size = step_size_mm
+            last_phase_c_steps = phase_c_steps
+
+            # Range advisor: detect truncated peaks at this aperture
+            # and extend the sweep if the corner peaks are clipped by
+            # the captured rail window. Runs per-aperture in manual
+            # mode (vs. auto mode's per-lens-config). _RejogRequested
+            # is propagated unchanged; the cascade has no clean
+            # rejog-in-place semantics since calibration is already
+            # done — the runner's outer abort path will catch it.
+            if self.range_checker is not None:
+                self._announce(
+                    f"Range check at ring f/{ring_stop:g} "
+                    f"(waiting on sharpness crops)..."
+                )
+                range_check_end_mm = (phase_c_steps - 1) * step_size_mm
+                forward_steps_done = self._run_range_check_and_extend(
+                    lens_dir=lens_dir,
+                    slug=slug,
+                    end_mm=range_check_end_mm,
+                    step_size_mm=step_size_mm,
+                    steps=phase_c_steps,
+                    calibration=cal_one,
+                    apertures=[aperture],
+                    start_step_index=phase_c_start,
+                )
+
+        # Final rail-zero return.
+        if forward_steps_done != 0:
+            self._announce("Returning rail to start (final)...")
+            self._return_rail_to_zero(forward_steps_done * last_step_size)
+
+        # Write calibration.json with the aggregated per-aperture result.
+        write_json(
+            lens_dir / "calibration.json",
+            {
+                "baseline_median": aggregate.baseline_median,
+                "per_aperture": aggregate.per_aperture,
+            },
+        )
+
+        # Record lens-config metadata.
+        from dataclasses import asdict as _asdict
+        if self.metadata is not None and not any(
+            lc.get("slug") == slug for lc in self.metadata.lens_configs
+        ):
+            self.metadata.lens_configs.append({
+                "slug": slug,
+                "magnification": float(magnification),
+                "widest_aperture": float(plan.widest_aperture),
+                "sample_plan": _asdict(plan),
+                "manual_aperture": True,
+                "magnification_indicated": (
+                    self._current_magnification_indicated
+                ),
+                "f_ring": self._current_f_ring,
+                "focal_length_mm": self._current_focal_length_mm,
+            })
+            self._write_metadata()
+            self._completed_slugs.add(slug)
+
+        # Lens-change recovery.
+        self._lens_change_recovery(slug)
+
     def _run_one_lens_config_inner(
         self,
         *,
@@ -724,6 +1201,18 @@ class SessionRunner:
         magnification: float,
         plan: SamplePlan,
     ) -> None:
+        if self.manual_aperture:
+            self._run_manual_aperture_sweep(
+                slug=slug,
+                lens_dir=lens_dir,
+                end_mm=end_mm,
+                steps=steps,
+                step_size_mm=step_size_mm,
+                apertures=apertures,
+                magnification=magnification,
+                plan=plan,
+            )
+            return
 
         # Calibration at rail step 0.
         # User-facing status so the terminal isn't silent during the
@@ -2432,6 +2921,9 @@ class SessionRunner:
                 filename="",
                 phase=Phase.ABORTED,
                 notes="skipped after droop",
+                magnification_indicated=self._current_magnification_indicated,
+                f_ring=self._current_f_ring,
+                focal_length_mm=self._current_focal_length_mm,
             )
         )
 
@@ -2497,6 +2989,15 @@ class SessionRunner:
         any aperture that calibrated with non-zero EC fire ~that EV
         darker during the sweep and trip droop on every shot.
         """
+        # In manual-aperture mode the lens diaphragm is mechanical;
+        # the camera's aperture widget either errors out or is a no-op
+        # for a non-CPU lens. Skip aperture-related camera writes and
+        # only set ISO / FEC (FEC is inert in flash-M but the widget
+        # still wants a value).
+        if self.manual_aperture:
+            self.camera.set_iso(cal.iso)
+            self.camera.set_fec(cal.fec_ev)
+            return
         batched = getattr(self.camera, "set_aperture_iso_fec", None)
         if batched is not None:
             batched(aperture=aperture, iso=cal.iso, fec=cal.fec_ev)
@@ -2634,6 +3135,9 @@ class SessionRunner:
                 filename=filename,
                 phase=phase,
                 notes="",
+                magnification_indicated=self._current_magnification_indicated,
+                f_ring=self._current_f_ring,
+                focal_length_mm=self._current_focal_length_mm,
             )
         )
 
@@ -2647,10 +3151,26 @@ class SessionRunner:
         """Print the per-aperture capture-count breakdown so the
         user can sanity-check before committing to the sweep. Lists
         each aperture's subsample factor, the resulting shot count,
-        and a total against the unsampled baseline."""
+        and a total against the unsampled baseline.
+
+        In manual-aperture mode the displayed aperture is the *ring*
+        f-number the operator dials (e.g. ``f/2.8``), not the
+        rig-internal effective label. Effective apertures are
+        capture-time metadata; the operator only cares about ring
+        stops while planning.
+        """
         replicas = max(1, int(plan.replicas_per_position))
         per_ap_lines: list[str] = []
         total_shots = 0
+        # Manual mode: map each aperture-label (effective) to its
+        # corresponding ring stop via the per-lens-config state.
+        ring_for_label: dict[str, str] = {}
+        if self.manual_aperture and self._current_ring_stops:
+            for ap_label, ring in zip(apertures, self._current_ring_stops):
+                ring_for_label[ap_label] = (
+                    f"{int(round(ring))}" if abs(ring - round(ring)) < 0.05
+                    else f"{ring:.1f}".rstrip("0").rstrip(".")
+                )
         for ap_str in apertures:
             try:
                 ap_float = _parse_fnum(ap_str)
@@ -2661,8 +3181,9 @@ class SessionRunner:
             shots = (positions + factor - 1) // factor   # ceil(positions/factor)
             per_ap_total = shots * replicas
             total_shots += per_ap_total
+            display = f"f/{ring_for_label[ap_str]}" if ap_str in ring_for_label else ap_str
             per_ap_lines.append(
-                f"    {ap_str:6s} ×{factor} → {shots} × {replicas} = {per_ap_total}"
+                f"    {display:7s} ×{factor} → {shots} × {replicas} = {per_ap_total}"
             )
         unsampled_total = positions * replicas * len(apertures)
         if unsampled_total > 0:
@@ -2935,7 +3456,102 @@ def main() -> None:
 
     All injectable collaborators come together here so tests can stay
     on lightweight fakes without ever touching this function.
+
+    CLI flags let the operator skip interactive prompts for headless /
+    tail-extension runs:
+    ``--no-probe`` overrides ``config.PROBE_ENABLED`` for this run.
+    ``--lens`` / ``--magnification`` substitute the lens-config and
+    magnification prompts. ``--rail-start`` / ``--rail-end`` (both
+    required together when used) substitute the START / END jog with
+    programmatic rail moves — interpreted as signed mm offsets from
+    the rail's current position when the CLI launches. The typical
+    tail-extension recipe is to manually position the rail at the
+    intended START and pass ``--rail-start 0 --rail-end <signed mm>``.
     """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="macro-lens-test",
+        description=(
+            "Run a macro-lens sharpness sweep. With no flags the runner "
+            "prompts interactively for lens config, magnification, and "
+            "rail START / END. CLI flags below skip the matching prompt."
+        ),
+    )
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help=(
+            "Disable the Phase-A probe for this run. Equivalent to "
+            "config.PROBE_ENABLED = False but scoped to this invocation. "
+            "Use for tail-extension sessions where the user-jogged range "
+            "intentionally lies outside the widest-aperture peak."
+        ),
+    )
+    parser.add_argument(
+        "--lens",
+        metavar="TEXT",
+        help=(
+            "Lens config string (skips the lens prompt). Should match "
+            "the verbatim text used in past sessions so the slug stays "
+            "consistent for offline analysis."
+        ),
+    )
+    parser.add_argument(
+        "--magnification",
+        type=float,
+        metavar="M",
+        help=(
+            "Magnification ratio (skips the magnification prompt). "
+            "E.g. 1.0 for 1:1, 0.5 for 1:2."
+        ),
+    )
+    parser.add_argument(
+        "--rail-start",
+        type=float,
+        metavar="MM",
+        help=(
+            "Signed mm offset from the rail's current hardware position "
+            "to the session START. The rail moves there, and that "
+            "position becomes session-zero. Usually 0 (use the rail's "
+            "current position as START). Required with --rail-end."
+        ),
+    )
+    parser.add_argument(
+        "--rail-end",
+        type=float,
+        metavar="MM",
+        help=(
+            "Signed mm offset from session START to session END. "
+            "Negative for backward sweeps (the common case on this rig). "
+            "Required with --rail-start."
+        ),
+    )
+    parser.add_argument(
+        "--manual-aperture",
+        action="store_true",
+        help=(
+            "Enable manual-aperture mode for non-CPU lenses (AI-S, "
+            "pre-AI). Inverts the capture loop (one rail sweep per "
+            "ring turn), prompts for magnification_indicated and "
+            "the lens's ring max aperture (parsed from slug when "
+            "possible), and switches the calibration cascade to "
+            "ISO-only (flash must be in Manual mode on the SB-5000 "
+            "commander since AA/TTL flash can't communicate aperture "
+            "for non-CPU lenses on Z7). Phase A sharpness probe runs "
+            "at every aperture (not just widest). Per-session flag — "
+            "mixing CPU and non-CPU lenses needs two sessions."
+        ),
+    )
+    args = parser.parse_args()
+
+    if (args.rail_start is None) != (args.rail_end is None):
+        parser.error(
+            "--rail-start and --rail-end must be supplied together or "
+            "both omitted (use --rail-start 0 for 'zero at current "
+            "rail position')"
+        )
+
     import config
     from camera.nikon_z7 import NikonZ7
     from notify.ntfy import NtfyClient
@@ -2944,6 +3560,12 @@ def main() -> None:
     from stackshot.controller import open_ftdi as open_stackshot
     from stackshot.jog import jog_start_and_end as _jog
     from stackshot.jog import jog_interactive as _jog_interactive
+
+    if args.no_probe:
+        # Per-invocation override; tail-extension sessions need Phase A
+        # off because the user-jogged window is intentionally outside
+        # the widest-aperture peak (cf. DESIGN_NOTES §6.28).
+        config.PROBE_ENABLED = False
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -3032,6 +3654,61 @@ def main() -> None:
             on_reacquire=_reacquire_camera,
         )
 
+    # Build CLI-driven prompt / jog overrides. Each override is opt-in:
+    # only the flags the user supplies replace the corresponding
+    # interactive prompt; everything else stays interactive.
+    runner_overrides: dict = {}
+    if args.lens is not None:
+        # One-shot: return the lens text on the first call, then None
+        # so SessionRunner.run()'s while-True loop exits cleanly after
+        # one lens config (no infinite re-prompting for headless runs).
+        _lens_emitted = [False]
+        def _cli_prompt_lens_config() -> str | None:
+            if _lens_emitted[0]:
+                return None
+            _lens_emitted[0] = True
+            return args.lens
+        runner_overrides["prompt_lens_config"] = _cli_prompt_lens_config
+        # If a reshoot plan is loaded, the plan-menu prompt fires
+        # before prompt_lens_config — short-circuit it by always
+        # returning OTHER so the runner falls through to the CLI
+        # lens-config one-shot above.
+        runner_overrides["prompt_lens_config_from_plan"] = (
+            lambda entries, completed: OTHER
+        )
+    if args.magnification is not None:
+        runner_overrides["prompt_magnification"] = lambda: args.magnification
+    if args.rail_start is not None:
+        # Programmatic two-leg jog. Leg 1 moves to the operator's
+        # intended START position (relative to wherever the rail
+        # happens to be at CLI launch); that becomes session-zero
+        # implicitly because :meth:`_run_one_lens_config` reads the
+        # returned end_mm as the signed offset from session-zero.
+        # Leg 2 walks to END. The runner then returns the rail to
+        # zero before starting the sweep, same as the interactive
+        # path.
+        def _cli_jog(rail_arg) -> JogResult:
+            if args.rail_start != 0:
+                direction = (
+                    Direction.FORWARD if args.rail_start > 0
+                    else Direction.BACKWARD
+                )
+                rail_arg.move_and_wait(
+                    direction, abs(args.rail_start), backlash=True
+                )
+            if args.rail_end != 0:
+                direction = (
+                    Direction.FORWARD if args.rail_end > 0
+                    else Direction.BACKWARD
+                )
+                rail_arg.move_and_wait(
+                    direction, abs(args.rail_end), backlash=True
+                )
+            return JogResult(end_mm=args.rail_end)
+        runner_overrides["jog"] = _cli_jog
+    else:
+        runner_overrides["jog"] = _camera_jog
+
     runner = SessionRunner(
         camera=camera,
         rail=rail,
@@ -3039,9 +3716,10 @@ def main() -> None:
         ntfy=ntfy,
         range_checker=range_checker,
         output_root=config.OUTPUT_ROOT,
-        jog=_camera_jog,
         jog_freeform=_freeform_jog,
         sharpness_collector_factory=_sharpness_factory,
+        manual_aperture=args.manual_aperture,
+        **runner_overrides,
     )
     try:
         runner.run()

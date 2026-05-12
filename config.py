@@ -12,6 +12,24 @@ from pathlib import Path
 MAX_FSTOP = 16.0
 WHOLE_STOP_SCALE = (1.4, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0, 16.0, 22.0, 32.0)
 
+# Standard ⅓-stop scale used by manual-aperture mode's label rounding.
+# Matches the values gphoto2 reports for CPU lenses (camera f-number
+# settings). Computed-effective apertures (f_ring × (1 + m_indicated))
+# are snapped to the closest entry here by log-distance so file labels
+# stay drop-in compatible with the CPU EXIF convention.
+ONE_THIRD_STOP_SCALE = (
+    1.4, 1.6, 1.8,
+    2.0, 2.2, 2.5,
+    2.8, 3.2, 3.5,
+    4.0, 4.5, 5.0,
+    5.6, 6.3, 7.1,
+    8.0, 9.0, 10.0,
+    11.0, 13.0, 14.0,
+    16.0, 18.0, 20.0,
+    22.0, 25.0, 29.0,
+    32.0,
+)
+
 # Per-aperture range extension. (iso, recycle_seconds).
 # ISO is the absolute base ISO at that aperture (NOT a stop bump).
 # Recycle delay absorbs flash recycle and any aperture-mechanism settle.
@@ -32,6 +50,72 @@ ISO_FLOOR = 100
 ISO_WARN = 1600
 ISO_CEIL = 3200
 ISO_STEP_EV = 1.0 / 3.0
+
+# ---- Manual-aperture mode (non-CPU lens, flash-M cascade) -----------------
+# Used only when --manual-aperture is enabled. The flash is in M mode
+# on the SB-5000 commander; FEC is inert; ISO and flash power are the
+# two exposure knobs. The rig prompts the user to dial in flash power
+# on the commander between apertures; ISO is set programmatically as
+# fine-tune and ceiling compensator.
+
+MANUAL_ISO_FLOOR = 100
+"""Floor ISO used by manual-aperture mode. ISO 100 is the lowest
+non-extended sensitivity on the Z7; staying at-or-above 100 avoids
+the Lo 1 (extended-low ISO 50) which has slightly worse colour
+response. The cascade prefers to absorb over-exposure via flash
+power drops (down to 1/128) before considering ISO. If even 1/128
+is still too bright, the cascade aborts with a "reduce ambient
+light" message rather than silently falling to ISO 50 — that's a
+rig-setup problem the operator should fix, not the algorithm."""
+
+MANUAL_FLASH_SOFT_CAP_STOPS = 1.0
+"""Preferred maximum flash power as stops below 1/1. 1.0 = 1/2 power.
+Keeps the flash in its comfortable operating zone (faster recycle,
+less battery drain, headroom for droop). The rig prefers bumping ISO
+up to MANUAL_FLASH_ISO_RELAX_THRESHOLD before exceeding this cap."""
+
+MANUAL_FLASH_HARD_CAP_STOPS = 0.0
+"""Maximum-allowed flash power as stops below 1/1. 0.0 = 1/1 full.
+Reached only when ISO would otherwise exceed ISO_WARN. Above this
+the cascade can only push ISO further (up to ISO_CEIL)."""
+
+MANUAL_FLASH_INITIAL_POWER_STOPS = 5.0
+"""Starting flash power for the coarse search on the first aperture.
+5.0 = 1/32 power. Biased low so the first capture is more likely
+under-exposed than over: ISO has more room to go up (50→3200, 6
+stops) than down (50→50, 0 stops on the Z7's extended Lo 1 range),
+and the coarse search will halve / double from here. Empirically
+1/16 is roughly correct for the 55 AIS f/2.8 + PK-13 at 1:1 —
+starting at 1/32 lands one stop under, which the +1-stop coarse-
+search adjustment corrects in a single iteration."""
+
+MANUAL_FLASH_SEARCH_TOLERANCE_EV = 1.0
+"""Coarse-search exit threshold. Once the test shot's EV delta from
+baseline is within ±this value, the first-aperture path stops
+halving / doubling power and switches to ISO fine-tune."""
+
+MANUAL_FLASH_BUMP_SANITY_EV = 0.5
+"""After the user sets the rig-prescribed power for a subsequent
+aperture, the first capture's EV delta from baseline must lie within
+±this value. Wider deviation suggests the user dialled the wrong
+power or didn't turn the ring; the cascade prompts the user to
+verify before proceeding."""
+
+MANUAL_FLASH_MAX_SEARCH_ITERATIONS = 15
+"""Safety termination for the first-aperture coarse search. The
+SB-5000 range is 7 stops (1/1..1/128); 15 iterations is enough for
+bidirectional search with margin. Exceeding this aborts with a
+'subject too bright/dim — adjust lighting' prompt."""
+
+MANUAL_FLASH_TOLERANCE_EV = 0.2
+"""Per-shot exposure tolerance for the manual-aperture flash-M
+cascade — tighter than :data:`TEST_SHOT_TOLERANCE_EV` (0.5 EV, used
+by auto-mode AA calibration where the closed-loop FEC absorbs most
+error). Manual mode's predictive solver can miss by ~0.25 EV when
+the simple `(1+m)²` bellows model or the flash IGBT timing drift
+from linear assumptions; this tolerance triggers an ISO fine-tune
+retry when that happens. Cost is at most one extra capture per
+aperture; benefit is consistent exposure across the sweep."""
 
 # ---- FEC (Z7 body range, SB-5000 commander) ---------------------------------
 
@@ -270,6 +354,32 @@ higher ``OK`` ceiling lets soft-but-real bells be reported as
 ``LOW_SIGNAL`` instead. 0.05 sits comfortably above empty-frame JPEG
 noise while still capturing the dimmest legitimate corners observed
 on the rig."""
+
+SHARPNESS_PARTIAL_FRAME_FACTOR = 0.80
+"""Cutoff for the absolute-size peer-compare partial-frame detector.
+A crop whose peak file size is below this factor times its peer-group
+median (4 corners vs 4 corners, 4 edges vs 4 edges) is classified
+as :data:`CropStatus.PARTIAL_FRAME` — the wafer / target edge is
+cutting through the crop window so part of the area is dark
+background that dilutes the JPEG-size metric.
+
+Distinct from :data:`SHARPNESS_CROP_OFF_TARGET_RANGE` (which catches
+"no wafer at all" via low dynamic range). Partial-frame crops still
+have real focus signal in the on-wafer portion, so dynamic range
+remains roughly normal; the giveaway is *absolute* peak size falling
+well below positionally similar peers. Operator remedy is
+reframing, not re-jogging.
+
+Empirical motivation: the 24-120 + 35 mm extension session
+(2026-05-11_185420) framed the wafer's lower-left corner partly
+outside the bottom-left crop window. bottom-left peaked at ~32 KB
+while the other three corners peaked at 41-49 KB, giving
+BL/peer-median ratios of 0.72-0.79 across all five apertures.
+Non-partial corners on the same session and the sibling 24-120 +
+45 mm session clustered at ≥ 0.95 of peer-group median, so 0.80
+cleanly separates the two regimes — partial-frame fires
+consistently across apertures while normal lens asymmetry stays
+below the flag."""
 
 # ---- Step-numbering for capture filenames ----------------------------------
 

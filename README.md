@@ -210,6 +210,58 @@ Ctrl-C also works — the program issues a StackShot stop, closes
 connections, and exits cleanly without dumping a traceback. Any
 in-progress shot may be lost.
 
+### Manual-aperture mode (non-CPU lenses)
+
+For AI-S, pre-AI, and other lenses where the diaphragm is set by a
+physical aperture ring (e.g., Micro-Nikkor 55mm f/2.8 AIS,
+Micro-Nikkor Auto 55mm f/3.5 + K-tubes), launch the runner with:
+
+```bash
+uv run macro-lens-test --manual-aperture
+```
+
+Differences from the default (CPU-lens) flow:
+
+* **Flash mode = Manual** on the SB-5000 commander remote groups
+  (M, not AA / TTL). The body can't communicate aperture to the
+  flash for non-CPU lenses on the Z7, so AA quenching is broken.
+  Group C is the left flash; group A is the right flash and
+  should be one third stop lower than C (subject-distance offset).
+  The rig calculates the per-aperture power target and prompts
+  you to dial it on the commander.
+* **You turn the aperture ring** between captures. The runner
+  prompts: `"Turn lens ring to f/X, then press [ENTER]. [q] to
+  abort:"` — dial that ring stop and press ENTER. The runner
+  walks ring whole stops from the lens's marked widest up to
+  whichever stop yields effective f-number ≤ `MAX_FSTOP`.
+* **You dial flash power** when the runner asks. The cascade
+  uses a deterministic per-aperture (power, ISO) target — it
+  knows the previous aperture's result and computes the next
+  power level that will land at baseline. The prompt format
+  matches the SB-5000 commander display, e.g.
+  ```
+  group A (right) : 1/4 -0.3
+  group C (left)  : 1/4
+  [ENTER] to confirm, [q] to abort:
+  ```
+* **Lens-config prompts**: the runner parses `focal_length_mm`
+  and `f_ring` (marked widest) from the slug regex, then asks
+  for `magnification_indicated` (the value the lens barrel
+  shows, e.g. `1:2` for 55 AIS at MFD). With an extension tube,
+  this is the lens-only contribution; the rig does the
+  bellows-factor math.
+* **ISO floor = 100** (not 50, which is auto-mode's default —
+  manual mode prefers staying at the native floor; the cascade
+  uses flash power to absorb most of the range and only bumps
+  ISO when it must).
+* **Tolerance = 0.2 EV** (tighter than auto-mode's 0.5) — the
+  predictive solver can miss by ~0.2-0.3 EV when the simple
+  bellows model or the flash IGBT timing diverge from linear
+  assumptions.
+
+See `macro_lens_test_plan.md` §14 for the full design;
+`DESIGN_NOTES.md` §6.31 for the decision rationale.
+
 ### Tail-extension workflow (multi-session merging)
 
 When a lens-config's data lands with some crops' peaks past either end

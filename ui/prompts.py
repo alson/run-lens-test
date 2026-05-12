@@ -156,6 +156,184 @@ def confirm(
     return text.strip().lower() not in ("q", "quit", "abort")
 
 
+# ---- Manual-aperture mode prompts -----------------------------------------
+
+
+def prompt_magnification_indicated(
+    prompt: str = (
+        "Magnification indicated on lens barrel "
+        "(e.g. 1:2 or 0.5; blank = same as total magnification): "
+    ),
+    *,
+    default: float,
+    input_func: InputFunc = input,
+) -> float:
+    """Prompt for ``m_indicated``, accepting ratio or float forms.
+
+    The lens barrel reading is the lens's own contribution to
+    magnification (helix-only). With no external tube, this equals
+    ``m_total``; with a tube, it's smaller. Empty input returns the
+    ``default`` (typically ``m_total``).
+
+    Uses :func:`sharpness.planner.parse_magnification` for parsing.
+    """
+    from sharpness.planner import parse_magnification
+
+    while True:
+        try:
+            text = input_func(prompt)
+        except EOFError:
+            raise
+        text = text.strip()
+        if not text:
+            return default
+        try:
+            return parse_magnification(text)
+        except ValueError as exc:
+            print(f"  {exc}; try e.g. 1:2, 0.5, 1/2")
+
+
+def prompt_focal_length(
+    prompt: str = "Lens focal length (mm, e.g. 55): ",
+    *,
+    input_func: InputFunc = input,
+) -> float:
+    """Prompt for a focal length in mm; re-prompts on bad input.
+
+    Used as a fallback when the slug regex doesn't find a ``<N>mm``
+    token. EOF re-raises so callers can distinguish "user gave up"
+    from "user gave junk".
+    """
+    while True:
+        try:
+            text = input_func(prompt)
+        except EOFError:
+            raise
+        try:
+            value = float(text.strip())
+        except ValueError:
+            print(f"  not a number: {text!r}")
+            continue
+        if value <= 0:
+            print(f"  must be > 0: {value}")
+            continue
+        return value
+
+
+def prompt_max_aperture(
+    prompt: str = (
+        "Indicated max aperture marked on lens "
+        "(e.g. 2.8 or f/2.8): "
+    ),
+    *,
+    input_func: InputFunc = input,
+) -> float:
+    """Prompt for the lens's marked widest aperture (the value on the
+    ring). Accepts ``"2.8"`` or ``"f/2.8"`` forms. Re-prompts on bad
+    input.
+
+    Used as a fallback when the slug regex doesn't find an ``f/N``
+    token. This is *not* the EXIF effective aperture — it's the
+    ring's marked widest, before any bellows-factor correction.
+    """
+    while True:
+        try:
+            text = input_func(prompt)
+        except EOFError:
+            raise
+        cleaned = text.strip().lower().lstrip("f").lstrip("/")
+        try:
+            value = float(cleaned)
+        except ValueError:
+            print(f"  not a number: {text!r}")
+            continue
+        if value <= 0:
+            print(f"  must be > 0: {value}")
+            continue
+        return value
+
+
+def prompt_turn_ring(
+    aperture_label: str,
+    *,
+    ring_stop: float,
+    m_indicated: float,
+    input_func: InputFunc = input,
+) -> bool:
+    """Block on ENTER while the user turns the lens ring to a target.
+
+    ``ring_stop`` is the **actual geometric f-number marked on the
+    lens ring** the user should dial to (e.g. 2.8, 4, 5.6 — picked
+    by the runner from the WHOLE_STOP_SCALE sequence walk).
+    ``aperture_label`` is the **effective aperture** the rig stores
+    in the file label (e.g. ``"4"`` for the 55 AIS at ring f/2.8 +
+    PK-13 at 1:1). The prompt names both so the user knows what to
+    dial and what the rig is recording.
+
+    Returns ``True`` on ENTER, ``False`` on ``q`` / EOF.
+    """
+    # Only the ring stop is operator-relevant during capture; the
+    # effective label exists for the file path / analysis side and
+    # would just clutter the prompt.
+    del aperture_label, m_indicated
+    msg = (
+        f"Turn lens ring to f/{_format_ring_stop(ring_stop)}, "
+        f"then press [ENTER]. [q] to abort: "
+    )
+    return confirm(msg, input_func=input_func)
+
+
+def _format_ring_stop(ring_stop: float) -> str:
+    """Format a geometric ring f-number for display.
+
+    Whole-stop values render without trailing decimals (``"4"``,
+    ``"8"``); thirds / halves keep one decimal (``"2.8"``, ``"5.6"``,
+    ``"3.5"``).
+    """
+    if abs(ring_stop - round(ring_stop)) < 0.05:
+        return f"{int(round(ring_stop))}"
+    return f"{ring_stop:.1f}".rstrip("0").rstrip(".")
+
+
+def prompt_set_flash_power(
+    *,
+    power_c_label: str,
+    power_a_label: str,
+    context: str = "",
+    input_func: InputFunc = input,
+) -> bool:
+    """Ask the user to dial flash power on the SB-5000 commander.
+
+    Manual-aperture mode keeps the remote groups in M (manual power)
+    on the commander, since the body can't communicate aperture to
+    the flash for non-CPU lenses on Z7. The rig pre-computes the
+    target power per aperture (see
+    :func:`session.flash_power.target_for_next_aperture`) and prompts
+    the user to dial it. Group C is the left flash; group A is the
+    right flash and runs 1/3 stop lower (subject-distance offset).
+
+    ``context`` is a short string included in the prompt header so
+    the user can see which aperture / phase they're setting power
+    for (e.g. ``"coarse search step 3"`` or ``"f/5.6 calibration"``).
+
+    Returns ``True`` if the user pressed ENTER, ``False`` on ``q`` /
+    EOF.
+    """
+    prefix = f"[{context}] " if context else ""
+    # SB-5000 commander displays group A before C; match that order
+    # so the operator reads the prompt top-to-bottom in the same
+    # direction they're scrolling on the flash.
+    msg = (
+        f"{prefix}Set flash power on SB-5000 commander:\n"
+        f"  group A (right) : {power_a_label}\n"
+        f"  group C (left)  : {power_c_label}\n"
+        "[ENTER] to confirm, [q] to abort: "
+    )
+    return confirm(msg, input_func=input_func)
+
+
+
+
 def prompt_range_inadequate(
     prompt: str,
     *,

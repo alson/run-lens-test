@@ -26,8 +26,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
+import math
+
 from camera.nikon_z7 import NikonZ7
+from errors import SessionAborted
 from exposure.analyse import ev_delta
+from session.flash_power import (
+    FlashTarget,
+    power_label,
+    target_for_next_aperture,
+)
 from session.log import Phase, ShotRow, ShotsCSV
 
 
@@ -44,6 +52,20 @@ def next_iso(current: int, *, ceiling: int) -> int:
     step would exceed ``ceiling`` (or we're already past the ladder)."""
     for value in ISO_LADDER:
         if value > current and value <= ceiling:
+            return value
+    return current
+
+
+def prev_iso(current: int, *, floor: int) -> int:
+    """Return the next ⅓-stop lower ISO, or ``current`` if the previous
+    step would drop below ``floor`` (or we're already at the bottom).
+
+    Used by the manual-flash (ISO-only) cascade to drop ISO when the
+    image is over-exposed, mirroring :func:`next_iso` in the other
+    direction.
+    """
+    for value in reversed(ISO_LADDER):
+        if value < current and value >= floor:
             return value
     return current
 
@@ -82,6 +104,13 @@ class ApertureCalibration:
     swap. ``None`` if no swap attempt was made; otherwise the
     measured ev — useful for diagnosing reverts (the swap dropped
     exposure by this much)."""
+    flash_power_stops_below_full: float | None = None
+    """Manual-aperture mode only: the flash power the rig instructed
+    the user to dial on the SB-5000 commander, as stops below 1/1
+    (0.0 = full, 1.0 = 1/2, 2.0 = 1/4, …, 7.0 = 1/128). ``None`` in
+    auto / AA mode where the flash auto-quenches and power isn't
+    user-controlled. Stored per-aperture so downstream tooling can
+    reconstruct the power sequence the operator dialled."""
 
 
 @dataclass
@@ -177,6 +206,444 @@ class Calibrator:
         result.baseline_median = baseline or 0.0
         return result
 
+    def calibrate_first_aperture_manual(
+        self,
+        *,
+        aperture: str,
+        lens_dir: Path,
+        lens_slug: str,
+        session_id: str,
+        baseline_median: float | None,
+        prompt_set_flash_power: Callable[..., bool],
+    ) -> tuple[CalibrationResult, float, int]:
+        """First-aperture cascade for manual-aperture mode.
+
+        Four-phase protocol:
+
+        1. **Coarse power search.** Start at
+           :data:`config.MANUAL_FLASH_INITIAL_POWER_STOPS` (1/8 by
+           default), ISO at :data:`config.MANUAL_ISO_FLOOR` (50).
+           After each capture, halve / double the power one full
+           stop based on the EV delta sign. Exit when within
+           ``MANUAL_FLASH_SEARCH_TOLERANCE_EV`` (±1 stop). Safety:
+           aborts if the search hits 1/1 or 1/128 still off-target,
+           or exceeds ``MANUAL_FLASH_MAX_SEARCH_ITERATIONS``.
+        2. **ISO fine-tune** at the settled power until within
+           ``TEST_SHOT_TOLERANCE_EV`` (1/3 stop).
+        3. **Back-calc** the precise 1/3-stop power that lands at
+           ISO floor; if the calc exceeds the soft cap, clamp and
+           let ISO carry the residual (per
+           :func:`session.flash_power.target_for_next_aperture`).
+        4. **Apply, verify, fine-tune ISO** at the new power.
+
+        Returns ``(CalibrationResult, final_power_stops, final_iso)``
+        so the runner can carry the (power, iso) state into
+        subsequent apertures.
+
+        The lens-ring aperture is set by the user before this method
+        runs; the camera's ``set_aperture`` is never called.
+        """
+        cfg = self._config
+        iso_floor = int(getattr(cfg, "MANUAL_ISO_FLOOR", 50))
+        iso_warn = int(getattr(cfg, "ISO_WARN", 1600))
+        iso_ceil = int(getattr(cfg, "ISO_CEIL", 3200))
+        soft_cap = float(getattr(cfg, "MANUAL_FLASH_SOFT_CAP_STOPS", 1.0))
+        hard_cap = float(getattr(cfg, "MANUAL_FLASH_HARD_CAP_STOPS", 0.0))
+        initial_power = float(
+            getattr(cfg, "MANUAL_FLASH_INITIAL_POWER_STOPS", 3.0)
+        )
+        search_tol = float(
+            getattr(cfg, "MANUAL_FLASH_SEARCH_TOLERANCE_EV", 1.0)
+        )
+        max_search_iters = int(
+            getattr(cfg, "MANUAL_FLASH_MAX_SEARCH_ITERATIONS", 15)
+        )
+        manual_tol = float(
+            getattr(
+                cfg, "MANUAL_FLASH_TOLERANCE_EV", cfg.TEST_SHOT_TOLERANCE_EV
+            )
+        )
+
+        capture_dir = lens_dir / "calibration"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+
+        # FEC stays at 0 throughout — inert in flash-M but the widget
+        # wants a value.
+        self._camera.set_fec(0.0)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(0.0)
+        self._camera.set_iso(iso_floor)
+
+        baseline = baseline_median
+        power_stops = initial_power
+        shots_taken = 0
+        last_median = 0.0
+        last_delta = 0.0
+        # Phase 1: coarse search.
+        for iteration in range(max_search_iters):
+            self._prompt_power(
+                prompt_set_flash_power,
+                power_stops,
+                context=f"coarse search step {iteration + 1}",
+            )
+            dest = capture_dir / _calibration_filename(aperture, shots_taken)
+            self._camera.capture_to(dest)
+            median = self._measure(dest)
+            last_median = median
+            shots_taken += 1
+            if baseline is None:
+                # Establishing the session baseline — accept whatever
+                # this capture yields at the current power. Skip the
+                # rest of the protocol; the next lens config will
+                # calibrate against this.
+                baseline = median
+                last_delta = 0.0
+                self._log_shot(
+                    aperture=aperture,
+                    iso=iso_floor,
+                    fec=0.0,
+                    median=median,
+                    ev=0.0,
+                    filename=str(dest.name),
+                    lens_slug=lens_slug,
+                    session_id=session_id,
+                    notes=f"baseline (manual first aperture, power {power_label(power_stops)})",
+                )
+                cal = ApertureCalibration(
+                    aperture=aperture,
+                    fec_ev=0.0,
+                    iso=iso_floor,
+                    final_median=median,
+                    final_ev_delta=0.0,
+                    hit_tolerance=True,
+                    iso_bumped=False,
+                    test_shots_taken=shots_taken,
+                    flash_power_stops_below_full=power_stops,
+                )
+                result = CalibrationResult(baseline_median=baseline)
+                result.per_aperture[aperture] = cal
+                return result, power_stops, iso_floor
+            delta = ev_delta(median, baseline)
+            last_delta = delta
+            self._log_shot(
+                aperture=aperture,
+                iso=iso_floor,
+                fec=0.0,
+                median=median,
+                ev=delta,
+                filename=str(dest.name),
+                lens_slug=lens_slug,
+                session_id=session_id,
+                notes=f"coarse search step {iteration + 1}, power {power_label(power_stops)}",
+            )
+            if abs(delta) <= search_tol:
+                break
+            # Adjust power one full stop in the right direction.
+            if delta > 0:
+                # Too bright → drop power one stop (increase stops-below).
+                new_power = power_stops + 1.0
+                if new_power > 7.0:
+                    raise SessionAborted(
+                        f"coarse search hit 1/128 minimum but image is "
+                        f"still over-exposed (delta={delta:+.2f} EV). "
+                        f"Reduce ambient light or add ND filter."
+                    )
+                power_stops = new_power
+            else:
+                new_power = power_stops - 1.0
+                if new_power < 0.0:
+                    raise SessionAborted(
+                        f"coarse search hit 1/1 full but image is still "
+                        f"under-exposed (delta={delta:+.2f} EV). "
+                        f"Reduce subject distance, increase ambient, or "
+                        f"use a brighter flash."
+                    )
+                power_stops = new_power
+        else:
+            raise SessionAborted(
+                f"coarse search exhausted {max_search_iters} iterations "
+                f"without converging within ±{search_tol} EV"
+            )
+
+        # Phase 2: ISO fine-tune at the settled power.
+        shots_taken, last_median, last_delta, fine_iso = self._iso_fine_tune(
+            aperture=aperture,
+            capture_dir=capture_dir,
+            baseline=baseline,
+            iso=iso_floor,
+            iso_floor=iso_floor,
+            iso_ceiling=iso_ceil,
+            shots_taken=shots_taken,
+            power_for_log=power_stops,
+            lens_slug=lens_slug,
+            session_id=session_id,
+            note_prefix="iso fine-tune (post-search)",
+            initial_median=last_median,
+            initial_delta=last_delta,
+            tol=manual_tol,
+        )
+
+        # Phase 3: back-calc target via target_for_next_aperture with
+        # aperture_stops_diff=0 (no aperture change; just absorb the
+        # iso overhang into power). Pass the post-fine-tune delta so
+        # the brute-force search can also pull the residual error
+        # toward zero.
+        target = target_for_next_aperture(
+            prev_power_stops=power_stops,
+            prev_iso=fine_iso,
+            aperture_stops_diff=0.0,
+            soft_cap_stops=soft_cap,
+            hard_cap_stops=hard_cap,
+            iso_floor=iso_floor,
+            iso_warn=iso_warn,
+            iso_ceil=iso_ceil,
+            prev_ev_delta=last_delta,
+        )
+
+        # Phase 4: prompt user to set the back-calculated power,
+        # then verify + ISO fine-tune. Suppress the prompt when the
+        # target equals the power dialled during Phase 1 — the user
+        # already has it set, no reason to ask again.
+        self._prompt_power(
+            prompt_set_flash_power,
+            target.power_stops_below_full,
+            context=f"calibrated target for {aperture}",
+            currently_set_power_stops=power_stops,
+        )
+        self._camera.set_iso(target.iso)
+        shots_taken, last_median, last_delta, final_iso = self._iso_fine_tune(
+            aperture=aperture,
+            capture_dir=capture_dir,
+            baseline=baseline,
+            iso=target.iso,
+            iso_floor=iso_floor,
+            iso_ceiling=iso_ceil,
+            shots_taken=shots_taken,
+            power_for_log=target.power_stops_below_full,
+            lens_slug=lens_slug,
+            session_id=session_id,
+            note_prefix="verification + iso fine-tune (post-back-calc)",
+            initial_median=None,
+            initial_delta=None,
+            tol=manual_tol,
+        )
+
+        cal = ApertureCalibration(
+            aperture=aperture,
+            fec_ev=0.0,
+            iso=final_iso,
+            final_median=last_median,
+            final_ev_delta=last_delta,
+            hit_tolerance=abs(last_delta) <= manual_tol,
+            iso_bumped=(final_iso != iso_floor),
+            test_shots_taken=shots_taken,
+            flash_power_stops_below_full=target.power_stops_below_full,
+        )
+        result = CalibrationResult(baseline_median=baseline)
+        result.per_aperture[aperture] = cal
+        return result, target.power_stops_below_full, final_iso
+
+    def calibrate_subsequent_aperture_manual(
+        self,
+        *,
+        aperture: str,
+        lens_dir: Path,
+        lens_slug: str,
+        session_id: str,
+        baseline_median: float,
+        prev_power_stops: float,
+        prev_iso: int,
+        prev_ev_delta: float,
+        aperture_stops_diff: float,
+        prompt_set_flash_power: Callable[..., bool],
+    ) -> tuple[CalibrationResult, float, int]:
+        """Subsequent-aperture cascade for manual-aperture mode.
+
+        Computes the target (power, iso) deterministically from the
+        previous aperture's calibrated state plus the aperture-stops
+        difference (typically 1.0 for a whole-stop ring step).
+        Prompts the user to dial the target power, captures, runs
+        a first-shot sanity check (delta from baseline within
+        ``MANUAL_FLASH_BUMP_SANITY_EV``), then ISO fine-tunes.
+
+        Returns ``(CalibrationResult, final_power_stops, final_iso)``
+        so the runner can chain state into the next aperture.
+        """
+        cfg = self._config
+        iso_floor = int(getattr(cfg, "MANUAL_ISO_FLOOR", 50))
+        iso_warn = int(getattr(cfg, "ISO_WARN", 1600))
+        iso_ceil = int(getattr(cfg, "ISO_CEIL", 3200))
+        soft_cap = float(getattr(cfg, "MANUAL_FLASH_SOFT_CAP_STOPS", 1.0))
+        hard_cap = float(getattr(cfg, "MANUAL_FLASH_HARD_CAP_STOPS", 0.0))
+        bump_sanity_ev = float(
+            getattr(cfg, "MANUAL_FLASH_BUMP_SANITY_EV", 0.5)
+        )
+        manual_tol = float(
+            getattr(
+                cfg, "MANUAL_FLASH_TOLERANCE_EV", cfg.TEST_SHOT_TOLERANCE_EV
+            )
+        )
+
+        capture_dir = lens_dir / "calibration"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+
+        # FEC inert; reset for hygiene.
+        self._camera.set_fec(0.0)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(0.0)
+
+        target = target_for_next_aperture(
+            prev_power_stops=prev_power_stops,
+            prev_iso=prev_iso,
+            aperture_stops_diff=aperture_stops_diff,
+            soft_cap_stops=soft_cap,
+            hard_cap_stops=hard_cap,
+            iso_floor=iso_floor,
+            iso_warn=iso_warn,
+            iso_ceil=iso_ceil,
+            prev_ev_delta=prev_ev_delta,
+        )
+        # Suppress this prompt when the new target equals what the
+        # commander is already set to (carry-over from previous
+        # aperture). The user already has the right power dialled.
+        self._prompt_power(
+            prompt_set_flash_power,
+            target.power_stops_below_full,
+            context=f"target for {aperture}",
+            currently_set_power_stops=prev_power_stops,
+        )
+        self._camera.set_iso(target.iso)
+
+        shots_taken = 0
+        # First-shot sanity check.
+        dest = capture_dir / _calibration_filename(aperture, shots_taken)
+        self._camera.capture_to(dest)
+        median = self._measure(dest)
+        shots_taken += 1
+        delta = ev_delta(median, baseline_median)
+        self._log_shot(
+            aperture=aperture,
+            iso=target.iso,
+            fec=0.0,
+            median=median,
+            ev=delta,
+            filename=str(dest.name),
+            lens_slug=lens_slug,
+            session_id=session_id,
+            notes=(
+                f"subsequent-aperture sanity check, power "
+                f"{power_label(target.power_stops_below_full)}"
+            ),
+        )
+        if abs(delta) > bump_sanity_ev:
+            # The first capture is significantly off the predicted
+            # value. Re-prompt the user — most likely cause is the
+            # commander wasn't dialled to the target power, or the
+            # ring wasn't turned, or both.
+            ok = prompt_set_flash_power(
+                power_c_label=power_label(target.power_stops_below_full),
+                power_a_label=power_label(target.power_stops_below_full + 1 / 3),
+                context=(
+                    f"SANITY: expected ~baseline but delta={delta:+.2f} EV. "
+                    f"Verify flash power AND ring position"
+                ),
+            )
+            if not ok:
+                raise SessionAborted(
+                    "user aborted at sanity-check re-prompt"
+                )
+            dest = capture_dir / _calibration_filename(aperture, shots_taken)
+            self._camera.capture_to(dest)
+            median = self._measure(dest)
+            shots_taken += 1
+            delta = ev_delta(median, baseline_median)
+            self._log_shot(
+                aperture=aperture,
+                iso=target.iso,
+                fec=0.0,
+                median=median,
+                ev=delta,
+                filename=str(dest.name),
+                lens_slug=lens_slug,
+                session_id=session_id,
+                notes="sanity check retry after user re-prompt",
+            )
+
+        # ISO fine-tune.
+        shots_taken, last_median, last_delta, final_iso = self._iso_fine_tune(
+            aperture=aperture,
+            capture_dir=capture_dir,
+            baseline=baseline_median,
+            iso=target.iso,
+            iso_floor=iso_floor,
+            iso_ceiling=iso_ceil,
+            shots_taken=shots_taken,
+            power_for_log=target.power_stops_below_full,
+            lens_slug=lens_slug,
+            session_id=session_id,
+            note_prefix=(
+                f"iso fine-tune (post-target, "
+                f"power {power_label(target.power_stops_below_full)})"
+            ),
+            initial_median=median,
+            initial_delta=delta,
+            tol=manual_tol,
+        )
+
+        cal = ApertureCalibration(
+            aperture=aperture,
+            fec_ev=0.0,
+            iso=final_iso,
+            final_median=last_median,
+            final_ev_delta=last_delta,
+            hit_tolerance=abs(last_delta) <= manual_tol,
+            iso_bumped=(final_iso != iso_floor),
+            test_shots_taken=shots_taken,
+            flash_power_stops_below_full=target.power_stops_below_full,
+        )
+        result = CalibrationResult(baseline_median=baseline_median)
+        result.per_aperture[aperture] = cal
+        return result, target.power_stops_below_full, final_iso
+
+    def calibrate_single_aperture(
+        self,
+        *,
+        aperture: str,
+        lens_dir: Path,
+        lens_slug: str,
+        session_id: str,
+        baseline_median: float | None,
+        set_aperture_via_camera: bool = True,
+        flash_mode: str = "aa",
+    ) -> CalibrationResult:
+        """Calibrate one aperture and return a single-entry result.
+
+        Used by manual-aperture mode where the runner inverts the
+        loop (apertures outer, rail inner): each aperture gets one
+        sweep, so calibration happens one aperture at a time. The
+        return shape matches :meth:`run` so the downstream caller
+        (sweep, log writer) doesn't special-case it.
+
+        ``set_aperture_via_camera``: see
+        :meth:`_calibrate_aperture`.
+
+        ``flash_mode``: see :meth:`_calibrate_aperture`.
+        """
+        capture_dir = lens_dir / "calibration"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        cal, baseline = self._calibrate_aperture(
+            aperture=aperture,
+            lens_slug=lens_slug,
+            session_id=session_id,
+            capture_dir=capture_dir,
+            baseline=baseline_median,
+            set_aperture_via_camera=set_aperture_via_camera,
+            flash_mode=flash_mode,
+        )
+        result = CalibrationResult(baseline_median=baseline or 0.0)
+        result.per_aperture[aperture] = cal
+        return result
+
     # ---- Per-aperture loop -------------------------------------------------
 
     def _calibrate_aperture(
@@ -187,7 +654,33 @@ class Calibrator:
         session_id: str,
         capture_dir: Path,
         baseline: float | None,
+        set_aperture_via_camera: bool = True,
+        flash_mode: str = "aa",
     ) -> tuple[ApertureCalibration, float | None]:
+        """Calibrate ISO/FEC/EC at one aperture and return the result.
+
+        ``set_aperture_via_camera``: when False, the camera ``set_aperture``
+        call is skipped — used by manual-aperture mode where the lens
+        ring is mechanical and the user sets it before this method
+        runs.
+
+        ``flash_mode``: ``"aa"`` (default) runs the existing AA-mode
+        cascade with FEC → EC → ISO range-extension. ``"manual"``
+        runs an ISO-only cascade for use when remote groups are in
+        flash-M mode (which is the only working mode for non-CPU
+        lenses on Z7 since the body can't communicate aperture to
+        the flash). In flash-M, FEC and EC have no effect; ISO is
+        the only useful exposure knob.
+        """
+        if flash_mode == "manual":
+            return self._calibrate_aperture_manual_flash(
+                aperture=aperture,
+                lens_slug=lens_slug,
+                session_id=session_id,
+                capture_dir=capture_dir,
+                baseline=baseline,
+                set_aperture_via_camera=set_aperture_via_camera,
+            )
         cfg = self._config
         ap_float = _parse_aperture(aperture)
         iso = self._initial_iso(ap_float)
@@ -202,7 +695,8 @@ class Calibrator:
         plateau_min_ev = float(
             getattr(cfg, "PLATEAU_DETECT_MIN_EV", 1.0)
         )
-        self._camera.set_aperture(aperture)
+        if set_aperture_via_camera:
+            self._camera.set_aperture(aperture)
         self._camera.set_iso(iso)
         self._camera.set_fec(fec)
         # Reset EC to 0 at the start of each aperture so a previous
@@ -415,6 +909,143 @@ class Calibrator:
             iso_headroom_attempt_ev=iso_headroom_attempt_ev,
         ), baseline
 
+    def _calibrate_aperture_manual_flash(
+        self,
+        *,
+        aperture: str,
+        lens_slug: str,
+        session_id: str,
+        capture_dir: Path,
+        baseline: float | None,
+        set_aperture_via_camera: bool,
+    ) -> tuple[ApertureCalibration, float | None]:
+        """ISO-only cascade for flash-Manual mode.
+
+        Flash is firing at a fixed power set on the commander. FEC
+        and EC have no effect because the flash isn't running an
+        auto-quench threshold. The only useful knob is ISO.
+
+        On each iteration: capture, measure central crop, compute EV
+        delta. If under-exposed, bump ISO one ⅓-stop (up to
+        ``ISO_CEIL``). If over-exposed, drop ISO one ⅓-stop (down to
+        ``ISO_FLOOR``). Saturation at either end ends the loop.
+
+        Conserves the existing :class:`ApertureCalibration` shape so
+        downstream callers (the runner's sweep + log writer) don't
+        special-case manual flash. ``fec_ev`` and ``ec_ev`` are left
+        at 0; ``iso_bumped`` reflects whether *any* ISO change
+        occurred during the loop.
+        """
+        cfg = self._config
+        ap_float = _parse_aperture(aperture)
+        iso = self._initial_iso(ap_float)
+        iso_floor = int(getattr(cfg, "ISO_FLOOR", 100))
+        iso_ceiling = int(getattr(cfg, "ISO_CEIL", 3200))
+        if set_aperture_via_camera:
+            self._camera.set_aperture(aperture)
+        self._camera.set_iso(iso)
+        # FEC stays at 0 — inert in flash-M but the camera widget
+        # still wants a value to read. Some callers rely on it being
+        # explicitly reset between apertures.
+        self._camera.set_fec(0.0)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(0.0)
+
+        initial_iso = iso
+        last_median = 0.0
+        last_delta = 0.0
+        converged = False
+        saturated = False
+        converged_shot_index = -1
+        for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
+            dest = capture_dir / _calibration_filename(aperture, shot_index)
+            self._camera.capture_to(dest)
+            median = self._measure(dest)
+            last_median = median
+
+            if baseline is None:
+                # First capture of the very first lens config of the
+                # session at the widest aperture sets the baseline.
+                baseline = median
+                last_delta = 0.0
+                self._log_shot(
+                    aperture=aperture,
+                    iso=iso,
+                    fec=0.0,
+                    median=median,
+                    ev=0.0,
+                    filename=str(dest.name),
+                    lens_slug=lens_slug,
+                    session_id=session_id,
+                    notes="baseline (manual flash)",
+                )
+                return ApertureCalibration(
+                    aperture=aperture,
+                    fec_ev=0.0,
+                    iso=iso,
+                    final_median=median,
+                    final_ev_delta=0.0,
+                    hit_tolerance=True,
+                    iso_bumped=False,
+                    test_shots_taken=1,
+                    ec_ev=0.0,
+                    ec_used=False,
+                ), baseline
+
+            delta = ev_delta(median, baseline)
+            last_delta = delta
+            self._log_shot(
+                aperture=aperture,
+                iso=iso,
+                fec=0.0,
+                median=median,
+                ev=delta,
+                filename=str(dest.name),
+                lens_slug=lens_slug,
+                session_id=session_id,
+                notes=f"calibration shot {shot_index} (manual flash, ISO-only)",
+            )
+
+            if abs(delta) <= cfg.TEST_SHOT_TOLERANCE_EV:
+                converged = True
+                converged_shot_index = shot_index
+                break
+
+            # ISO is the only knob. Under-exposure → bump up; over →
+            # drop down. Saturation at either end ends the loop.
+            if delta < -cfg.TEST_SHOT_TOLERANCE_EV:
+                bumped = next_iso(iso, ceiling=iso_ceiling)
+                if bumped == iso:
+                    saturated = True
+                    break
+                iso = bumped
+            else:
+                dropped = prev_iso(iso, floor=iso_floor)
+                if dropped == iso:
+                    saturated = True
+                    break
+                iso = dropped
+            self._camera.set_iso(iso)
+
+        shots_taken = (
+            converged_shot_index + 1
+            if converged
+            else cfg.TEST_SHOT_MAX_RETRIES + 1
+        )
+        return ApertureCalibration(
+            aperture=aperture,
+            fec_ev=0.0,
+            iso=iso,
+            final_median=last_median,
+            final_ev_delta=last_delta,
+            hit_tolerance=converged,
+            iso_bumped=(iso != initial_iso),
+            test_shots_taken=shots_taken,
+            saturated_at_ceiling=saturated,
+            ec_ev=0.0,
+            ec_used=False,
+        ), baseline
+
     def _try_iso_headroom_swap(
         self,
         *,
@@ -509,6 +1140,126 @@ class Calibrator:
         return None, delta
 
     # ---- Helpers ----------------------------------------------------------
+
+    def _prompt_power(
+        self,
+        prompt_set_flash_power: Callable[..., bool],
+        power_stops: float,
+        *,
+        context: str,
+        currently_set_power_stops: float | None = None,
+    ) -> None:
+        """Render labels for groups C / A and prompt the user.
+
+        Group A trails group C by 1/3 stop (subject-distance offset
+        for the right flash, documented in
+        ``rustling-tumbling-moonbeam.md``). The A label is clamped
+        to the SB-5000's 1/128 minimum if C is at 1/128 itself —
+        the commander can't display lower than 1/128, so groups C
+        and A coincide at the floor.
+
+        ``currently_set_power_stops``: when supplied and equal to
+        the requested ``power_stops`` (within 1/6 stop, the 1/3-stop
+        ladder's half-step), the prompt is suppressed — the user
+        already dialled the target, no reason to ask again.
+
+        Raises :class:`errors.SessionAborted` if the user answers `q`.
+        """
+        if (
+            currently_set_power_stops is not None
+            and abs(power_stops - currently_set_power_stops) < 1 / 6
+        ):
+            return
+        a_stops = min(power_stops + 1 / 3, 7.0)
+        ok = prompt_set_flash_power(
+            power_c_label=power_label(power_stops),
+            power_a_label=power_label(a_stops),
+            context=context,
+        )
+        if not ok:
+            raise SessionAborted(
+                f"user aborted at flash-power prompt ({context})"
+            )
+
+    def _iso_fine_tune(
+        self,
+        *,
+        aperture: str,
+        capture_dir: Path,
+        baseline: float,
+        iso: int,
+        iso_floor: int,
+        iso_ceiling: int,
+        shots_taken: int,
+        power_for_log: float,
+        lens_slug: str,
+        session_id: str,
+        note_prefix: str,
+        initial_median: float | None = None,
+        initial_delta: float | None = None,
+        tol: float | None = None,
+    ) -> tuple[int, float, float, int]:
+        """Adjust ISO by 1/3-stop steps until within tolerance.
+
+        Either evaluates an existing capture's ``initial_median /
+        initial_delta`` (passed by the caller) or takes one fresh
+        capture as a starting point, then iterates: adjust ISO,
+        capture, evaluate, until ``|delta| <= tol`` (defaults to
+        ``TEST_SHOT_TOLERANCE_EV`` when ``tol`` is None) or ISO
+        saturates at floor / ceiling.
+
+        Returns ``(shots_taken, last_median, last_delta, final_iso)``.
+        """
+        cfg = self._config
+        if tol is None:
+            tol = float(cfg.TEST_SHOT_TOLERANCE_EV)
+        max_retries = int(cfg.TEST_SHOT_MAX_RETRIES)
+        notes = f"{note_prefix}, power {power_label(power_for_log)}"
+
+        # Establish the starting (median, delta).
+        if initial_median is not None and initial_delta is not None:
+            last_median = initial_median
+            last_delta = initial_delta
+        else:
+            dest = capture_dir / _calibration_filename(aperture, shots_taken)
+            self._camera.capture_to(dest)
+            last_median = self._measure(dest)
+            shots_taken += 1
+            last_delta = ev_delta(last_median, baseline)
+            self._log_shot(
+                aperture=aperture, iso=iso, fec=0.0,
+                median=last_median, ev=last_delta,
+                filename=str(dest.name), lens_slug=lens_slug,
+                session_id=session_id, notes=notes,
+            )
+
+        for _ in range(max_retries):
+            if abs(last_delta) <= tol:
+                break
+            if last_delta < -tol:
+                bumped = next_iso(iso, ceiling=iso_ceiling)
+                if bumped == iso:
+                    break
+                iso = bumped
+            else:
+                dropped = prev_iso(iso, floor=iso_floor)
+                if dropped == iso:
+                    break
+                iso = dropped
+            self._camera.set_iso(iso)
+            dest = capture_dir / _calibration_filename(aperture, shots_taken)
+            self._camera.capture_to(dest)
+            last_median = self._measure(dest)
+            shots_taken += 1
+            last_delta = ev_delta(last_median, baseline)
+            self._log_shot(
+                aperture=aperture, iso=iso, fec=0.0,
+                median=last_median, ev=last_delta,
+                filename=str(dest.name), lens_slug=lens_slug,
+                session_id=session_id, notes=notes,
+            )
+
+        return shots_taken, last_median, last_delta, iso
 
     def _initial_iso(self, ap_float: float) -> int:
         """ISO base for an aperture, picked from the per-aperture
