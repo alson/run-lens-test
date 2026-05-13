@@ -165,7 +165,7 @@ def main() -> int:
     print("=" * 78)
     print("SUMMARY")
     print("=" * 78)
-    print(f"{'aperture':>10} {'verdict':>10} {'ev':>+8} {'FEC':>+6} {'EC':>+6} {'ISO':>5} {'shots':>6} {'time':>6}")
+    print(f"{'aperture':>10} {'verdict':>10} {'ev':>8} {'FEC':>6} {'EC':>6} {'ISO':>5} {'shots':>6} {'time':>6}")
     print("-" * 78)
     n_ok = 0
     total_shots = 0

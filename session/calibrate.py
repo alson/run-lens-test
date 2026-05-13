@@ -1669,16 +1669,36 @@ def _distribute_bias(
     residual past FEC's limits. Each value is snapped to its own
     ⅓-stop grid so the camera's PTP widget accepts it.
 
+    **Avoids k=±7 grid positions.** The Z7's PTP range widget for
+    ``flashexposurecompensation`` empirically rejects every float
+    representation of ±2.333 (k=±7) — see
+    ``tools/fec_acceptance_grid.py``. If FEC or EC would otherwise
+    snap to one of these positions, the function substitutes the
+    nearest whole stop (k=±6) and puts the residual ⅓ stop in the
+    other lever. Total exposure bias is preserved exactly.
+
     Returns ``(fec, ec, ec_used)``. ``ec_used`` is True when EC was
     actually moved away from zero — useful for the cascade's result
     summary so the operator can see whether the camera-side EC bias
     is in play.
     """
     fec = _clamp(_snap(target_bias, fec_step), fec_min, fec_max)
+    # The Z7 rejects k=±7 (±2.333) for FEC. Substitute k=±6 (±2.0)
+    # and let the residual go to EC.
+    fec_k = round(fec / fec_step) if fec_step > 0 else 0
+    if fec_k == -7:
+        fec = -2.0
+    elif fec_k == 7:
+        fec = 2.0
     remaining = target_bias - fec
     if abs(remaining) < ec_step / 2.0:
         return fec, 0.0, False
     ec = _clamp(_snap(remaining, ec_step), ec_min, ec_max)
+    ec_k = round(ec / ec_step) if ec_step > 0 else 0
+    if ec_k == -7:
+        ec = -2.0
+    elif ec_k == 7:
+        ec = 2.0
     ec_used = abs(ec) > 1e-6
     return fec, ec, ec_used
 

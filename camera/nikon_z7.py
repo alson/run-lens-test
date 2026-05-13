@@ -272,43 +272,74 @@ class NikonZ7:
         self.drain_events()
 
     def _set_range(self, name: str, value: float) -> None:
-        cfg = self.camera.get_config()
-        widget = find(cfg, name)
-        if widget is None:
-            return
         # The Z7's PTP range widget for ``flashexposurecompensation``
-        # silently rejects float64 inputs at certain ⅓-stop values
-        # whose float64 representation is "off-grid" relative to the
-        # camera's internal float32 storage. ⅓-stop values like
-        # -5/3 (`-1.6666666666666667`) sit a few ULP of float32 away
-        # from the camera's nearest grid point; the widget's strict
-        # comparison rejects them. ``set_config`` returns without
-        # raising, the widget keeps its previous value, and the
-        # subsequent capture fires at the OLD FEC while the caller's
-        # bookkeeping says the new one. Empirically the camera DOES
-        # accept inputs rounded to 3 decimals (e.g. -1.667) and snaps
-        # them to its internal grid; we exploit that here. The
-        # readback verifies the camera's reported value is within
-        # 1e-3 of what we requested — comfortably accommodating the
-        # float32-snap round-trip but catching any future widget that
-        # actually ignores the call.
-        rounded = round(float(value), 3)
-        widget.set_value(rounded)
-        self.camera.set_config(cfg)
-        self.drain_events()
-        cfg2 = self.camera.get_config()
-        widget2 = find(cfg2, name)
-        if widget2 is None:
-            return
-        actual = float(widget2.get_value())
-        if abs(actual - rounded) > 1e-3:
-            raise CameraStateError(
-                f"{name} set_value({value!r} → rounded {rounded!r}) "
-                f"silently rejected: camera reports {actual!r} after "
-                f"set_config. The widget appears to ignore values "
-                f"outside its accepted grid — see _set_range in "
-                f"camera/nikon_z7.py for context."
-            )
+        # has a quirky internal grid: different ⅓-stop positions
+        # accept different float representations. Empirical map (from
+        # tools/fec_acceptance_grid.py against the real camera):
+        #
+        #   k=-7 (−2.333): NO float64 representation accepted
+        #   k=-5 (−1.667): 3-decimal & 4-decimal work; k/3 & float32 don't
+        #   k=-4 (−1.333): k/3 & float32 work; 3-decimal & 4-decimal don't
+        #   k=-9, -8, -6, -3, etc.: all forms work
+        #
+        # Sending an unaccepted form returns success from
+        # ``set_config`` but the widget keeps its previous value — a
+        # silent no-op. Subsequent captures fire at the OLD value
+        # while the caller's bookkeeping says the new one.
+        #
+        # Defence: try several common rounding forms in order, with
+        # readback verification between each. First accepted form
+        # wins. Raises CameraStateError only if ALL candidates are
+        # rejected (e.g. k=-7) so the caller can snap to a nearby
+        # accepted grid point.
+        import struct
+        v = float(value)
+        candidates: list[float] = []
+        seen: set[int] = set()
+        for c in (
+            round(v, 3),
+            round(v, 4),
+            struct.unpack("<f", struct.pack("<f", v))[0],
+            v,
+        ):
+            # De-dup by bit pattern so we don't try identical floats twice.
+            bits = struct.unpack("<q", struct.pack("<d", c))[0]
+            if bits in seen:
+                continue
+            seen.add(bits)
+            candidates.append(c)
+
+        last_actual: float | None = None
+        for cand in candidates:
+            cfg = self.camera.get_config()
+            widget = find(cfg, name)
+            if widget is None:
+                return
+            widget.set_value(cand)
+            self.camera.set_config(cfg)
+            self.drain_events()
+            # Retry readback a few times — the PTP property update
+            # propagates asynchronously and the camera may briefly
+            # continue to report the old value for ~100–300 ms.
+            for _ in range(4):
+                cfg2 = self.camera.get_config()
+                widget2 = find(cfg2, name)
+                if widget2 is None:
+                    return
+                last_actual = float(widget2.get_value())
+                if abs(last_actual - cand) <= 1e-3:
+                    return
+                self._sleep(0.2)
+            # This candidate's silent no-op confirmed; try next form.
+
+        raise CameraStateError(
+            f"{name} set_value({value!r}) silently rejected by all "
+            f"{len(candidates)} candidate representations "
+            f"({[f'{c!r}' for c in candidates]}). Camera reports "
+            f"{last_actual!r}. The widget's accepted grid excludes "
+            f"this ⅓-stop position — see "
+            f"tools/fec_acceptance_grid.py for the empirical map."
+        )
         # Readback verification. The Z7's PTP range widget for some
         # properties (notably ``flashexposurecompensation``) silently
         # rejects values that don't match its internal ⅓-stop grid by
