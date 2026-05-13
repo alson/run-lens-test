@@ -276,9 +276,65 @@ class NikonZ7:
         widget = find(cfg, name)
         if widget is None:
             return
-        widget.set_value(float(value))
+        # The Z7's PTP range widget for ``flashexposurecompensation``
+        # silently rejects float64 inputs at certain ⅓-stop values
+        # whose float64 representation is "off-grid" relative to the
+        # camera's internal float32 storage. ⅓-stop values like
+        # -5/3 (`-1.6666666666666667`) sit a few ULP of float32 away
+        # from the camera's nearest grid point; the widget's strict
+        # comparison rejects them. ``set_config`` returns without
+        # raising, the widget keeps its previous value, and the
+        # subsequent capture fires at the OLD FEC while the caller's
+        # bookkeeping says the new one. Empirically the camera DOES
+        # accept inputs rounded to 3 decimals (e.g. -1.667) and snaps
+        # them to its internal grid; we exploit that here. The
+        # readback verifies the camera's reported value is within
+        # 1e-3 of what we requested — comfortably accommodating the
+        # float32-snap round-trip but catching any future widget that
+        # actually ignores the call.
+        rounded = round(float(value), 3)
+        widget.set_value(rounded)
         self.camera.set_config(cfg)
         self.drain_events()
+        cfg2 = self.camera.get_config()
+        widget2 = find(cfg2, name)
+        if widget2 is None:
+            return
+        actual = float(widget2.get_value())
+        if abs(actual - rounded) > 1e-3:
+            raise CameraStateError(
+                f"{name} set_value({value!r} → rounded {rounded!r}) "
+                f"silently rejected: camera reports {actual!r} after "
+                f"set_config. The widget appears to ignore values "
+                f"outside its accepted grid — see _set_range in "
+                f"camera/nikon_z7.py for context."
+            )
+        # Readback verification. The Z7's PTP range widget for some
+        # properties (notably ``flashexposurecompensation``) silently
+        # rejects values that don't match its internal ⅓-stop grid by
+        # strict floating-point equality. ``set_config`` returns
+        # success, no exception is raised, and the widget retains its
+        # previous value — causing the next capture to fire at the
+        # *old* setting while the caller's bookkeeping says the new
+        # one. Catching that here surfaces the failure where it
+        # happens instead of letting it propagate as a phantom flash
+        # response. See ``_snap`` in session/calibrate.py for the
+        # original 1-ULP bug; this readback is defence-in-depth for
+        # any future caller that hands us a value off the widget's
+        # grid.
+        cfg2 = self.camera.get_config()
+        widget2 = find(cfg2, name)
+        if widget2 is None:
+            return
+        actual = float(widget2.get_value())
+        if abs(actual - float(value)) > 1e-3:
+            raise CameraStateError(
+                f"{name} set_value({value!r}) silently rejected: "
+                f"camera reports {actual!r} after set_config. Likely "
+                f"a floating-point mismatch with the widget's discrete "
+                f"grid — try snapping the requested value to canonical "
+                f"⅓-stop form (k/3 rather than k * (1/3))."
+            )
 
     # ---- Convenience setters --------------------------------------------
 

@@ -155,6 +155,42 @@ class TestSnap:
         assert _snap(0.5, 1 / 3) == pytest.approx(2 / 3)
         assert _snap(-0.4, 1 / 3) == pytest.approx(-1 / 3)
 
+    def test_canonical_third_stops_match_k_over_3(self) -> None:
+        # The Z7's PTP widget validates FEC against a ⅓-stop grid via
+        # strict float equality. ``_snap`` must produce the same
+        # IEEE-754 form as ``k/3`` for all integer k in the FEC range
+        # so the camera doesn't silently reject the requested value.
+        # ``k * (1/3)`` and ``k/3`` differ by 1 ULP at k = −5 and
+        # k = −7 (the canonical k/3 form is the one the camera
+        # accepts). Verifies the regression.
+        for k in range(-9, 4):
+            expected = k / 3.0
+            snapped = _snap(k / 3.0, 1.0 / 3.0)
+            assert snapped == expected, (
+                f"k={k}: _snap returned {snapped!r}, expected {expected!r} "
+                f"(off-by-ULP form would silently fail Z7 PTP validation)"
+            )
+
+    def test_specific_failing_case_minus_5_thirds(self) -> None:
+        # The cascade trace that exposed this bug had _snap convert a
+        # FEC adjustment to −5/3. With the old form this produced
+        # −1.6666666666666665, which the Z7 silently rejected. The
+        # fixed form must produce −1.6666666666666667 (== −5/3).
+        result = _snap(-1.6, 1.0 / 3.0)
+        assert result == -5 / 3
+        assert repr(result) == repr(-5 / 3)
+
+    def test_whole_stop_step_unchanged(self) -> None:
+        # Whole-stop snap (step=1.0) should be unaffected.
+        assert _snap(0.7, 1.0) == 1.0
+        assert _snap(-2.3, 1.0) == -2.0
+
+    def test_rejects_non_positive_step(self) -> None:
+        with pytest.raises(ValueError):
+            _snap(1.0, 0.0)
+        with pytest.raises(ValueError):
+            _snap(1.0, -0.5)
+
 
 # ---- Baseline establishment -----------------------------------------------
 

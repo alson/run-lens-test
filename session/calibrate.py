@@ -1322,7 +1322,39 @@ def _parse_aperture(text: str) -> float:
 
 
 def _snap(value: float, step: float) -> float:
-    """Round ``value`` to the nearest multiple of ``step``."""
+    """Round ``value`` to the nearest multiple of ``step``.
+
+    When ``step = 1/N`` for some integer N (the common case for
+    ⅓-stop, ½-stop, ¼-stop grids), the snapped value is computed as
+    ``round(value * N) / N`` rather than ``round(value/step) * step``.
+    The two forms are mathematically equivalent but produce slightly
+    different IEEE-754 floats at specific positions: for step=1/3,
+    ``-5 * (1/3) = -1.6666666666666665`` but ``-5/3 =
+    -1.6666666666666667`` (off by 1 ULP). The Nikon Z7's PTP range
+    widget for `flashexposurecompensation` validates against its
+    internal ⅓-stop grid by what appears to be strict-equality
+    comparison: the 1-ULP form is silently rejected. The
+    ``camera.set_config()`` call returns success, the FEC widget
+    retains its previous value, and the cascade's `set_fec(value)`
+    becomes a silent no-op — masquerading as `set_fec` lag or
+    "hysteresis" because subsequent shots fire at whatever the
+    *previous* successfully-set FEC was.
+
+    The bug manifested on Sigma 150 + 6T + 5T cascades that landed on
+    FEC = -1.667 (k = -5); see `tools/cascade_dry_run.py` and the
+    accompanying DESIGN_NOTES entry. Only k = -5 and k = -7 in the
+    ⅓-stop grid suffer the 1-ULP form drift; other ⅓-stop values
+    happen to round to the canonical form by coincidence.
+    """
+    if step <= 0:
+        raise ValueError(f"step must be positive, got {step}")
+    # Detect 1/N steps and use direct division by N to produce the
+    # canonical IEEE-754 form. Threshold of 1e-9 is well below
+    # ⅓-stop resolution; allows tests that pass ``1/3`` literally and
+    # any caller that supplies ``1.0/3.0`` or similar.
+    inv = round(1.0 / step)
+    if inv > 0 and abs(inv * step - 1.0) < 1e-9:
+        return round(value * inv) / inv
     return round(value / step) * step
 
 

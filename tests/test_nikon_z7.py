@@ -133,6 +133,15 @@ class TestApplySessionConfig:
         # Order matches the wrapper's get_config call sequence — VR
         # scan happens between autofocus and flashexposurecompensation;
         # EC is the final reset.
+        # The fec widget is made *stateful* (set_value updates the
+        # value get_value returns) so the readback in _set_range sees
+        # the value the wrapper just wrote, not the initial value.
+        fec_state = {"value": 1.0}
+        def _fec_set(v):
+            fec_state["value"] = float(v)
+        fec_widget = make_widget("flashexposurecompensation", 1.0)
+        fec_widget.set_value.side_effect = _fec_set
+        fec_widget.get_value.side_effect = lambda: fec_state["value"]
         widgets = {
             "capturetarget": make_widget(
                 "capturetarget", "Memory card", choices=["Internal RAM", "Memory card"]
@@ -146,18 +155,18 @@ class TestApplySessionConfig:
             ),
             "autofocus": make_widget("autofocus", "On", choices=["On", "Off"]),
             "vr": make_widget("vr", "On", choices=["On", "Off"]),
-            "flashexposurecompensation": make_widget(
-                "flashexposurecompensation", 1.0
-            ),
+            "flashexposurecompensation": fec_widget,
             "exposurecompensation": make_widget(
                 "exposurecompensation", "3", choices=["-1", "0", "1", "3"],
             ),
         }
-        # Each get_config call must return a fresh tree because the
-        # wrapper does get_config -> mutate -> set_config per setter.
-        camera.get_config.side_effect = [
-            make_widget("main", children=[w]) for w in widgets.values()
-        ]
+        # Single shared tree returned for every get_config call.
+        # The wrapper grabs cfg → mutates → set_config per setter, and
+        # _set_range does a readback get_config after that; sharing the
+        # tree (with a stateful fec_widget) lets all of those calls see
+        # consistent state without a fragile side_effect list.
+        shared_tree = make_widget("main", children=list(widgets.values()))
+        camera.get_config.return_value = shared_tree
         nikon.apply_session_config()
         # set_config called once per widget present (including VR + EC).
         assert camera.set_config.call_count == 8
@@ -367,8 +376,14 @@ class TestFECSanityCheck:
 
     def test_restores_fec_to_baseline(self, nikon, camera, gp, tmp_path) -> None:
         self._wire_capture_to(nikon, camera, gp, tmp_path)
-        # Track set_value calls on the FEC widget.
+        # Track set_value calls on the FEC widget; make it stateful
+        # so the readback in _set_range sees the value just written.
+        fec_state = {"value": 0.0}
+        def _fec_set(v):
+            fec_state["value"] = float(v)
         fec_widget = make_widget("flashexposurecompensation", 0.0)
+        fec_widget.set_value.side_effect = _fec_set
+        fec_widget.get_value.side_effect = lambda: fec_state["value"]
         camera.get_config.return_value = make_widget(
             "main", children=[fec_widget]
         )
@@ -478,7 +493,79 @@ class TestSetEC:
         ec_widget.set_value.assert_called_with(2.0)
 
 
-# ---- list_apertures --------------------------------------------------------
+# ---- _set_range readback verification --------------------------------------
+
+
+class TestSetRangeReadback:
+    """Regression coverage for the silent-no-op bug where the Z7's PTP
+    range widget for ``flashexposurecompensation`` accepted a
+    ``set_config`` call without raising, but the widget's value stayed
+    at the previous setting. Caused by 1-ULP float drift: ``_snap``
+    produced ``-5 * (1/3) = -1.6666666666666665`` but the widget only
+    accepts the canonical ``-5/3 = -1.6666666666666667``. The fix has
+    two parts: ``_snap`` is fixed to produce canonical k/N values, and
+    ``_set_range`` reads back the widget's value to catch any future
+    instance of this class of bug."""
+
+    def _wire_range_widget(self, camera, name: str, initial: float):
+        """Build a widget that reflects whatever set_value writes —
+        the well-behaved case."""
+        w = make_widget(name, initial)
+        # Make get_value return whatever set_value was last called with.
+        state = {"value": initial}
+        def _set(v):
+            state["value"] = float(v)
+        w.set_value.side_effect = _set
+        w.get_value.side_effect = lambda: state["value"]
+        camera.get_config.return_value = make_widget("main", children=[w])
+        return w
+
+    def _wire_silent_reject_widget(self, camera, name: str, stuck_at: float):
+        """Build a widget that ACCEPTS set_value calls (no exception)
+        but always returns the same value via get_value — the
+        camera-side silent-reject pattern."""
+        w = make_widget(name, stuck_at)
+        # set_value succeeds (no exception) but get_value never updates.
+        w.set_value.side_effect = lambda v: None  # no-op accept
+        w.get_value.side_effect = lambda: stuck_at
+        camera.get_config.return_value = make_widget("main", children=[w])
+        return w
+
+    def test_well_behaved_widget_passes(self, nikon, camera) -> None:
+        self._wire_range_widget(camera, "flashexposurecompensation", 0.0)
+        # No exception when the widget's reported value matches the
+        # request after set_config.
+        nikon.set_fec(-1.0)
+
+    def test_silent_rejection_raises(self, nikon, camera) -> None:
+        # Widget pretends to accept set_value but get_value reports an
+        # unchanged value. _set_range must detect this and raise rather
+        # than silently moving on.
+        self._wire_silent_reject_widget(
+            camera, "flashexposurecompensation", stuck_at=0.0,
+        )
+        with pytest.raises(CameraStateError, match="silently rejected"):
+            nikon.set_fec(-1.6666666666666665)  # the off-by-ULP form
+
+    def test_tolerance_is_3_decimal_places(self, nikon, camera) -> None:
+        # 1e-3 readback tolerance — sub-ULP differences in canonical
+        # values mustn't trigger a false positive.
+        w = self._wire_range_widget(camera, "flashexposurecompensation", 0.0)
+        # Pretend the widget reports back a value 1e-4 different
+        # (well within tolerance — could happen with widget rounding).
+        original_set = w.set_value.side_effect
+        def _slightly_off(v):
+            original_set(v)
+            # Override the side effect to add a small drift on next get.
+        w.set_value.side_effect = _slightly_off
+        w.get_value.side_effect = lambda: -1.0001  # within 1e-3
+        nikon.set_fec(-1.0)  # No raise.
+
+    def test_missing_widget_silently_returns(self, nikon, camera) -> None:
+        # If the widget isn't present at all (older firmware variants),
+        # _set_range is a no-op and the readback path is skipped.
+        camera.get_config.return_value = make_widget("main")
+        nikon.set_fec(-1.0)  # No raise — the widget find returns None.
 
 
 class TestListApertures:
