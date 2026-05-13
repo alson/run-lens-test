@@ -682,6 +682,15 @@ class Calibrator:
                 set_aperture_via_camera=set_aperture_via_camera,
             )
         cfg = self._config
+        if getattr(cfg, "LINEAR_CASCADE_ENABLED", False):
+            return self._calibrate_aperture_linear(
+                aperture=aperture,
+                lens_slug=lens_slug,
+                session_id=session_id,
+                capture_dir=capture_dir,
+                baseline=baseline,
+                set_aperture_via_camera=set_aperture_via_camera,
+            )
         ap_float = _parse_aperture(aperture)
         iso = self._initial_iso(ap_float)
         fec = 0.0
@@ -1046,6 +1055,285 @@ class Calibrator:
             ec_used=False,
         ), baseline
 
+    # ---- Linear-model cascade (AA mode, 3-5 shots) ------------------------
+
+    def _calibrate_aperture_linear(
+        self,
+        *,
+        aperture: str,
+        lens_slug: str,
+        session_id: str,
+        capture_dir: Path,
+        baseline: float | None,
+        set_aperture_via_camera: bool = True,
+    ) -> tuple[ApertureCalibration, float | None]:
+        """3-5 shot linear-model AA calibration.
+
+        Replaces the legacy iterative cascade (10-shot cap, plateau-
+        detector, FEC-saturation fallback chain) with an explicit
+        per-shot purpose model:
+
+        * **Shot 1** — probe at FEC=0, ISO=floor, EC=0. Establishes
+          ``delta_0`` = the rig's "natural" exposure deviation.
+        * **Shot 2** — apply target bias ``-delta_0``, distributed
+          across FEC then EC. Should land at baseline if the flash
+          chain is linear (per the rig_flash_headroom memory's
+          slope-≈-1.0 observation).
+        * **Shot 3** — ALWAYS — headroom probe. Add +1 stop of bias
+          in the same direction as the shot-2 adjustment. Slope =
+          ``(delta_2 - delta_1) / probe_step``.
+        * **Shot 4** — only if needed: either a fine-tune (if
+          ``|delta_1| > tolerance`` AND headroom confirmed by shot 3)
+          OR a post-ISO-bump retry (if shot 3 revealed the flash is
+          mechanically maxed).
+        * **Shot 5** — only if shot 4 was ISO-bump and we still need
+          one more touch-up to land within tolerance.
+
+        Slope thresholds:
+
+        * ``slope >= 0.7 EV / stop``: linear regime, flash has
+          headroom. If ``|delta_1| <= tolerance`` we're done with
+          shot 2's settings (shot 3 was diagnostic). Otherwise
+          fine-tune in shot 4.
+        * ``slope < 0.3 EV / stop``: flash is at mechanical max.
+          The +1-stop probe didn't move the needle, so adding more
+          FEC/EC won't help — bump ISO.
+        * ``0.3 ≤ slope < 0.7``: partial maxing; treated
+          conservatively as saturated and bumps ISO.
+
+        Replaces the legacy cascade's same-FEC-different-output
+        oscillation pattern with a one-pass linear model. Combined
+        with the FEC float-rounding fix in
+        :meth:`NikonZ7._set_range`, the cascade is robust against
+        both the float-rounding silent rejections and the
+        oscillation that came from the greedy ``new_fec = fec -
+        delta`` step + ⅓-stop snap interaction.
+        """
+        cfg = self._config
+        ap_float = _parse_aperture(aperture)
+        iso_floor = self._initial_iso(ap_float)
+        iso = iso_floor
+
+        fec = 0.0
+        ec = 0.0
+        ec_min = float(getattr(cfg, "EC_MIN_EV", -3.0))
+        ec_max = float(getattr(cfg, "EC_MAX_EV", 3.0))
+        ec_step = float(getattr(cfg, "EC_STEP_EV", 1.0 / 3.0))
+        fec_min = float(cfg.FEC_MIN_EV)
+        fec_max = float(cfg.FEC_MAX_EV)
+        fec_step = float(cfg.FEC_STEP_EV)
+        tolerance = float(cfg.TEST_SHOT_TOLERANCE_EV)
+        iso_step_ev = float(getattr(cfg, "ISO_STEP_EV", 1.0 / 3.0))
+
+        if set_aperture_via_camera:
+            self._camera.set_aperture(aperture)
+        self._camera.set_iso(iso)
+        self._camera.set_fec(fec)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(ec)
+
+        last_median = 0.0
+        last_delta = 0.0
+        iso_bumped = False
+        ec_used = False
+        saturated = False
+        converged = False
+        shots = 0
+
+        def shoot(notes: str) -> tuple[float, float]:
+            """Capture, measure, log. Returns (median, delta)."""
+            nonlocal shots, last_median, last_delta
+            dest = capture_dir / _calibration_filename(aperture, shots)
+            self._camera.capture_to(dest)
+            median = self._measure(dest)
+            shots += 1
+            last_median = median
+            if baseline is None:
+                # Caller (shot 1 of first lens config) handles
+                # baseline assignment; return delta=0 placeholder.
+                self._log_shot(
+                    aperture=aperture, iso=iso, fec=fec,
+                    median=median, ev=0.0,
+                    filename=str(dest.name),
+                    lens_slug=lens_slug, session_id=session_id,
+                    notes="baseline",
+                )
+                return median, 0.0
+            delta = ev_delta(median, baseline)
+            last_delta = delta
+            self._log_shot(
+                aperture=aperture, iso=iso, fec=fec,
+                median=median, ev=delta,
+                filename=str(dest.name),
+                lens_slug=lens_slug, session_id=session_id,
+                notes=notes,
+            )
+            return median, delta
+
+        # ---- Shot 1: probe at FEC=0 ----------------------------------
+        median, delta_0 = shoot("linear shot 1 (probe FEC=0)")
+        if baseline is None:
+            # First lens config: this shot SETS the baseline; no
+            # further work for this aperture.
+            return ApertureCalibration(
+                aperture=aperture, fec_ev=fec, iso=iso,
+                final_median=median, final_ev_delta=0.0,
+                hit_tolerance=True, iso_bumped=False,
+                test_shots_taken=1, ec_ev=ec, ec_used=False,
+            ), median
+
+        # ---- Compute target & shot 2 ---------------------------------
+        target_bias = -delta_0
+        fec, ec, ec_used = _distribute_bias(
+            target_bias,
+            fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
+            ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
+        )
+        self._camera.set_fec(fec)
+        if hasattr(self._camera, "set_ec"):
+            self._camera.set_ec(ec)
+        _, delta_1 = shoot("linear shot 2 (target)")
+
+        # ---- Shot 3: headroom probe ----------------------------------
+        # Probe in the same sign as the original adjustment, by one
+        # whole stop. If shot 1 was exactly on target (target_bias ≈
+        # 0), probe upward by convention — we still want to verify
+        # linear response.
+        probe_sign = 1.0 if target_bias >= 0 else -1.0
+        probe_target_bias = (fec + ec) + probe_sign  # cumulative bias = current + 1 stop
+        probe_fec, probe_ec, probe_ec_used = _distribute_bias(
+            probe_target_bias,
+            fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
+            ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
+        )
+        # If the probe yields exactly the same settings (cascade
+        # already at FEC+EC ceiling in the probe direction), we
+        # can't actually probe. Skip the shot and treat as saturated
+        # (the cascade has no headroom on this side anyway).
+        actual_probe_step = (probe_fec + probe_ec) - (fec + ec)
+        can_probe = abs(actual_probe_step) > 1e-3
+        slope = 0.0
+        if can_probe:
+            shot2_fec, shot2_ec = fec, ec
+            shot2_ec_used = ec_used
+            self._camera.set_fec(probe_fec)
+            if hasattr(self._camera, "set_ec"):
+                self._camera.set_ec(probe_ec)
+            fec, ec = probe_fec, probe_ec
+            ec_used = ec_used or probe_ec_used
+            _, delta_2 = shoot("linear shot 3 (headroom probe)")
+            slope = (delta_2 - delta_1) / actual_probe_step
+
+        # ---- Classify -----------------------------------------------
+        slope_healthy = 0.7
+        slope_maxed = 0.3
+        if can_probe and slope >= slope_healthy:
+            # Headroom confirmed. Revert to shot 2's settings.
+            self._camera.set_fec(shot2_fec)
+            if hasattr(self._camera, "set_ec"):
+                self._camera.set_ec(shot2_ec)
+            fec, ec = shot2_fec, shot2_ec
+            ec_used = shot2_ec_used
+            if abs(delta_1) <= tolerance:
+                converged = True
+                last_delta = delta_1
+            else:
+                # Fine-tune: distribute target_bias + (-delta_1).
+                ft_bias = (fec + ec) + (-delta_1)
+                fec, ec, ec_used_ft = _distribute_bias(
+                    ft_bias,
+                    fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
+                    ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
+                )
+                ec_used = ec_used or ec_used_ft
+                self._camera.set_fec(fec)
+                if hasattr(self._camera, "set_ec"):
+                    self._camera.set_ec(ec)
+                _, last_delta = shoot("linear shot 4 (fine-tune)")
+                converged = abs(last_delta) <= tolerance
+        elif not can_probe or slope < slope_maxed or (slope < slope_healthy and abs(delta_1) > tolerance):
+            # Flash maxed (or borderline + off-target). Bump ISO by
+            # enough ⅓-stops to cover the residual deficit; the
+            # ISO bump gives REAL exposure gain because the flash
+            # is already at mechanical max.
+            deficit_ev = -delta_1 if delta_1 < 0 else 0.0
+            if deficit_ev <= tolerance:
+                # delta_1 was within tolerance after all (slope was
+                # borderline but image is on target). Accept.
+                if can_probe:
+                    self._camera.set_fec(shot2_fec)
+                    if hasattr(self._camera, "set_ec"):
+                        self._camera.set_ec(shot2_ec)
+                    fec, ec = shot2_fec, shot2_ec
+                    ec_used = shot2_ec_used
+                converged = True
+                last_delta = delta_1
+            else:
+                stops_to_bump = max(1, int(round(deficit_ev / iso_step_ev)))
+                new_iso = iso
+                iso_gained = 0.0
+                for _ in range(stops_to_bump):
+                    bumped = next_iso(new_iso, ceiling=cfg.ISO_CEIL)
+                    if bumped == new_iso:
+                        saturated = True
+                        break
+                    new_iso = bumped
+                    iso_gained += iso_step_ev
+                if new_iso != iso_floor:
+                    iso_bumped = True
+                iso = new_iso
+                self._camera.set_iso(iso)
+                # Keep FEC/EC at shot 2's settings (the probe values
+                # were diagnostic and we don't keep them).
+                if can_probe and (fec, ec) != (shot2_fec, shot2_ec):
+                    self._camera.set_fec(shot2_fec)
+                    if hasattr(self._camera, "set_ec"):
+                        self._camera.set_ec(shot2_ec)
+                    fec, ec = shot2_fec, shot2_ec
+                    ec_used = shot2_ec_used
+                _, last_delta = shoot("linear shot 4 (post ISO bump)")
+                converged = abs(last_delta) <= tolerance
+                if not converged and not saturated:
+                    # One more refinement after ISO bump. The flash
+                    # response is now (mostly) at the new ISO; a
+                    # FEC/EC adjustment by -last_delta should land us
+                    # within tolerance unless the rig is genuinely
+                    # nonlinear.
+                    refine_bias = (fec + ec) + (-last_delta)
+                    fec, ec, ec_used_rf = _distribute_bias(
+                        refine_bias,
+                        fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
+                        ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
+                    )
+                    ec_used = ec_used or ec_used_rf
+                    self._camera.set_fec(fec)
+                    if hasattr(self._camera, "set_ec"):
+                        self._camera.set_ec(ec)
+                    _, last_delta = shoot("linear shot 5 (refine post-ISO)")
+                    converged = abs(last_delta) <= tolerance
+        else:
+            # Slope healthy but |delta_1| was within tolerance and
+            # can_probe was False — accept.
+            converged = abs(delta_1) <= tolerance
+            last_delta = delta_1
+
+        return ApertureCalibration(
+            aperture=aperture,
+            fec_ev=fec,
+            iso=iso,
+            final_median=last_median,
+            final_ev_delta=last_delta,
+            hit_tolerance=converged,
+            iso_bumped=iso_bumped,
+            test_shots_taken=shots,
+            saturated_at_ceiling=saturated,
+            ec_ev=ec,
+            ec_used=ec_used,
+            iso_headroom_applied=False,
+            iso_headroom_attempted=False,
+            iso_headroom_attempt_ev=None,
+        ), baseline
+
     def _try_iso_headroom_swap(
         self,
         *,
@@ -1360,6 +1648,39 @@ def _snap(value: float, step: float) -> float:
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def _distribute_bias(
+    target_bias: float,
+    *,
+    fec_min: float,
+    fec_max: float,
+    fec_step: float,
+    ec_min: float,
+    ec_max: float,
+    ec_step: float,
+) -> tuple[float, float, bool]:
+    """Split a target exposure bias across FEC and (if needed) EC.
+
+    Used by the linear cascade to convert a single "I need +X EV"
+    decision into a concrete (FEC, EC) setting respecting the Z7's
+    asymmetric ranges (FEC: -3 to +1, EC: -3 to +3). FEC absorbs as
+    much as possible (it's the "primary" lever); EC picks up any
+    residual past FEC's limits. Each value is snapped to its own
+    ⅓-stop grid so the camera's PTP widget accepts it.
+
+    Returns ``(fec, ec, ec_used)``. ``ec_used`` is True when EC was
+    actually moved away from zero — useful for the cascade's result
+    summary so the operator can see whether the camera-side EC bias
+    is in play.
+    """
+    fec = _clamp(_snap(target_bias, fec_step), fec_min, fec_max)
+    remaining = target_bias - fec
+    if abs(remaining) < ec_step / 2.0:
+        return fec, 0.0, False
+    ec = _clamp(_snap(remaining, ec_step), ec_min, ec_max)
+    ec_used = abs(ec) > 1e-6
+    return fec, ec, ec_used
 
 
 def _calibration_filename(aperture: str, shot_index: int) -> str:

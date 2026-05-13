@@ -155,6 +155,18 @@ PLATEAU_DETECT_MIN_EV = 1.0     # don't fire on a single ⅓-stop bump
 # otherwise the calibrator reverts.
 ISO_HEADROOM_EV = 1.0
 
+# ---- Linear AA cascade -----------------------------------------------------
+# Replaces the legacy iterative cascade (greedy ``new_fec = fec - delta``
+# loop with plateau detection and FEC saturation fallback chain) with a
+# 3-5 shot linear-model cascade: probe at FEC=0, apply -delta, headroom-
+# probe, then either fine-tune or bump ISO. See
+# :meth:`Calibrator._calibrate_aperture_linear` for the algorithm.
+#
+# Enabled by default. The legacy iterative cascade is preserved in
+# :meth:`Calibrator._calibrate_aperture` and is reachable by setting
+# this flag to ``False``.
+LINEAR_CASCADE_ENABLED = True
+
 # ---- Sample planner --------------------------------------------------------
 # Minimum rail positions for a usable sweep. The advisor's bell-curve
 # detector needs at least ~10 points across the captured range to land

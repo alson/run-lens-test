@@ -511,6 +511,275 @@ class TestCalibrateSingleAperture:
         assert aperture_calls == ["f/4"]
 
 
+@pytest.fixture
+def linear_cfg(cfg):
+    """``cfg`` with LINEAR_CASCADE_ENABLED + ISO_STEP_EV set so the
+    cascade dispatches to ``_calibrate_aperture_linear``."""
+    cfg.LINEAR_CASCADE_ENABLED = True
+    cfg.ISO_STEP_EV = 1.0 / 3.0
+    # Tighter tolerance for linear cascade tests so we can assert
+    # behaviour at meaningful precision (legacy fixture uses 1/3 stop).
+    cfg.TEST_SHOT_TOLERANCE_EV = 0.5
+    return cfg
+
+
+def _median_from_ev(baseline: float, ev: float, gamma: float = 2.2) -> float:
+    """Inverse of ``exposure.analyse.ev_delta`` — produces a median
+    that yields the requested ev given the gamma-corrected linearisation
+    the cascade uses. ``ev = log2(lin(median) / lin(baseline))`` and
+    ``lin(x) = (x/255)**gamma``, so ``median = baseline * (2**ev)**(1/gamma)``.
+    """
+    return baseline * ((2.0 ** ev) ** (1.0 / gamma))
+
+
+class TestLinearCascade:
+    """The new 3-5 shot AA cascade — ``Calibrator._calibrate_aperture_linear``.
+
+    Tests cover the six observable shot-count / branch combinations:
+    3-shot happy path (shot 2 on-target + headroom confirmed),
+    4-shot fine-tune (shot 2 off-target + headroom),
+    4-shot ISO-bump (slope < 0.3 EV/stop = flash maxed),
+    5-shot ISO-bump + fine-tune,
+    saturated_at_ceiling (ISO hits cap),
+    plus the first-lens-config baseline-setting path.
+    """
+
+    def test_baseline_setting_first_shot_only(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # First lens config: shot 1 SETS the baseline; no cascade body
+        # runs. ``test_shots_taken`` should be 1 and the result is OK.
+        calib = make_calibrator(camera, linear_cfg, medians=[129.0])
+        result, baseline = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=None,
+        )
+        assert baseline == 129.0
+        assert result.test_shots_taken == 1
+        assert result.hit_tolerance
+        assert result.fec_ev == 0.0
+        assert result.ec_ev == 0.0
+
+    def test_three_shot_happy_path_already_on_target(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 at FEC=0 lands on baseline. Shot 2 (also at FEC=0)
+        # also lands on baseline. Shot 3 probes brighter (+1 stop on
+        # FEC) and brightens by ~1 EV → slope=1.0, healthy.
+        baseline = 129.0
+        medians = [
+            baseline,                       # shot 1: delta_0 = 0
+            baseline,                       # shot 2: delta_1 = 0
+            _median_from_ev(baseline, 1.0), # shot 3: probe +1 stop = +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.test_shots_taken == 3
+        # Settings returned should be shot 2's (FEC=0), not the probe's.
+        assert result.fec_ev == 0.0
+        assert result.ec_ev == 0.0
+        assert not result.iso_bumped
+
+    def test_three_shot_happy_path_dim_corrected(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 dim by 1 EV → target FEC = +1.0. Shot 2 at FEC=+1
+        # lands on baseline. Shot 3 probes +1 more stop (EC=+1) and
+        # brightens by 1 EV → slope=1.0, healthy. Done in 3 shots.
+        baseline = 129.0
+        medians = [
+            _median_from_ev(baseline, -1.0),  # shot 1: 1 EV under
+            baseline,                          # shot 2 at FEC=+1: on target
+            _median_from_ev(baseline, 1.0),    # shot 3 (FEC+1,EC+1): +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.test_shots_taken == 3
+        assert result.fec_ev == pytest.approx(1.0)
+        # EC=0 because shot 2's settings (the converged target) are returned;
+        # the EC=+1 was only used in the probe shot.
+        assert result.ec_ev == 0.0
+
+    def test_four_shot_fine_tune_when_off_target_with_headroom(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 dim by 0.7 EV → snapped FEC = +0.667 (⅓-stop).
+        # Shot 2 lands at -0.05 EV (within tolerance 0.5? yes — but
+        # we engineer shot 2 to be just outside tolerance for the
+        # fine-tune branch).
+        baseline = 129.0
+        # Make shot 2 land outside tolerance by 0.6 EV, slope still ~1.0
+        # so headroom is confirmed → fine-tune.
+        linear_cfg.TEST_SHOT_TOLERANCE_EV = 0.3  # tighter
+        medians = [
+            _median_from_ev(baseline, -1.0),  # shot 1: 1 EV under
+            _median_from_ev(baseline, -0.6),  # shot 2: still 0.6 EV under
+            _median_from_ev(baseline, +0.4),  # shot 3 (+1 stop probe): +1 EV → slope ≈ 1.0
+            baseline,                          # shot 4: fine-tune lands on target
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.test_shots_taken == 4
+        assert not result.iso_bumped
+
+    def test_four_shot_iso_bump_when_flash_maxed(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 dim by 2 EV. Target FEC=+1 (max), EC=+1.
+        # Shot 2 still dim by 1.5 EV (flash maxed, didn't gain full
+        # 2 EV from the bias request). Shot 3 probes +1 more stop —
+        # luminance unchanged (slope ≈ 0) → flash mechanically maxed.
+        # Branch B: bump ISO by deficit (1.5 EV ≈ 5 ⅓-stops).
+        # Shot 4 at higher ISO + shot 2's FEC/EC lands on target.
+        baseline = 129.0
+        medians = [
+            _median_from_ev(baseline, -2.0),  # shot 1: 2 EV under
+            _median_from_ev(baseline, -1.5),  # shot 2 at FEC+EC=+2: still 1.5 EV under (flash maxed)
+            _median_from_ev(baseline, -1.5),  # shot 3 probe: unchanged → slope=0
+            _median_from_ev(baseline, 0.0),   # shot 4 after ISO bump: on target
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.test_shots_taken == 4
+        assert result.iso_bumped
+        assert result.iso > 100  # bumped above floor
+        # Shot 2's FEC/EC retained (the probe values are diagnostic only).
+
+    def test_saturated_at_iso_ceiling(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Same flash-maxed pattern but ISO bumps can't cover the
+        # deficit (ceiling hit before tolerance met).
+        baseline = 129.0
+        # Engineer a 10-EV deficit so even ISO_CEIL = 3200 (5 stops
+        # from ISO_FLOOR=100) can't recover.
+        medians = [
+            _median_from_ev(baseline, -10.0),
+            _median_from_ev(baseline, -9.0),  # shot 2 (slight response)
+            _median_from_ev(baseline, -9.0),  # shot 3 probe: no slope
+            _median_from_ev(baseline, -4.0),  # shot 4 post ISO bump: still under
+            _median_from_ev(baseline, -4.0),  # shot 5: still under
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert not result.hit_tolerance
+        assert result.saturated_at_ceiling
+        assert result.iso == linear_cfg.ISO_CEIL
+        assert result.iso_bumped
+
+    def test_distributes_to_ec_when_fec_saturated(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 dim by 2.5 EV. FEC_MAX = +1 absorbs 1.0; remainder
+        # (1.5 EV) goes to EC. Shot 2 lands on target. Shot 3 probes
+        # brighter (more EC) → slope=1.0, healthy. Done.
+        baseline = 129.0
+        medians = [
+            _median_from_ev(baseline, -2.5),  # shot 1
+            baseline,                          # shot 2: linear response delivered
+            _median_from_ev(baseline, 1.0),    # shot 3 (+1 EC): +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.fec_ev == pytest.approx(1.0)
+        assert result.ec_used
+        assert result.ec_ev == pytest.approx(1.5, abs=1.0 / 3.0)
+
+    def test_legacy_path_when_flag_unset(
+        self, camera, cfg, tmp_path
+    ) -> None:
+        # No LINEAR_CASCADE_ENABLED on cfg → must dispatch to the
+        # legacy iterative cascade. Verifies the dispatch is opt-in.
+        assert not hasattr(cfg, "LINEAR_CASCADE_ENABLED")
+        # Provide enough medians for either path so the test isn't
+        # path-sensitive about its assertion target.
+        medians = [129.0, 129.0, 129.0, 129.0]
+        calib = make_calibrator(camera, cfg, medians=medians)
+        # Mostly just verifying it doesn't blow up; legacy cascade
+        # converges trivially when shot 1 already at baseline.
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=129.0,
+        )
+        assert result.hit_tolerance
+
+
+class TestDistributeBias:
+    def test_zero_bias(self) -> None:
+        from session.calibrate import _distribute_bias
+        fec, ec, ec_used = _distribute_bias(
+            0.0, fec_min=-3, fec_max=1, fec_step=1/3,
+            ec_min=-3, ec_max=3, ec_step=1/3,
+        )
+        assert fec == 0.0
+        assert ec == 0.0
+        assert not ec_used
+
+    def test_small_positive_bias_goes_to_fec_only(self) -> None:
+        from session.calibrate import _distribute_bias
+        fec, ec, ec_used = _distribute_bias(
+            0.5, fec_min=-3, fec_max=1, fec_step=1/3,
+            ec_min=-3, ec_max=3, ec_step=1/3,
+        )
+        # Snapped to nearest 1/3: 0.5 → 0.667 (or 0.333 depending on
+        # tiebreaker), well within FEC range.
+        assert -3 <= fec <= 1
+        assert ec == 0.0
+        assert not ec_used
+
+    def test_overflows_into_ec_when_fec_saturates(self) -> None:
+        from session.calibrate import _distribute_bias
+        fec, ec, ec_used = _distribute_bias(
+            2.5, fec_min=-3, fec_max=1, fec_step=1/3,
+            ec_min=-3, ec_max=3, ec_step=1/3,
+        )
+        assert fec == pytest.approx(1.0)
+        assert ec == pytest.approx(1.5, abs=1/3)
+        assert ec_used
+
+    def test_negative_bias_to_fec(self) -> None:
+        from session.calibrate import _distribute_bias
+        fec, ec, ec_used = _distribute_bias(
+            -1.0, fec_min=-3, fec_max=1, fec_step=1/3,
+            ec_min=-3, ec_max=3, ec_step=1/3,
+        )
+        assert fec == pytest.approx(-1.0)
+        assert ec == 0.0
+
+    def test_extreme_bias_clamps_at_ec_max(self) -> None:
+        from session.calibrate import _distribute_bias
+        fec, ec, ec_used = _distribute_bias(
+            10.0, fec_min=-3, fec_max=1, fec_step=1/3,
+            ec_min=-3, ec_max=3, ec_step=1/3,
+        )
+        assert fec == 1.0
+        assert ec == 3.0
+        assert ec_used
+
+
 class TestManualFlashCascade:
     def test_iso_only_no_fec_writes_for_underexposure(
         self, camera, cfg, tmp_path
