@@ -167,12 +167,23 @@ class Calibrator:
         config,
         shots_csv: ShotsCSV | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc),
+        progress: Callable[..., None] | None = None,
     ) -> None:
         self._camera = camera
         self._measure = measure
         self._config = config
         self._csv = shots_csv
         self._now = now
+        # progress(aperture, aperture_index, aperture_count, shot_index,
+        # shot_count_max, fec, ec, iso, last_ev, label) — see
+        # SessionRunner._calibration_progress for the production
+        # renderer. Default no-op so tests stay opaque to UI.
+        self._progress = progress or (lambda **kw: None)
+        # Per-aperture context the cascade fills in for the progress
+        # callback. ``Calibrator.run`` is the place that knows the
+        # aperture index/count; the cascade just reads these.
+        self._cal_aperture_index = 0
+        self._cal_aperture_count = 1
 
     # ---- Public entry point ------------------------------------------------
 
@@ -194,7 +205,10 @@ class Calibrator:
         baseline = baseline_median
         first_capture_dir = lens_dir / "calibration"
         first_capture_dir.mkdir(parents=True, exist_ok=True)
-        for aperture in apertures:
+        aperture_list = list(apertures)
+        self._cal_aperture_count = len(aperture_list)
+        for ap_idx, aperture in enumerate(aperture_list):
+            self._cal_aperture_index = ap_idx
             cal, baseline = self._calibrate_aperture(
                 aperture=aperture,
                 lens_slug=lens_slug,
@@ -1140,9 +1154,26 @@ class Calibrator:
         converged = False
         shots = 0
 
+        # Upper bound on shots — used by the progress renderer to
+        # size the bar. The cascade actually runs 3-5 shots.
+        SHOT_COUNT_MAX = 5
+
         def shoot(notes: str) -> tuple[float, float]:
             """Capture, measure, log. Returns (median, delta)."""
             nonlocal shots, last_median, last_delta
+            # Progress BEFORE capture so the user sees what's about to
+            # fire (FEC/EC/ISO currently set on the camera) and the
+            # last measured delta for context.
+            self._progress(
+                aperture=aperture,
+                aperture_index=self._cal_aperture_index,
+                aperture_count=self._cal_aperture_count,
+                shot_index=shots,
+                shot_count_max=SHOT_COUNT_MAX,
+                fec=fec, ec=ec, iso=iso,
+                last_ev=last_delta if shots > 0 else None,
+                label=notes,
+            )
             dest = capture_dir / _calibration_filename(aperture, shots)
             self._camera.capture_to(dest)
             median = self._measure(dest)
@@ -1228,28 +1259,50 @@ class Calibrator:
         slope_healthy = 0.7
         slope_maxed = 0.3
         if can_probe and slope >= slope_healthy:
-            # Headroom confirmed. Revert to shot 2's settings.
-            self._camera.set_fec(shot2_fec)
-            if hasattr(self._camera, "set_ec"):
-                self._camera.set_ec(shot2_ec)
-            fec, ec = shot2_fec, shot2_ec
-            ec_used = shot2_ec_used
-            if abs(delta_1) <= tolerance:
-                converged = True
+            # Headroom confirmed. **⅓-stop snap-error correction** —
+            # shot 2's snapped bias may have rounded the wrong way
+            # off the ideal target (snap error up to ⅙ EV). If
+            # |delta_1| > ⅙ EV (one half ⅓-stop), adjust the total
+            # bias by ⅓-stop in the appropriate direction and snap
+            # to the adjacent ⅓-stop position. This picks the better
+            # of the two ⅓-stop neighbours without taking another
+            # shot. Predicted delta = delta_1 ∓ 1/3 EV (slope=1
+            # assumption; close enough since the slope check above
+            # confirmed we're in linear regime).
+            shot2_total = shot2_fec + shot2_ec
+            sixth = fec_step / 2.0  # ⅙ EV when fec_step is ⅓
+            if abs(delta_1) <= sixth:
+                # Snap was favourable; keep shot 2's settings.
+                self._camera.set_fec(shot2_fec)
+                if hasattr(self._camera, "set_ec"):
+                    self._camera.set_ec(shot2_ec)
+                fec, ec = shot2_fec, shot2_ec
+                ec_used = shot2_ec_used
                 last_delta = delta_1
+                converged = True
             else:
-                # Fine-tune: distribute target_bias + (-delta_1).
-                ft_bias = (fec + ec) + (-delta_1)
-                fec, ec, ec_used_ft = _distribute_bias(
-                    ft_bias,
+                # Snap rounded the wrong way. Adjust ±⅓ stop and
+                # re-distribute. The sign of the adjustment makes
+                # the image change in the direction that reduces
+                # |delta|: bright image (delta > 0) → MORE negative
+                # bias; dim image (delta < 0) → MORE positive bias.
+                adjustment = -fec_step if delta_1 > 0 else +fec_step
+                refined_total = shot2_total + adjustment
+                refined_fec, refined_ec, refined_ec_used = _distribute_bias(
+                    refined_total,
                     fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
                     ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
                 )
-                ec_used = ec_used or ec_used_ft
-                self._camera.set_fec(fec)
+                self._camera.set_fec(refined_fec)
                 if hasattr(self._camera, "set_ec"):
-                    self._camera.set_ec(ec)
-                _, last_delta = shoot("linear shot 4 (fine-tune)")
+                    self._camera.set_ec(refined_ec)
+                fec, ec = refined_fec, refined_ec
+                ec_used = refined_ec_used
+                # Predicted delta after the ±⅓-stop adjustment.
+                # More positive bias → brighter image → delta += ⅓.
+                # More negative bias → darker image → delta -= ⅓.
+                # The sign of ``adjustment`` matches this directly.
+                last_delta = delta_1 + adjustment
                 converged = abs(last_delta) <= tolerance
         elif not can_probe or slope < slope_maxed or (slope < slope_healthy and abs(delta_1) > tolerance):
             # Flash maxed (or borderline + off-target). Bump ISO by
@@ -1683,8 +1736,13 @@ def _distribute_bias(
     is in play.
     """
     fec = _clamp(_snap(target_bias, fec_step), fec_min, fec_max)
-    # The Z7 rejects k=±7 (±2.333) for FEC. Substitute k=±6 (±2.0)
-    # and let the residual go to EC.
+    # The Z7 rejects k=±7 (±2.333) for FEC specifically (empirical;
+    # see tools/fec_acceptance_grid.py). Substitute k=±6 (±2.0)
+    # and let the residual go to EC. EC isn't checked here —
+    # ``NikonZ7._set_range``'s multi-form retry handles EC's
+    # representation quirks without changing the grid; if EC's
+    # k=±7 turn out to be similarly rejected, the readback there
+    # will raise so we can add an explicit substitution.
     fec_k = round(fec / fec_step) if fec_step > 0 else 0
     if fec_k == -7:
         fec = -2.0
@@ -1694,11 +1752,6 @@ def _distribute_bias(
     if abs(remaining) < ec_step / 2.0:
         return fec, 0.0, False
     ec = _clamp(_snap(remaining, ec_step), ec_min, ec_max)
-    ec_k = round(ec / ec_step) if ec_step > 0 else 0
-    if ec_k == -7:
-        ec = -2.0
-    elif ec_k == 7:
-        ec = 2.0
     ec_used = abs(ec) > 1e-6
     return fec, ec, ec_used
 

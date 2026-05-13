@@ -903,6 +903,7 @@ class SessionRunner:
             config=self.config,
             shots_csv=self.shots_csv,
             now=self.now,
+            progress=self._calibration_progress,
         )
         aggregate = CalibrationResult(
             baseline_median=self.baseline_median or 0.0
@@ -1231,6 +1232,7 @@ class SessionRunner:
             config=self.config,
             shots_csv=self.shots_csv,
             now=self.now,
+            progress=self._calibration_progress,
         )
         # Calibration retry loop. If any aperture fails to reach
         # tolerance, the user can adjust the rig and re-run
@@ -1244,6 +1246,7 @@ class SessionRunner:
                 apertures=apertures,
                 baseline_median=self.baseline_median,
             )
+            self._progress_done()  # newline after the inline cal progress bar
             self.baseline_median = cal_result.baseline_median
             if self.metadata is not None:
                 self.metadata.baseline_median_luminance = self.baseline_median
@@ -3437,6 +3440,72 @@ class SessionRunner:
         if sys.stdout.isatty():
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+    def _calibration_progress(
+        self,
+        *,
+        aperture: str,
+        aperture_index: int,
+        aperture_count: int,
+        shot_index: int,
+        shot_count_max: int,
+        fec: float,
+        ec: float,
+        iso,
+        last_ev: float | None,
+        label: str,
+    ) -> None:
+        """Inline progress bar for the AA calibration cascade.
+
+        Format::
+
+            [████░░░░░░░░░░░░░░░░] cal 1/5(probe) ap f/5.6 (1/4) \
+            FEC=+0.00 EC=+0.00 ISO=100 ev=+1.62
+
+        The bar fraction advances smoothly within each aperture's
+        shot sequence (shot_index / shot_count_max) and jumps cleanly
+        when the next aperture starts. ``label`` is the cascade's
+        own description of what this shot is for ("probe", "target",
+        "headroom probe", "fine-tune", "post ISO bump", "refine
+        post-ISO"); the renderer compresses it into a short tag.
+        ``last_ev`` is ``None`` before the first shot.
+
+        No-op when stdout isn't a TTY (e.g. logs / CI).
+        """
+        if not sys.stdout.isatty():
+            return
+        bar_width = 20
+        fraction = (
+            aperture_index + (shot_index / max(1, shot_count_max))
+        ) / max(1, aperture_count)
+        fraction = max(0.0, min(1.0, fraction))
+        filled = int(round(fraction * bar_width))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        # Compress the cascade's "linear shot N (label)" into a short
+        # tag: ``probe``/``target``/``headroom``/``fine``/``iso``/``refine``.
+        # Falls back to the raw label if no keyword matches.
+        tag = label
+        for keyword, short in (
+            ("probe FEC=0", "probe"),
+            ("target", "target"),
+            ("headroom", "headroom"),
+            ("fine-tune", "fine"),
+            ("post ISO bump", "iso-bump"),
+            ("refine post-ISO", "refine"),
+            ("baseline", "baseline"),
+        ):
+            if keyword in label.lower():
+                tag = short
+                break
+        ec_str = f"EC={ec:+.2f} " if abs(ec) > 1e-6 else ""
+        ev_str = f"ev={last_ev:+.2f}" if last_ev is not None else "ev=    "
+        line = (
+            f"\r[{bar}] cal {shot_index + 1}/{shot_count_max}({tag})  "
+            f"ap {aperture} ({aperture_index + 1}/{aperture_count})  "
+            f"FEC={fec:+.2f} {ec_str}ISO={iso}  {ev_str}"
+        )
+        sys.stdout.write(line + "\x1b[K")
+        sys.stdout.flush()
 
     def _make_session_id(self) -> str:
         return self.now().strftime("%Y-%m-%d_%H%M%S")

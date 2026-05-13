@@ -612,18 +612,20 @@ class TestLinearCascade:
         self, camera, linear_cfg, tmp_path
     ) -> None:
         # Shot 1 dim by 0.7 EV → snapped FEC = +0.667 (⅓-stop).
-        # Shot 2 lands at -0.05 EV (within tolerance 0.5? yes — but
-        # we engineer shot 2 to be just outside tolerance for the
-        # fine-tune branch).
+        # Make shot 2 land outside the ⅙-EV "snap-favorable" band
+        # but inside ⅓+⅙ EV so the ±⅓-stop refinement nails it in
+        # 3 shots (predicted_delta within tolerance). Verifies the
+        # snap-error-correction branch in Branch A — no shot 4
+        # needed because the refinement's prediction is within
+        # tolerance.
         baseline = 129.0
-        # Make shot 2 land outside tolerance by 0.6 EV, slope still ~1.0
-        # so headroom is confirmed → fine-tune.
-        linear_cfg.TEST_SHOT_TOLERANCE_EV = 0.3  # tighter
+        # |delta_1| = 0.25 EV is above ⅙ (0.167) so refinement
+        # fires, and predicted_delta after ±⅓-stop = 0.25 - 0.333
+        # = -0.083, comfortably within the cfg tolerance of 0.5.
         medians = [
-            _median_from_ev(baseline, -1.0),  # shot 1: 1 EV under
-            _median_from_ev(baseline, -0.6),  # shot 2: still 0.6 EV under
-            _median_from_ev(baseline, +0.4),  # shot 3 (+1 stop probe): +1 EV → slope ≈ 1.0
-            baseline,                          # shot 4: fine-tune lands on target
+            _median_from_ev(baseline, -1.0),    # shot 1: 1 EV under
+            _median_from_ev(baseline, +0.25),   # shot 2: snapped wrong way, 0.25 EV bright
+            _median_from_ev(baseline, +1.25),   # shot 3 probe: +1 EV gain → slope ≈ 1.0
         ]
         calib = make_calibrator(camera, linear_cfg, medians=medians)
         result, _ = calib._calibrate_aperture(
@@ -631,8 +633,14 @@ class TestLinearCascade:
             capture_dir=tmp_path, baseline=baseline,
         )
         assert result.hit_tolerance
-        assert result.test_shots_taken == 4
+        # 3 shots: probe + target + headroom. Refinement applied
+        # without a 4th capture (snap-error correction).
+        assert result.test_shots_taken == 3
         assert not result.iso_bumped
+        # Refined FEC = shot 2's FEC shifted by -⅓ stop (image was
+        # bright, so we apply more negative bias).
+        # delta_1 was +0.25 → adjustment = -⅓ → predicted_delta ≈ -0.083.
+        assert result.final_ev_delta == pytest.approx(0.25 - 1.0 / 3.0, abs=1e-6)
 
     def test_four_shot_iso_bump_when_flash_maxed(
         self, camera, linear_cfg, tmp_path
