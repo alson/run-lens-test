@@ -172,6 +172,88 @@ class TestEarliestUnderexposedStep:
         assert d.earliest_underexposed_step(-0.7) is None
 
 
+# ---- Two-sided detection (over-exposure) -----------------------------------
+
+
+class TestOverExposureCriteria:
+    """Mirror criteria with positive thresholds. Over-trips fire on
+    rig-state shifts (e.g. flash bumped during a battery swap) and
+    carry ``direction="over"`` so the runner can branch to silent
+    re-calibration."""
+
+    def test_severe_over_trips_on_single_shot(self) -> None:
+        d = DroopDetector(
+            window=10,
+            criteria=((1, -2.0), (2, -0.7), (1, +2.0), (2, +0.7)),
+        )
+        d.push("f/4", 0.0)
+        evt = d.push("f/4", +2.5)
+        assert evt is not None
+        assert evt.direction == "over"
+        assert evt.threshold == pytest.approx(+2.0)
+
+    def test_moderate_over_trips_on_two_shots(self) -> None:
+        d = DroopDetector(
+            window=10,
+            criteria=((1, -2.0), (2, -0.7), (1, +2.0), (2, +0.7)),
+        )
+        d.push("f/4", 0.0)
+        assert d.push("f/4", +0.8) is None
+        evt = d.push("f/4", +0.9)
+        assert evt is not None
+        assert evt.direction == "over"
+        assert evt.threshold == pytest.approx(+0.7)
+
+    def test_under_and_over_can_coexist(self) -> None:
+        d = DroopDetector(
+            window=10,
+            criteria=((1, -2.0), (2, -0.7), (1, +2.0), (2, +0.7)),
+        )
+        # Mix of under and over readings — over crit fires when 2 ≥
+        # +0.7 accumulate, regardless of negative samples interspersed.
+        assert d.push("f/4", 0.0) is None
+        assert d.push("f/4", -0.5) is None
+        assert d.push("f/4", +0.8) is None
+        evt = d.push("f/4", +0.9)
+        assert evt is not None
+        assert evt.direction == "over"
+
+    def test_explicit_direction_overrides_sign_inference(self) -> None:
+        from exposure.droop import TripCriterion
+        # Zero threshold with explicit direction.
+        crit = TripCriterion(count=1, ev_threshold=0.0, direction="over")
+        assert crit.direction == "over"
+        crit2 = TripCriterion(count=1, ev_threshold=0.0, direction="under")
+        assert crit2.direction == "under"
+
+
+# ---- earliest_anomalous_step (two-sided rewind search) --------------------
+
+
+class TestEarliestAnomalousStep:
+    def test_under_direction_matches_legacy_helper(self) -> None:
+        d = DroopDetector(window=10, criteria=())
+        d.push("f/4", -0.1, step_index=0)
+        d.push("f/4", -0.8, step_index=2)
+        d.push("f/4", -0.9, step_index=3)
+        assert d.earliest_anomalous_step(-0.7, direction="under") == 2
+        # Legacy alias returns the same result.
+        assert d.earliest_underexposed_step(-0.7) == 2
+
+    def test_over_direction_finds_min_step_above_threshold(self) -> None:
+        d = DroopDetector(window=10, criteria=())
+        d.push("f/4", +0.1, step_index=0)
+        d.push("f/4", +0.8, step_index=2)
+        d.push("f/4", +0.5, step_index=3)
+        d.push("f/4", +0.9, step_index=5)
+        assert d.earliest_anomalous_step(+0.7, direction="over") == 2
+
+    def test_invalid_direction_raises(self) -> None:
+        d = DroopDetector(window=10, criteria=())
+        with pytest.raises(ValueError):
+            d.earliest_anomalous_step(0.0, direction="sideways")
+
+
 # ---- Construction validation ----------------------------------------------
 
 
@@ -179,3 +261,19 @@ class TestConstruction:
     def test_window_must_be_positive(self) -> None:
         with pytest.raises(ValueError):
             DroopDetector(window=0, criteria=())
+
+    def test_three_tuple_criterion_with_explicit_direction(self) -> None:
+        d = DroopDetector(
+            window=5,
+            criteria=((1, 0.0, "over"),),
+        )
+        # Zero threshold + over → any non-negative push trips.
+        evt = d.push("f/4", +0.5)
+        assert evt is not None
+        assert evt.direction == "over"
+
+    def test_legacy_two_tuple_auto_derives_direction(self) -> None:
+        d = DroopDetector(window=5, criteria=((1, -1.0),))
+        evt = d.push("f/4", -1.5)
+        assert evt is not None
+        assert evt.direction == "under"

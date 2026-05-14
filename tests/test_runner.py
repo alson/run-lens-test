@@ -1169,6 +1169,10 @@ class TestDroopPause:
         camera = FakeCamera(apertures=["f/4"])
         rail = FakeRail()
         # Sweep: severe trip at step 2 (median 25 → ≈-4.4 EV).
+        # Each droop trip now includes a post-pause sanity capture
+        # before the reshoot proper. Sanity sees the same "still
+        # under" frame so no re-cal is triggered (under-direction
+        # sanity only triggers re-cal if it flips to OVER).
         # Outer reshoot covers [2..2]; reshoot also under (still no
         # battery swap) → nested reshoot. Nested also under → nested-
         # nested reshoot. THIS time the user finally swaps. Sweep
@@ -1178,8 +1182,11 @@ class TestDroopPause:
             100.0,    # step 0 sweep ok
             100.0,    # step 1 sweep ok
             25.0,     # step 2 sweep — severe trip
+            25.0,     # outer post-pause sanity (still under, no re-cal)
             25.0,     # outer reshoot at step 2 — still bad, recurses
+            25.0,     # 2nd nested sanity (still under, no re-cal)
             25.0,     # 2nd nested reshoot at step 2 — still bad
+            25.0,     # 3rd nested sanity (still under, no re-cal)
             100.0,    # 3rd nested reshoot at step 2 — fresh batteries
             100.0,    # sweep step 3 ok
         ]
@@ -1218,6 +1225,169 @@ class TestDroopPause:
         droop_prompts = [m for m in confirm_calls if "droop" in m.lower()]
         assert len(droop_prompts) == 3
 
+    def test_over_exposure_triggers_recalibration_no_prompt(
+        self, cfg, tmp_path
+    ) -> None:
+        # Sweep frames jump to +0.7 EV after a hypothetical rig
+        # bump. With DROOP_OVER_CRIT_B = (2, +0.7) two consecutive
+        # over-exposed shots trip the moderate-over criterion. The
+        # runner must NOT prompt the user (no battery swap needed);
+        # it should re-calibrate silently and reshoot.
+        cfg.DROOP_OVER_CRIT_A = (1, +2.0)
+        cfg.DROOP_OVER_CRIT_B = (2, +0.7)
+        cfg.DROOP_REWIND_TOLERANCE_EV = 0.3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        # 5-step sweep. Steps 0 and 1 clean. Steps 2 and 3 over by
+        # +0.7 EV (median ≈ 162 — but precision matters: ev_delta(165,
+        # 100) ≈ +1.6, so use median 130 → ev ≈ +0.83 to trigger).
+        # 2nd trip lands at step 3 → reshoot steps 2..3, no prompt.
+        medians = [
+            100.0,    # cal
+            100.0,    # step 0 sweep ok
+            100.0,    # step 1 sweep ok
+            130.0,    # step 2 sweep — 1st ≥ +0.7 (≈+0.83 EV)
+            130.0,    # step 3 sweep — 2nd → over-trip
+            # No sanity check on over-trip; goes straight to re-cal.
+            # Re-cal at current rail position (linear cascade: shot 1
+            # at fec=0, shot 2 target, shot 3 headroom probe).
+            100.0,    # re-cal shot 1 (probe at fec=0): lands at baseline
+            100.0,    # re-cal shot 2 (target, no adjustment needed)
+            100.0,    # re-cal shot 3 (headroom probe)
+            # Reshoot steps 2..3:
+            100.0,    # reshoot step 2
+            100.0,    # reshoot step 3
+            # Sweep continues:
+            100.0,    # step 4
+        ]
+        confirm_calls: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 5, "end_mm": 4.0},
+        )
+
+        def _confirm(msg: str) -> bool:
+            confirm_calls.append(msg)
+            return True
+
+        runner.confirm = _confirm
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.config = cfg  # ensure new over criteria are visible
+        runner.run()
+
+        # Critical: no "Battery droop" prompt for the over-exposure
+        # trip — the runner re-calibrates without involving the user.
+        droop_prompts = [c for c in confirm_calls if "Battery droop" in c]
+        assert len(droop_prompts) == 0
+        # Reshoot rows must exist for the firing step (3) and the
+        # rewind-target (2).
+        rows = runner.shots_csv.read_rows()
+        reshoot_steps = sorted({
+            int(r["rail_step"]) for r in rows if r["phase"] == "reshoot"
+        })
+        assert reshoot_steps == [2, 3]
+
+    def test_under_trip_post_pause_sanity_over_triggers_recal(
+        self, cfg, tmp_path
+    ) -> None:
+        # Under-trip fires, user pauses + swaps batteries. After the
+        # swap the rig is over-exposed by ~+0.7 EV (e.g. flash A was
+        # bumped during the swap). Sanity check catches this and
+        # triggers re-cal before the reshoot.
+        cfg.DROOP_REWIND_TOLERANCE_EV = 0.3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        medians = [
+            100.0,    # cal f/4 at fec=0 → baseline
+            100.0,    # step 0 sweep
+            25.0,     # step 1 sweep — severe under → trip
+            # Post-pause sanity capture at f/4 with cal settings —
+            # comes back over (+0.83 EV). Triggers re-cal.
+            130.0,
+            # Re-cal at current rail position (linear cascade
+            # consumes shots until convergence — all clean now):
+            100.0,    # re-cal shot 1
+            100.0,    # re-cal shot 2
+            100.0,    # re-cal shot 3 (headroom probe)
+            # Reshoot step 1 with new cal:
+            100.0,
+            # Sweep step 2 ok:
+            100.0,
+        ]
+        confirm_calls: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 3, "end_mm": 2.0},
+        )
+        runner.confirm = lambda msg: (confirm_calls.append(msg) or True)
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        sanity_rows = [
+            r for r in rows
+            if "post-droop sanity check" in r.get("notes", "")
+        ]
+        # Sanity check row was logged with phase=calibration.
+        assert len(sanity_rows) == 1
+        assert sanity_rows[0]["phase"] == "calibration"
+        # Reshoot exists for step 1.
+        reshoot_steps = sorted({
+            int(r["rail_step"]) for r in rows if r["phase"] == "reshoot"
+        })
+        assert 1 in reshoot_steps
+
+    def test_rewind_uses_tolerance_not_firing_threshold(
+        self, cfg, tmp_path
+    ) -> None:
+        # Severe trip at step 3 fires criterion A (-2.0). Earlier
+        # steps had mild-under shots in the rewind tolerance band
+        # (-0.3 to -2.0). Previously the rewind would only cover the
+        # firing step itself; now it should rewind to the FIRST
+        # frame past ±DROOP_REWIND_TOLERANCE_EV (0.3 EV).
+        cfg.DROOP_REWIND_TOLERANCE_EV = 0.3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        medians = [
+            100.0,    # cal
+            100.0,    # step 0 ok
+            80.0,     # step 1 → ev ≈ -0.7 (past 0.3 tol)
+            85.0,     # step 2 → ev ≈ -0.5 (past 0.3 tol)
+            25.0,     # step 3 → severe trip (≤ -2.0)
+            # Post-pause sanity (under, no re-cal since not flipped):
+            25.0,
+            # Reshoot steps 1..3 (the rewind should land on step 1
+            # because that's the earliest frame ≤ -0.3 EV):
+            100.0, 100.0, 100.0,
+            # Sweep step 4:
+            100.0,
+        ]
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 5, "end_mm": 4.0},
+        )
+        runner.confirm = lambda _msg: True
+        runner.prompt_lens_config = (lambda calls={"n": 0}: (
+            calls.update(n=calls["n"] + 1) or ("L" if calls["n"] == 1 else None)
+        ))
+        runner.run()
+
+        rows = runner.shots_csv.read_rows()
+        reshoot_steps = sorted({
+            int(r["rail_step"]) for r in rows if r["phase"] == "reshoot"
+        })
+        # CRITICAL: rewind extends back to step 1, not just step 3.
+        # The old code (event.threshold = -2.0) would only have
+        # reshot step 3.
+        assert reshoot_steps == [1, 2, 3]
+
     def test_severe_trip_on_first_replica_skips_remaining_replicas(
         self, cfg, tmp_path
     ) -> None:
@@ -1234,14 +1404,17 @@ class TestDroopPause:
         # Single aperture, 3-step sweep.
         # Step 0: 3 replicas at 100 (clean).
         # Step 1: replica 0 = 25 (severe trip, no more replicas).
-        # _handle_droop: restart_step=1, current=1 → reshoot just
-        #   step 1 (3 fresh replicas).
+        # _handle_droop: post-pause sanity capture (still under but
+        #   under-direction → no re-cal triggered), then reshoot
+        #   just step 1 (3 fresh replicas).
         # Step 2: 3 replicas at 100 (clean).
         medians = [
             100.0,                     # cal f/4
             # Step 0 (3 replicas):
             100.0, 100.0, 100.0,
             # Step 1 sweep (replica 0 captured before trip):
+            25.0,
+            # Post-pause sanity check (under → no re-cal):
             25.0,
             # Step 1 reshoot (3 replicas, fresh batteries):
             100.0, 100.0, 100.0,
@@ -1278,10 +1451,10 @@ class TestDroopPause:
         ]
         assert len(step1_reshoot) == 3
         # Total capture events for the session:
-        # 1 cal + 3 step 0 + 1 step 1 sweep (short-circuit) + 3 step 1
-        # reshoot + 3 step 2 = 11.
+        # 1 cal + 3 step 0 + 1 step 1 sweep (short-circuit) +
+        # 1 post-pause sanity + 3 step 1 reshoot + 3 step 2 = 12.
         capture_count = sum(1 for k, _ in camera.history if k == "capture")
-        assert capture_count == 11
+        assert capture_count == 12
 
     def test_resume_reshoots_from_first_underexposed_step(
         self, cfg, tmp_path

@@ -207,6 +207,14 @@ class Calibrator:
         first_capture_dir.mkdir(parents=True, exist_ok=True)
         aperture_list = list(apertures)
         self._cal_aperture_count = len(aperture_list)
+        # Carry-over state for the linear cascade: previous aperture's
+        # final FEC/EC/ISO seed the next aperture's shot 1 so the rig
+        # usually lands on target in one shot. ISO is monotonically
+        # raised (a stop-down aperture can only need more sensitivity,
+        # never less, when the flash is at the same setting).
+        prev_fec: float = 0.0
+        prev_ec: float = 0.0
+        prev_iso: int | None = None
         for ap_idx, aperture in enumerate(aperture_list):
             self._cal_aperture_index = ap_idx
             cal, baseline = self._calibrate_aperture(
@@ -215,8 +223,14 @@ class Calibrator:
                 session_id=session_id,
                 capture_dir=first_capture_dir,
                 baseline=baseline,
+                prev_fec=prev_fec,
+                prev_ec=prev_ec,
+                prev_iso=prev_iso,
             )
             result.per_aperture[aperture] = cal
+            prev_fec = cal.fec_ev
+            prev_ec = cal.ec_ev
+            prev_iso = cal.iso
         result.baseline_median = baseline or 0.0
         return result
 
@@ -670,6 +684,9 @@ class Calibrator:
         baseline: float | None,
         set_aperture_via_camera: bool = True,
         flash_mode: str = "aa",
+        prev_fec: float = 0.0,
+        prev_ec: float = 0.0,
+        prev_iso: int | None = None,
     ) -> tuple[ApertureCalibration, float | None]:
         """Calibrate ISO/FEC/EC at one aperture and return the result.
 
@@ -685,6 +702,13 @@ class Calibrator:
         lenses on Z7 since the body can't communicate aperture to
         the flash). In flash-M, FEC and EC have no effect; ISO is
         the only useful exposure knob.
+
+        ``prev_fec`` / ``prev_ec`` / ``prev_iso``: previous aperture's
+        calibrated values. The linear cascade seeds shot 1 with these
+        so the rig usually lands on target in one shot (stopping down
+        in unit steps preserves rig characteristics). ``prev_iso``
+        also acts as a floor — ISO is monotonically raised across
+        apertures since a stop-down only needs more sensitivity.
         """
         if flash_mode == "manual":
             return self._calibrate_aperture_manual_flash(
@@ -704,6 +728,9 @@ class Calibrator:
                 capture_dir=capture_dir,
                 baseline=baseline,
                 set_aperture_via_camera=set_aperture_via_camera,
+                prev_fec=prev_fec,
+                prev_ec=prev_ec,
+                prev_iso=prev_iso,
             )
         ap_float = _parse_aperture(aperture)
         iso = self._initial_iso(ap_float)
@@ -1080,6 +1107,9 @@ class Calibrator:
         capture_dir: Path,
         baseline: float | None,
         set_aperture_via_camera: bool = True,
+        prev_fec: float = 0.0,
+        prev_ec: float = 0.0,
+        prev_iso: int | None = None,
     ) -> tuple[ApertureCalibration, float | None]:
         """3-5 shot linear-model AA calibration.
 
@@ -1125,11 +1155,21 @@ class Calibrator:
         """
         cfg = self._config
         ap_float = _parse_aperture(aperture)
-        iso_floor = self._initial_iso(ap_float)
+        baseline_iso = self._initial_iso(ap_float)
+        # Carry-over ISO: a smaller aperture can only ever need at
+        # least as much sensitivity as the prior aperture (flash at
+        # same setting → less light reaches sensor). max(prev, baseline)
+        # avoids the cascade re-discovering the bump on every aperture.
+        if prev_iso is not None:
+            iso_floor = max(baseline_iso, int(prev_iso))
+        else:
+            iso_floor = baseline_iso
         iso = iso_floor
 
-        fec = 0.0
-        ec = 0.0
+        # Carry-over FEC/EC: previous aperture's converged bias usually
+        # lands within ⅙ EV at the next stop-down. Snap + clamp so the
+        # carried values are on the valid grid even if config bounds
+        # changed between sessions.
         ec_min = float(getattr(cfg, "EC_MIN_EV", -3.0))
         ec_max = float(getattr(cfg, "EC_MAX_EV", 3.0))
         ec_step = float(getattr(cfg, "EC_STEP_EV", 1.0 / 3.0))
@@ -1138,6 +1178,8 @@ class Calibrator:
         fec_step = float(cfg.FEC_STEP_EV)
         tolerance = float(cfg.TEST_SHOT_TOLERANCE_EV)
         iso_step_ev = float(getattr(cfg, "ISO_STEP_EV", 1.0 / 3.0))
+        fec = _clamp(_snap(prev_fec, fec_step), fec_min, fec_max)
+        ec = _clamp(_snap(prev_ec, ec_step), ec_min, ec_max)
 
         if set_aperture_via_camera:
             self._camera.set_aperture(aperture)
@@ -1149,7 +1191,7 @@ class Calibrator:
         last_median = 0.0
         last_delta = 0.0
         iso_bumped = False
-        ec_used = False
+        ec_used = abs(ec) > 1e-6
         saturated = False
         converged = False
         shots = 0
@@ -1201,8 +1243,12 @@ class Calibrator:
             )
             return median, delta
 
-        # ---- Shot 1: probe at FEC=0 ----------------------------------
-        median, delta_0 = shoot("linear shot 1 (probe FEC=0)")
+        # ---- Shot 1: probe at carried-over FEC/EC --------------------
+        # When prev_fec/prev_ec are 0 (first aperture of first lens
+        # config, or no carry), this is the original FEC=0 probe.
+        # Otherwise we start from the prior aperture's converged bias
+        # — usually within ⅙ EV of target, so shot 2 can be skipped.
+        median, delta_0 = shoot("linear shot 1 (probe at prev FEC/EC)")
         if baseline is None:
             # First lens config: this shot SETS the baseline; no
             # further work for this aperture.
@@ -1210,20 +1256,35 @@ class Calibrator:
                 aperture=aperture, fec_ev=fec, iso=iso,
                 final_median=median, final_ev_delta=0.0,
                 hit_tolerance=True, iso_bumped=False,
-                test_shots_taken=1, ec_ev=ec, ec_used=False,
+                test_shots_taken=1, ec_ev=ec, ec_used=ec_used,
             ), median
 
-        # ---- Compute target & shot 2 ---------------------------------
-        target_bias = -delta_0
-        fec, ec, ec_used = _distribute_bias(
-            target_bias,
-            fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
-            ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
-        )
-        self._camera.set_fec(fec)
-        if hasattr(self._camera, "set_ec"):
-            self._camera.set_ec(ec)
-        _, delta_1 = shoot("linear shot 2 (target)")
+        # **Shortcut**: if shot 1 already landed within ⅙ EV (one
+        # half ⅓-stop, i.e. snap-favourable distance), the carried-
+        # over FEC/EC nailed it. Skip the shot-2 target adjustment;
+        # go straight to the shot-3-style headroom probe so we still
+        # verify the flash isn't mechanically maxed.
+        sixth = fec_step / 2.0
+        if abs(delta_0) <= sixth:
+            target_bias = 0.0
+            delta_1 = delta_0
+            # ec_used / fec / ec already reflect carried-over state.
+        else:
+            # ---- Compute target & shot 2 -----------------------------
+            target_bias = -delta_0
+            # Existing FEC/EC bias must be ADDED to the bias delta the
+            # snap-and-distribute helper produces. Equivalent to:
+            # solve for total_bias = (fec + ec) - delta_0.
+            absolute_target = (fec + ec) + target_bias
+            fec, ec, ec_used = _distribute_bias(
+                absolute_target,
+                fec_min=fec_min, fec_max=fec_max, fec_step=fec_step,
+                ec_min=ec_min, ec_max=ec_max, ec_step=ec_step,
+            )
+            self._camera.set_fec(fec)
+            if hasattr(self._camera, "set_ec"):
+                self._camera.set_ec(ec)
+            _, delta_1 = shoot("linear shot 2 (target)")
 
         # ---- Shot 3: headroom probe ----------------------------------
         # Probe in the same sign as the original adjustment, by one

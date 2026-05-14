@@ -2485,16 +2485,36 @@ class SessionRunner:
         """Return ``self.droop_detector`` if one was injected (tests),
         otherwise build a fresh one from the config-driven window +
         trip criteria. Used wherever the runner needs a detector
-        instance — phase A, the main sweep, etc."""
-        return self.droop_detector or DroopDetector(
+        instance — phase A, the main sweep, etc.
+
+        Over-exposure criteria are optional in config (older configs
+        only have under criteria); when absent the detector runs
+        under-only, matching legacy behaviour.
+        """
+        if self.droop_detector is not None:
+            return self.droop_detector
+        criteria: list = [
+            self.config.DROOP_CRIT_A,
+            self.config.DROOP_CRIT_B,
+        ]
+        over_a = getattr(self.config, "DROOP_OVER_CRIT_A", None)
+        over_b = getattr(self.config, "DROOP_OVER_CRIT_B", None)
+        if over_a is not None:
+            criteria.append(over_a)
+        if over_b is not None:
+            criteria.append(over_b)
+        return DroopDetector(
             window=self.config.ROLLING_WINDOW,
-            criteria=(self.config.DROOP_CRIT_A, self.config.DROOP_CRIT_B),
+            criteria=tuple(criteria),
         )
 
     def _droop_alert_and_pause(self, event: DroopEvent) -> None:
         """Send the ntfy notification, play the local chirp, and
-        prompt the user to swap batteries. Common to droop trips
-        from any phase (sweep, reshoot, probe).
+        prompt the user to swap batteries. Common to **under**-exposure
+        droop trips from any phase (sweep, reshoot, probe).
+
+        Over-exposure trips do NOT call this — they branch to silent
+        re-calibration in :meth:`_handle_droop`.
 
         Raises :class:`SessionAborted` if the user picks ``q``.
         """
@@ -2540,26 +2560,85 @@ class SessionRunner:
         the inner aperture loop. Returns ``False`` when no rewind was
         needed (droop fired on the first sample at the current step)
         — caller continues with ``aborted=True`` per the existing
-        skip-the-rest-of-this-step semantics."""
-        self._droop_alert_and_pause(event)
-        # Find the earliest step (across all apertures) whose EV ≤
-        # the firing trip threshold. ``window_snapshot`` is the
-        # firing aperture's window only; ``earliest_underexposed_step``
-        # consults all. We always reshoot at least the current step:
-        # the trip means we just captured an under-exposed frame
-        # here, and leaving it on disk would pollute the sharpness
-        # dataset. If the window also contains earlier under-exposed
-        # steps (typical of moderate trips that drift in over a few
-        # shots), rewind further to cover those too.
-        restart_step = droop.earliest_underexposed_step(event.threshold)
+        skip-the-rest-of-this-step semantics.
+
+        Branches on ``event.direction``:
+
+        * ``"under"`` (battery droop) — prompt the user to swap
+          batteries, then take a single sanity-check capture at the
+          current rail position and compare to the firing aperture's
+          calibrated reference. If the sanity capture is still off-
+          tolerance (rig also shifted during the swap pause), re-run
+          the calibrator at the current rail position before the
+          reshoot.
+        * ``"over"`` (rig-state shift, e.g. flash bumped during a
+          prior pause) — skip the battery prompt entirely and re-run
+          the calibrator at the current rail position before
+          reshooting.
+
+        Rewind extent uses ``DROOP_REWIND_TOLERANCE_EV`` (default
+        0.3 EV) rather than the firing criterion's threshold, so
+        mildly-tainted frames preceding the trip also get reshot.
+        """
+        direction = getattr(event, "direction", "under")
+        rewind_tol = float(
+            getattr(self.config, "DROOP_REWIND_TOLERANCE_EV", 0.3)
+        )
+
+        if direction == "over":
+            self._droop_over_announce(event)
+        else:
+            self._droop_alert_and_pause(event)
+
+        # Find the rewind extent. Rewind tolerance is intentionally
+        # tighter than the firing threshold: a severe -2 EV trip
+        # would otherwise only rewind to itself, leaving mildly-
+        # under (-0.5 EV) preceding frames in the dataset. Direction
+        # mirrors the trip direction.
+        rewind_threshold = -rewind_tol if direction == "under" else +rewind_tol
+        restart_step = droop.earliest_anomalous_step(
+            rewind_threshold, direction=direction,
+        )
         if restart_step is None or restart_step > current_step_index:
-            # Defensive: trip implies at least one push ≤ threshold,
-            # so restart_step should always be <= current_step_index.
-            # Fall back to current step if the search came up empty.
+            # Defensive: the firing sample is always in the window
+            # at or past the threshold, so this should always find
+            # something. Fall back to current step.
             restart_step = current_step_index
+
+        # Optionally re-calibrate before reshooting. Over-exposure
+        # always triggers re-cal (rig state changed silently); under-
+        # exposure does a sanity capture first and only re-cals if
+        # that capture is now on the OPPOSITE side (positive EV =
+        # rig shifted during the battery-swap pause). A sanity that
+        # is still under just means the swap didn't fix the droop —
+        # the reshoot will trip droop again and prompt the user.
+        recalibrated = False
+        if direction == "over":
+            self._recalibrate_at_current_position(
+                lens_dir=lens_dir, slug=slug, apertures=apertures,
+                calibration=calibration,
+            )
+            recalibrated = True
+        else:
+            sanity_ev = self._post_pause_sanity_ev(
+                lens_dir=lens_dir, slug=slug,
+                aperture=event.aperture,
+                cal=calibration.per_aperture.get(event.aperture),
+                tolerance_ev=rewind_tol,
+            )
+            if sanity_ev is not None and sanity_ev > rewind_tol:
+                # Post-pause sanity is over-exposed → rig shifted
+                # during the pause (flash moved, sensor obstructed,
+                # commander setting changed). Re-cal to absorb it.
+                self._recalibrate_at_current_position(
+                    lens_dir=lens_dir, slug=slug, apertures=apertures,
+                    calibration=calibration,
+                )
+                recalibrated = True
+
         # Reset the droop window before reshooting so the nested
         # reshoot starts from a clean slate; if its captures are
-        # still under-exposed the new samples will trip droop again
+        # still off-tolerance the new samples will trip droop again
         # and recurse further.
         droop.reset_all()
         self._reshoot_steps(
@@ -2574,10 +2653,170 @@ class SessionRunner:
             droop=droop,
         )
         droop.reset_all()
-        # Reshoot now always covers the current step's apertures,
-        # so the caller can skip the rest of its inner aperture
-        # loop unconditionally.
         return True
+
+    def _droop_over_announce(self, event: DroopEvent) -> None:
+        """Notify (ntfy + log) for an over-exposure trip. No user
+        prompt — re-calibration runs automatically."""
+        msg = (
+            f"Over-exposure on {event.aperture}: {event.triggered_count} of last "
+            f"{len(event.window_snapshot)} shots ≥ {event.threshold:+.1f} EV. "
+            f"Re-calibrating without pause."
+        )
+        if self.ntfy is not None:
+            self.ntfy.with_body(BATTERY_DROOP, msg)
+        self._announce(msg)
+        wav_path = getattr(self.config, "ALERT_WAV", None)
+        if wav_path is not None:
+            try:
+                play_alert(wav_path)
+            except Exception:                            # noqa: BLE001
+                log.exception("alert sound failed")
+
+    def _post_pause_sanity_ev(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        aperture: str,
+        cal: "ApertureCalibration | None",
+        tolerance_ev: float,
+    ) -> float | None:
+        """Capture one sanity-check frame at the current rail position
+        and firing aperture's calibrated settings, then return its
+        EV delta relative to ``cal.final_median``. Returns ``None``
+        when the check couldn't be performed (no cal record / no
+        valid reference).
+
+        The capture is written to the lens's ``calibration/`` directory
+        with a ``sanity_<aperture>_<timestamp>`` name so the file
+        doesn't collide with the original cal frames or the reshoot
+        frames. A row is logged with ``phase=calibration`` and a note
+        describing the comparison so the offline log analysis can see
+        the rig state at the moment of the pause.
+        """
+        if cal is None:
+            return None
+        reference = cal.final_median or self.baseline_median or 0.0
+        if reference <= 0:
+            return None
+        # Apply the firing aperture's calibrated settings (the rail
+        # already has the right aperture from the trip; reapplying
+        # is harmless and guarantees ISO/FEC/EC are correct even
+        # after a nested droop on a different aperture).
+        try:
+            self.camera.set_aperture(aperture)
+        except Exception:                                 # noqa: BLE001
+            log.exception("sanity check: set_aperture failed")
+        self.camera.set_iso(cal.iso)
+        self.camera.set_fec(cal.fec_ev)
+        if hasattr(self.camera, "set_ec"):
+            self.camera.set_ec(cal.ec_ev)
+        self._wait_for_recycle()
+        capture_dir = lens_dir / "calibration"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = int(self.monotonic() * 1000)
+        safe = aperture.replace("/", "_").replace(".", "_")
+        dest = capture_dir / f"sanity_{safe}_{timestamp}.jpg"
+        self._last_capture_started_at = self.monotonic()
+        self._last_capture_aperture = aperture
+        self.camera.capture_to(dest)
+        median = self._measure(dest)
+        ev_rel = ev_delta(median, reference)
+        self._log_shot(
+            slug=slug,
+            step_index=0,
+            position_mm=0.0,
+            aperture=aperture,
+            cal=cal,
+            median=median,
+            ev=ev_rel,
+            filename=str(dest.relative_to(lens_dir)),
+            phase=Phase.CALIBRATION,
+            notes=f"post-droop sanity check (vs cal final_median {reference:.1f})",
+        )
+        if ev_rel > tolerance_ev:
+            self._announce(
+                f"Sanity check at {aperture}: ev={ev_rel:+.2f} EV vs "
+                f"cal reference (tol +{tolerance_ev:.2f}). "
+                f"Rig shifted during pause — re-calibrating."
+            )
+        elif ev_rel < -tolerance_ev:
+            self._announce(
+                f"Sanity check at {aperture}: ev={ev_rel:+.2f} EV — "
+                f"still under-exposed. Reshoot will retry; droop may "
+                f"prompt again if batteries are still drained."
+            )
+        else:
+            self._announce(
+                f"Sanity check at {aperture}: ev={ev_rel:+.2f} EV — "
+                f"within tolerance ±{tolerance_ev:.2f}. Proceeding to reshoot."
+            )
+        return ev_rel
+
+    def _recalibrate_at_current_position(
+        self,
+        *,
+        lens_dir: Path,
+        slug: str,
+        apertures: list[str],
+        calibration: CalibrationResult,
+    ) -> None:
+        """Re-run the per-aperture calibrator at the rail's current
+        position (which is wherever the droop event fired) and
+        replace the affected entries in ``calibration.per_aperture``
+        in place. The session-level baseline is preserved.
+
+        Writes the updated calibration to ``calibration.json`` so a
+        downstream tool can see the cascade did rebuild against the
+        new rig state.
+        """
+        self._announce(
+            f"Re-calibrating {len(apertures)} apertures at current "
+            f"rail position (rig state shifted)..."
+        )
+        calibrator = self._make_calibrator()
+        # baseline_median stays at the session-level value so EVs
+        # remain comparable across lens configs and the pre-shift
+        # data.
+        new_result = calibrator.run(
+            lens_dir=lens_dir,
+            lens_slug=slug,
+            session_id=self.session_id,
+            apertures=apertures,
+            baseline_median=self.baseline_median,
+        )
+        self._progress_done()
+        # Merge new per-aperture entries into the existing result
+        # (so the caller's reference stays valid).
+        for ap, new_cal in new_result.per_aperture.items():
+            calibration.per_aperture[ap] = new_cal
+        # Persist for downstream tooling.
+        try:
+            write_json(
+                lens_dir / "calibration.json",
+                {
+                    "baseline_median": calibration.baseline_median,
+                    "per_aperture": calibration.per_aperture,
+                    "recalibrated_mid_sweep": True,
+                },
+            )
+        except Exception:                                # noqa: BLE001
+            log.exception("recalibration: writing calibration.json failed")
+        self._announce_calibration(new_result)
+
+    def _make_calibrator(self) -> "Calibrator":
+        """Build a Calibrator with the same wiring used during the
+        initial calibration pass. Centralised so the mid-sweep
+        re-cal path stays in sync with the up-front cal pass."""
+        return Calibrator(
+            camera=self.camera,
+            measure=self._measure,
+            config=self.config,
+            shots_csv=self.shots_csv,
+            now=self.now,
+            progress=self._calibration_progress,
+        )
 
     def _handle_calibration_failure(
         self,
@@ -3119,6 +3358,7 @@ class SessionRunner:
         ev: float,
         filename: str,
         phase: Phase,
+        notes: str = "",
     ) -> None:
         if self.shots_csv is None:
             return
@@ -3137,7 +3377,7 @@ class SessionRunner:
                 median_ev_relative_to_baseline=ev,
                 filename=filename,
                 phase=phase,
-                notes="",
+                notes=notes,
                 magnification_indicated=self._current_magnification_indicated,
                 f_ring=self._current_f_ring,
                 focal_length_mm=self._current_focal_length_mm,

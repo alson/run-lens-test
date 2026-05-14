@@ -97,7 +97,7 @@ class TestJogLoopMovement:
     ) -> None:
         controller._pos = 4.2
         write_status = MagicMock()
-        # The user just hits 's' immediately.
+        # The user just hits 's' immediately (keyboard sub-mode).
         position = jog_loop(
             controller,
             read_key=_scripted_reader("s"),
@@ -105,6 +105,7 @@ class TestJogLoopMovement:
             keys=keys,
             set_key="s",
             label="START",
+            start_in_panel=False,
         )
         assert position == 0.0
         controller.zero_position.assert_called_once()
@@ -123,6 +124,7 @@ class TestJogLoopMovement:
             keys=keys,
             set_key="e",
             label="END",
+            start_in_panel=False,
         )
         assert position == pytest.approx(12.0)
         controller.zero_position.assert_not_called()
@@ -137,6 +139,7 @@ class TestJogLoopMovement:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         assert controller.move_and_wait.call_args_list == [
             call(Direction.FORWARD, pytest.approx(1.0), backlash=True),
@@ -154,6 +157,7 @@ class TestJogLoopMovement:
             write_status=MagicMock(),
             keys=keys,
             set_key="s",
+            start_in_panel=False,
         )
         # No moves issued.
         controller.move_and_wait.assert_not_called()
@@ -170,6 +174,7 @@ class TestJogLoopMovement:
             write_status=write_status,
             keys=keys,
             set_key="s",
+            start_in_panel=False,
         )
         # Initial + 2 moves + final-after-zero = 4.
         assert write_status.call_count == 4
@@ -192,6 +197,7 @@ class TestJogLoopDrainAfterMove:
             write_status=MagicMock(),
             keys=keys,
             set_key="s",
+            start_in_panel=False,
         )
         # Only ONE move — the first 'd'. The other three were drained
         # and discarded.
@@ -210,6 +216,7 @@ class TestJogLoopDrainAfterMove:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         assert controller.move_and_wait.call_args_list == [
             call(Direction.FORWARD, pytest.approx(1.0), backlash=True),
@@ -237,6 +244,7 @@ class TestJogLoopDrainAfterMove:
             write_status=MagicMock(),
             keys=keys,
             set_key="s",
+            start_in_panel=False,
         )
         # Drain TypeErrored, so both 'd's were processed individually.
         assert controller.move_and_wait.call_count == 2
@@ -347,6 +355,89 @@ class TestJogLoopPanelRelease:
         controller.take_from_panel.assert_called_once()
 
 
+class TestJogLoopStartsInPanel:
+    """``start_in_panel=True`` (the new default) auto-enters panel
+    mode at startup. The user can press s/e to set without ever
+    going to keyboard mode; ENTER drops to keyboard mode."""
+
+    def test_default_enters_panel_then_s_sets_without_reacquire(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        controller._pos = 3.0
+        on_release = MagicMock()
+        on_reacquire = MagicMock()
+        write_status = MagicMock()
+        # User presses 's' in panel → set START without reacquiring.
+        position = jog_loop(
+            controller,
+            read_key=_scripted_reader("s"),
+            write_status=write_status,
+            keys=keys,
+            set_key="s",
+            label="START",
+            on_release=on_release,
+            on_reacquire=on_reacquire,
+        )
+        assert position == 0.0
+        controller.release_to_panel.assert_called_once()
+        controller.take_from_panel.assert_called_once()
+        on_release.assert_called_once()
+        # KEY ASSERTION: on_reacquire NOT called for 's' in panel —
+        # camera stays released for the upcoming END jog.
+        on_reacquire.assert_not_called()
+        controller.zero_position.assert_called_once()
+
+    def test_e_in_panel_sets_and_reacquires(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        controller._pos = 7.5
+        on_release = MagicMock()
+        on_reacquire = MagicMock()
+        position = jog_loop(
+            controller,
+            read_key=_scripted_reader("e"),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+            label="END",
+            on_release=on_release,
+            on_reacquire=on_reacquire,
+        )
+        assert position == pytest.approx(7.5)
+        # 'e' DOES reacquire — capture starts immediately after.
+        on_reacquire.assert_called_once()
+        controller.zero_position.assert_not_called()
+
+    def test_enter_drops_to_keyboard_mode(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        # User presses ENTER → reacquire + go to keyboard mode → then
+        # 'd' moves rail forward → then 'e' sets END.
+        jog_loop(
+            controller,
+            read_key=_scripted_reader("\r", "d", "e"),
+            write_status=MagicMock(),
+            keys=keys,
+            set_key="e",
+        )
+        controller.move_and_wait.assert_called_once_with(
+            Direction.FORWARD, pytest.approx(1.0), backlash=True
+        )
+
+    def test_q_in_panel_aborts(
+        self, controller, keys: JogKeyMap
+    ) -> None:
+        with pytest.raises(SessionAborted):
+            jog_loop(
+                controller,
+                read_key=_scripted_reader("q"),
+                write_status=MagicMock(),
+                keys=keys,
+                set_key="s",
+                label="START",
+            )
+
+
 class TestJogLoopNumericEntry:
     """``:`` opens a numeric-target entry mode; the user types an
     absolute mm position and ENTER moves the rail there."""
@@ -364,6 +455,7 @@ class TestJogLoopNumericEntry:
             write_status=write_status,
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         # One absolute move from -1.0 to -3.10 → backward 2.10 mm.
         controller.move_and_wait.assert_called_once_with(
@@ -382,6 +474,7 @@ class TestJogLoopNumericEntry:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         controller.move_and_wait.assert_called_once_with(
             Direction.FORWARD, pytest.approx(2.5), backlash=True
@@ -400,6 +493,7 @@ class TestJogLoopNumericEntry:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         controller.move_and_wait.assert_not_called()
         assert result == pytest.approx(-2.0)
@@ -415,6 +509,7 @@ class TestJogLoopNumericEntry:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         controller.move_and_wait.assert_not_called()
         assert result == pytest.approx(-2.0)
@@ -432,6 +527,7 @@ class TestJogLoopNumericEntry:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         controller.move_and_wait.assert_called_once_with(
             Direction.BACKWARD, pytest.approx(3.10), backlash=True
@@ -454,6 +550,7 @@ class TestJogLoopNumericEntry:
             write_status=MagicMock(),
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         controller.move_and_wait.assert_not_called()
         assert result == pytest.approx(0.0)
@@ -471,6 +568,7 @@ class TestJogLoopNumericEntry:
             write_status=write_status,
             keys=keys,
             set_key="e",
+            start_in_panel=False,
         )
         # Find any call where the message contains the buffer prefix.
         msgs = [c.args[1] for c in write_status.call_args_list]

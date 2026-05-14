@@ -560,17 +560,17 @@ class TestLinearCascade:
         assert result.fec_ev == 0.0
         assert result.ec_ev == 0.0
 
-    def test_three_shot_happy_path_already_on_target(
+    def test_two_shot_happy_path_already_on_target(
         self, camera, linear_cfg, tmp_path
     ) -> None:
-        # Shot 1 at FEC=0 lands on baseline. Shot 2 (also at FEC=0)
-        # also lands on baseline. Shot 3 probes brighter (+1 stop on
-        # FEC) and brightens by ~1 EV → slope=1.0, healthy.
+        # Shot 1 at FEC=0 lands on baseline (|delta| ≤ ⅙ EV). The
+        # shot-2 target-adjustment is skipped; cascade jumps to the
+        # headroom probe directly. Probe brightens by ~1 EV → slope
+        # = 1.0, healthy. Total: 2 shots.
         baseline = 129.0
         medians = [
             baseline,                       # shot 1: delta_0 = 0
-            baseline,                       # shot 2: delta_1 = 0
-            _median_from_ev(baseline, 1.0), # shot 3: probe +1 stop = +1 EV
+            _median_from_ev(baseline, 1.0), # shot 2 (headroom probe): +1 EV
         ]
         calib = make_calibrator(camera, linear_cfg, medians=medians)
         result, _ = calib._calibrate_aperture(
@@ -578,8 +578,9 @@ class TestLinearCascade:
             capture_dir=tmp_path, baseline=baseline,
         )
         assert result.hit_tolerance
-        assert result.test_shots_taken == 3
-        # Settings returned should be shot 2's (FEC=0), not the probe's.
+        assert result.test_shots_taken == 2
+        # Settings returned should be shot 1's (FEC=0); the probe
+        # values are diagnostic only.
         assert result.fec_ev == 0.0
         assert result.ec_ev == 0.0
         assert not result.iso_bumped
@@ -733,6 +734,86 @@ class TestLinearCascade:
             capture_dir=tmp_path, baseline=129.0,
         )
         assert result.hit_tolerance
+
+    def test_carries_prev_fec_ec_into_shot_1(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Stop-down aperture: prev_fec=+1, prev_ec=+1/3 (on the ⅓-stop
+        # grid). Shot 1 fires at carried-over bias and lands within ⅙
+        # EV — shortcut path takes 2 shots and keeps the carried FEC/EC.
+        baseline = 129.0
+        medians = [
+            baseline,                       # shot 1 at carried FEC/EC: on target
+            _median_from_ev(baseline, 1.0), # shot 2 (headroom probe): +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/8", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+            prev_fec=1.0, prev_ec=1.0 / 3.0, prev_iso=200,
+        )
+        assert result.hit_tolerance
+        assert result.test_shots_taken == 2
+        assert result.fec_ev == pytest.approx(1.0)
+        assert result.ec_ev == pytest.approx(1.0 / 3.0)
+        # Verify camera was set to the carried bias on shot 1.
+        first_fec = next(v for (k, v) in camera.history if k == "fec")
+        first_ec = next(v for (k, v) in camera.history if k == "ec")
+        assert first_fec == pytest.approx(1.0)
+        assert first_ec == pytest.approx(1.0 / 3.0)
+
+    def test_iso_floor_uses_max_of_prev_and_baseline(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # f/16 baseline ISO is 400 (per linear_cfg.RANGE_EXTENSION).
+        # Previous aperture (e.g. f/11) bumped to ISO 800 — we must
+        # carry that forward; smaller aperture only needs MORE
+        # sensitivity, never less.
+        baseline = 129.0
+        medians = [
+            baseline,                       # shot 1: on target at ISO 800
+            _median_from_ev(baseline, 1.0), # shot 2 (probe): +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/16", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+            prev_iso=800,
+        )
+        assert result.iso == 800
+        # ISO call sequence: should have started at 800 (max of 800
+        # and the baseline 400), not at 400.
+        first_iso = next(v for (k, v) in camera.history if k == "iso")
+        assert first_iso == 800
+
+    def test_skip_to_headroom_off_target_branch(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shot 1 within ⅙ EV but slope < 0.3 in the headroom probe
+        # (flash at mechanical max). Must trigger the ISO-bump
+        # branch even though shot 2 was skipped — the carried-over
+        # FEC/EC is preserved, ISO goes up.
+        baseline = 129.0
+        medians = [
+            _median_from_ev(baseline, 0.1),  # shot 1: ≤ ⅙ EV, on target
+            _median_from_ev(baseline, 0.1),  # shot 2 (probe): unchanged → slope=0
+        ]
+        # We need a 4th shot after ISO bump (post-bump retry); 5th if
+        # still off-target. Pre-seed enough.
+        medians.extend([baseline, baseline])
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/8", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+            prev_fec=1.0 / 3.0, prev_ec=0.0,
+        )
+        # Shot 1 was on target so deficit_ev=0 → the cascade accepts
+        # without bumping ISO (the slope-borderline branch sees
+        # |delta_1| ≤ tolerance). Verifies the shortcut + maxed slope
+        # path doesn't spuriously raise ISO when image is on target.
+        assert result.hit_tolerance
+        assert not result.iso_bumped
+        assert result.fec_ev == pytest.approx(1.0 / 3.0)
 
 
 class TestDistributeBias:

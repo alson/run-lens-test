@@ -76,6 +76,7 @@ def jog_loop(
     label: str = "START",
     on_release: Callable[[], None] | None = None,
     on_reacquire: Callable[[], None] | None = None,
+    start_in_panel: bool = True,
 ) -> float:
     """Run a single jog session and return the rail's final position.
 
@@ -109,7 +110,16 @@ def jog_loop(
         of front-panel mode (SPACE / ENTER). Used by the production
         runner to also release the camera (close gphoto2) so the
         camera's LCD shows live view while the user is positioning
-        the rail manually, then reacquire it after.
+        the rail manually, then reacquire it after. When the user
+        ends the jog via ``set_key`` while in panel mode,
+        ``on_reacquire`` is NOT called — the camera is left released
+        so the next jog can stay in live view without paying the
+        ~2 s reacquire cost.
+    start_in_panel :
+        When True (default), the loop immediately enters front-panel
+        mode at startup; pressing ENTER drops to the supervised
+        keyboard sub-mode. Tests pass ``start_in_panel=False`` to
+        skip the auto-release and start in keyboard mode directly.
 
     Returns
     -------
@@ -128,6 +138,48 @@ def jog_loop(
     position = controller.get_position()
     write_status(position, label)
     pending_key: str | None = None
+    if start_in_panel:
+        # Drop straight into panel mode. The user can press s/e to
+        # set position without leaving live view (camera stays
+        # released across both jogs for "s"; "e" reacquires since
+        # capture begins immediately after), or press ENTER to drop
+        # to keyboard mode (which reacquires).
+        position, panel_pending, panel_set = _release_to_panel(
+            controller=controller,
+            read_key=read_key,
+            write_status=write_status,
+            label=label,
+            on_release=on_release,
+            on_reacquire=on_reacquire,
+            set_keys=(set_key, keys.abort_key),
+        )
+        if panel_set == keys.abort_key:
+            raise SessionAborted(f"jog aborted at {label}")
+        if panel_set == set_key:
+            # s/e was pressed in panel mode. _release_to_panel already
+            # took the rail back from the front panel (so we can read
+            # / zero) and skipped on_reacquire. Do the set logic, then
+            # only reacquire the camera for "e" (capturing starts).
+            if set_key == "s":
+                controller.zero_position()
+                position = controller.get_position()
+                write_status(position, f"{label} set (zeroed)")
+            else:
+                write_status(position, f"{label} set")
+                if on_reacquire is not None:
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    try:
+                        on_reacquire()
+                    except Exception as exc:          # noqa: BLE001
+                        write_status(
+                            position,
+                            f"{label} (on_reacquire callback failed: {exc})",
+                        )
+            return position
+        if panel_pending is not None:
+            pending_key = panel_pending
     while True:
         if pending_key is not None:
             key = pending_key
@@ -145,14 +197,36 @@ def jog_loop(
                 write_status(position, f"{label} set")
             return position
         if key == PANEL_RELEASE_KEY:
-            position, panel_pending = _release_to_panel(
+            position, panel_pending, panel_set = _release_to_panel(
                 controller=controller,
                 read_key=read_key,
                 write_status=write_status,
                 label=label,
                 on_release=on_release,
                 on_reacquire=on_reacquire,
+                set_keys=(set_key, keys.abort_key),
             )
+            if panel_set == keys.abort_key:
+                raise SessionAborted(f"jog aborted at {label}")
+            if panel_set == set_key:
+                if set_key == "s":
+                    controller.zero_position()
+                    position = controller.get_position()
+                    write_status(position, f"{label} set (zeroed)")
+                else:
+                    write_status(position, f"{label} set")
+                    if on_reacquire is not None:
+                        if sys.stdout.isatty():
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                        try:
+                            on_reacquire()
+                        except Exception as exc:      # noqa: BLE001
+                            write_status(
+                                position,
+                                f"{label} (on_reacquire callback failed: {exc})",
+                            )
+                return position
             if panel_pending is not None:
                 pending_key = panel_pending
             continue
@@ -280,16 +354,23 @@ def _release_to_panel(
     label: str,
     on_release: Callable[[], None] | None = None,
     on_reacquire: Callable[[], None] | None = None,
-) -> tuple[float, str | None]:
+    set_keys: tuple[str, ...] = (),
+) -> tuple[float, str | None, str | None]:
     """Drop USB control so the user can drive the rail with the
     StackShot's physical buttons (and, via ``on_release``, regain
-    direct LCD/AF control of the camera). Returns the position the
-    user left the rail at after pressing ENTER.
+    direct LCD/AF control of the camera). Returns
+    ``(position, pending_key, set_key_pressed)``: the position the
+    user left the rail at, an optional key queued during reacquire
+    to forward to the caller's main loop, and which set key (if any)
+    was pressed inside panel mode to exit early.
 
     ``on_release`` runs after the rail is released (typically closes
     the gphoto2 session so the camera's LCD shows live view).
     ``on_reacquire`` runs before the rail is taken back from the
-    panel (typically re-opens the gphoto2 session).
+    panel (typically re-opens the gphoto2 session). When the user
+    exits panel mode by pressing one of ``set_keys`` (s/e/q),
+    ``on_reacquire`` is skipped — the camera is left released so the
+    next jog can stay in live view without paying the reacquire cost.
 
     Falls back to a clear "not supported" message when the underlying
     transport can't toggle bit-mode (e.g.
@@ -307,7 +388,7 @@ def _release_to_panel(
         controller.release_to_panel()
     except NotImplementedError as exc:
         write_status(cached_position, f"{label} (panel release not supported: {exc})")
-        return cached_position, None
+        return cached_position, None, None
     if on_release is not None:
         # Break the in-place \r status line *before* the on_release
         # callback runs — the callback typically emits log records
@@ -326,14 +407,30 @@ def _release_to_panel(
                 cached_position,
                 f"{label} | PANEL (on_release callback failed: {exc})",
             )
+    set_hint = "/".join(set_keys) if set_keys else ""
     write_status(
         cached_position,
-        f"{label} | PANEL — rail buttons + camera live view; ENTER to resume",
+        f"{label} | PANEL — rail buttons + camera live view; "
+        f"ENTER to resume" + (f", {set_hint} to set" if set_hint else ""),
     )
+    exit_set_key: str | None = None
     while True:
         k = read_key()
         if k in ("\r", "\n"):
             break
+        if k in set_keys:
+            exit_set_key = k
+            break
+    if exit_set_key is not None:
+        # Set was pressed in panel — take rail back briefly so we can
+        # read its current position (and zero it for "s"). Skip
+        # on_reacquire: the caller wants the camera left in live view
+        # so the next jog (END) can stay in panel without paying the
+        # reacquire cost.
+        controller.take_from_panel()
+        position = controller.get_position()
+        write_status(position, label)
+        return position, None, exit_set_key
     # Immediate visual feedback BEFORE the slow reacquire (camera
     # re-init can take ~2 s). Without this the user thinks ENTER
     # didn't register and queues more keystrokes that leak into the
@@ -376,7 +473,7 @@ def _release_to_panel(
         pass
     position = controller.get_position()
     write_status(position, label)
-    return position, pending
+    return position, pending, None
 
 
 # ---- Production wiring: termios + stdout -----------------------------------
@@ -494,28 +591,65 @@ def jog_start_and_end(
     the chosen start). The END value returned is in mm relative to
     that origin.
 
-    Optional ``on_release`` / ``on_reacquire`` callbacks are forwarded
-    into the SPACE / ENTER panel-release toggle. The production runner
-    uses them to also close / reopen the gphoto2 camera session so
-    the camera's LCD shows live view while the rail is in front-panel
-    mode.
+    Both jogs start in front-panel mode by default (rail under its
+    own buttons + camera in live view); pressing ENTER drops to the
+    supervised keyboard sub-mode. Pressing ``s`` in panel ends the
+    START jog without reacquiring the camera, so the END jog stays
+    in live view too. ``e`` in panel ends the END jog and reacquires
+    the camera (capture begins immediately after).
+
+    Optional ``on_release`` / ``on_reacquire`` callbacks are wrapped
+    to be idempotent across the two-jog sequence so a no-op second
+    release / first reacquire never reaches the camera. The
+    production runner passes camera close / open functions; this
+    wrapper guarantees they're called the correct number of times
+    even when the user toggles between panel and keyboard modes.
     """
+    # State machine — gates on_release/on_reacquire so the camera is
+    # only closed when open and reopened when closed.
+    camera_released = [False]
+
+    def _wrap_release() -> None:
+        if camera_released[0]:
+            return
+        if on_release is not None:
+            on_release()
+        camera_released[0] = True
+
+    def _wrap_reacquire() -> None:
+        if not camera_released[0]:
+            return
+        if on_reacquire is not None:
+            on_reacquire()
+        camera_released[0] = False
+
     prompt = (
+        "  PANEL: rail buttons + camera live view  ENTER=keyboard  "
+        "{set}=set {label}  q=abort"
+    )
+    keyboard_prompt = (
         "  a/d=coarse(1mm)  A/D=fine(0.05mm)  :=type-target-mm  "
         "SPACE=front-panel+camera  {set}=set {label}  q=abort"
     )
     print("Jog rail to START.")
     print(prompt.format(set="s", label="START"))
+    print(keyboard_prompt.format(set="s", label="START"))
     jog_interactive(
         controller, label="START", set_key="s", keys=keys,
-        on_release=on_release, on_reacquire=on_reacquire,
+        on_release=_wrap_release, on_reacquire=_wrap_reacquire,
     )
     print("\nJog rail to END.")
     print(prompt.format(set="e", label="END"))
+    print(keyboard_prompt.format(set="e", label="END"))
     end_mm = jog_interactive(
         controller, label="END", set_key="e", keys=keys,
-        on_release=on_release, on_reacquire=on_reacquire,
+        on_release=_wrap_release, on_reacquire=_wrap_reacquire,
     )
+    # Final safety: if the user managed to end the END jog with the
+    # camera still released (shouldn't happen — set_key="e" in panel
+    # reacquires, and ENTER → keyboard also reacquires), reacquire
+    # now so capture can proceed.
+    _wrap_reacquire()
     return JogResult(end_mm=end_mm)
 
 

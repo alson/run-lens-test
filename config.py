@@ -242,12 +242,28 @@ a plateau-driven ISO bump to settle."""
 ROLLING_WINDOW = 10
 # Droop trip criteria — evaluated in order; whichever fires first
 # wins. The detector pools pushes session-wide (across every
-# aperture in the sweep), so consecutive under-exposed shots at
+# aperture in the sweep), so consecutive off-target shots at
 # *different* apertures still trip the moderate criterion. Severe
 # fires on a single shot — typical "flash refused to fire / hit
-# its mechanical-min" failure mode.
+# its mechanical-min" failure mode (under) or rig-state shift after
+# a pause (over).
+#
+# Under-exposure trips trigger the battery-swap prompt; over-exposure
+# trips trigger silent re-calibration (no battery prompt, no user
+# pause). Both then reshoot from the earliest off-tolerance frame.
 DROOP_CRIT_A = (1, -2.0)   # 1 severe shot ≤ -2 EV — fire immediately
 DROOP_CRIT_B = (2, -0.7)   # 2 of last 10 ≤ -0.7 EV — gradual drift
+DROOP_OVER_CRIT_A = (1, +2.0)   # 1 severe shot ≥ +2 EV — fire immediately
+DROOP_OVER_CRIT_B = (2, +0.7)   # 2 of last 10 ≥ +0.7 EV — gradual shift
+
+# Rewind / re-cal tolerance. When a droop event fires, the search
+# for "earliest off-target frame" uses ±this threshold rather than
+# the firing criterion's threshold. Smaller than the moderate
+# trigger (±0.7 EV) so frames that drifted just under the trigger
+# also get reshot. Also drives the post-pause sanity-check: if the
+# first sanity capture is more than ±this EV from cal.final_median,
+# the calibrator re-runs at the current rail position.
+DROOP_REWIND_TOLERANCE_EV = 0.3
 
 # ---- Range-too-narrow auto-extension ---------------------------------------
 
