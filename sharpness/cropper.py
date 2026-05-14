@@ -1,26 +1,22 @@
-"""Apply crop boxes to a JPEG and report file sizes.
+"""Apply crop boxes to a JPEG losslessly and report file sizes.
 
-The cropper decodes the source JPEG once into an ndarray, slices it
-into 17 sub-images, encodes each back to JPEG, writes them to
-``<out>/<crop_name>/<source_name>``, and returns a ``CropResult``
-with the file size of every produced JPEG. File size is the
-sharpness proxy used downstream — same metric as
-``analyse-lens-test/select-crops.sh``.
+The cropper reads the source JPEG bytes, calls
+``TurboJPEG.crop_multiple`` to extract 17 sub-images **without decoding
+or re-encoding** (lossless JPEG transform), writes them to
+``<out>/<crop_name>/<source_name>``, and returns a ``CropResult`` with
+the file size of every produced JPEG. File size is the sharpness proxy
+used downstream — same metric as ``analyse-lens-test/select-crops.sh``.
 
 Backed by ``libjpeg-turbo`` via the :mod:`turbojpeg` ctypes wrapper.
-The previous PIL/Pillow path linked the same libjpeg-turbo on this
-system but went through more Python dispatch and an Image-object
-allocation per crop. Direct turbojpeg saves ~13 % per shot
-single-threaded; the gain stacks with the ProcessPoolExecutor
-worker pool the live collector uses in production.
-
-Quality note: at the same nominal ``quality=92`` setting, turbojpeg
-produces slightly larger files (~10–17 %) than PIL because PIL
-applies a small extra optimization step that turbojpeg's default
-encode doesn't. The file-size-as-sharpness proxy stays valid as
-long as every shot in a session uses the same encoder + quality —
-the comparison is monotonic in scene detail, not calibrated to an
-absolute byte count.
+The previous implementation decoded the source to BGR, sliced the
+ndarray 17 times, and re-encoded each slice at ``quality=92`` — two
+generations of JPEG compression on every crop. ``crop_multiple``
+re-packs encoded MCU blocks into the new JPEGs directly, so the crops
+inherit the source's encoded quality exactly and add zero generations
+of loss. This works only when the crop origins are on MCU boundaries
+(16 px for the 4:2:0-subsampled sources this pipeline ships); the
+origins emitted by :func:`sharpness.crops.all_crop_boxes` are
+guaranteed MCU-aligned via :mod:`lens_test_detect_core.mcu`.
 """
 
 from __future__ import annotations
@@ -29,13 +25,9 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 from turbojpeg import TurboJPEG
 
-from sharpness.crops import CropBox, all_crop_boxes
-
-
-DEFAULT_JPEG_QUALITY = 92
+from sharpness.crops import all_crop_boxes
 
 
 @dataclass(frozen=True)
@@ -54,10 +46,9 @@ class CropResult:
 
 # A single :class:`TurboJPEG` instance owns a libturbojpeg handle
 # (a few KB of native state). Constructing one per call costs a
-# dlopen + tjInitCompress / tjInitDecompress, which is wasteful when
-# the cropper runs hundreds of times per session. One handle per
-# (process, thread) is plenty — the underlying tj* APIs are
-# thread-safe per handle.
+# dlopen + tjInitTransform, which is wasteful when the cropper runs
+# hundreds of times per session. One handle per (process, thread) is
+# plenty — the underlying tj* APIs are thread-safe per handle.
 _tj_local = threading.local()
 
 
@@ -69,41 +60,26 @@ def _tj() -> TurboJPEG:
     return instance
 
 
-def crop_to_bytes(
-    image: np.ndarray,
-    box: CropBox,
-    *,
-    quality: int = DEFAULT_JPEG_QUALITY,
-) -> bytes:
-    """Return JPEG-encoded bytes for one crop slice. Pure: no disk I/O.
-
-    ``image`` is a decoded ndarray in BGR order (turbojpeg's native
-    layout). The slice is forced contiguous if it isn't already so
-    libturbojpeg's encoder gets a clean buffer.
-    """
-    sub = image[box.top:box.bottom, box.left:box.right]
-    if not sub.flags["C_CONTIGUOUS"]:
-        sub = np.ascontiguousarray(sub)
-    return _tj().encode(sub, quality=quality)
-
-
 def crop_image_file(
     source: Path,
     out_dir: Path,
     *,
     crop_w: int | None = None,
     crop_h: int | None = None,
-    quality: int = DEFAULT_JPEG_QUALITY,
 ) -> CropResult:
-    """Decode ``source``, write 17 crops under ``out_dir/<crop_name>/``.
+    """Lossless-crop ``source`` into 17 sub-JPEGs under ``out_dir``.
 
     The output filename matches the source filename, so a sweep's
     worth of crops in the same crop subdirectory naturally sort by
     capture time (matching ``analyse-lens-test`` conventions).
+
+    Crops are produced by ``TurboJPEG.crop_multiple`` — no decode and
+    no re-encode. The output crops inherit the source's encoded
+    JPEG quality exactly.
     """
     raw = Path(source).read_bytes()
-    arr = _tj().decode(raw)  # (H, W, 3) BGR, uint8
-    h, w = arr.shape[:2]
+    w, h, _subsample, _colorspace = _tj().decode_header(raw)
+
     boxes_kw: dict[str, int] = {}
     if crop_w is not None:
         boxes_kw["crop_w"] = crop_w
@@ -111,12 +87,17 @@ def crop_image_file(
         boxes_kw["crop_h"] = crop_h
     boxes = all_crop_boxes(w, h, **boxes_kw)
 
+    names = list(boxes.keys())
+    crop_params = [
+        (b.left, b.top, b.width, b.height) for b in (boxes[n] for n in names)
+    ]
+    crops = _tj().crop_multiple(raw, crop_params)
+
     sizes: dict[str, int] = {}
-    for name, box in boxes.items():
+    for name, data in zip(names, crops, strict=True):
         target_dir = out_dir / name
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / Path(source).name
-        data = crop_to_bytes(arr, box, quality=quality)
         target.write_bytes(data)
         sizes[name] = len(data)
     return CropResult(source=Path(source), sizes=sizes)

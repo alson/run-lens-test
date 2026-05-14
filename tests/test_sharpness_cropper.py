@@ -1,9 +1,9 @@
 """Tests for sharpness.cropper.
 
-``crop_to_bytes`` operates on a decoded ndarray (BGR, uint8 — the
-turbojpeg native layout). ``crop_image_file`` is exercised
-end-to-end with a real JPEG round-trip to confirm the
-decode → slice → encode → file pipeline holds together.
+``crop_image_file`` extracts 17 lossless sub-JPEGs from a source
+file via ``TurboJPEG.crop_multiple``; the decode → re-encode pipeline
+that the previous implementation used is gone, so all assertions
+exercise the lossless-transform path end-to-end with real JPEGs.
 """
 
 from __future__ import annotations
@@ -13,80 +13,43 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PIL import Image
+from turbojpeg import TurboJPEG
 
-from sharpness.cropper import (
-    CropResult,
-    crop_image_file,
-    crop_to_bytes,
-)
-from sharpness.crops import CROP_NAMES, CropBox
+from lens_test_detect_core.mcu import MCU_SIZE
+from sharpness.cropper import CropResult, crop_image_file
+from sharpness.crops import CROP_NAMES, all_crop_boxes
 
 
 # --- helpers ---------------------------------------------------------------
 
 
-def _flat_bgr(w: int, h: int, value: int = 128) -> np.ndarray:
-    return np.full((h, w, 3), value, dtype=np.uint8)
+def _write_textured_jpeg(path: Path, w: int, h: int, seed: int = 1) -> None:
+    """Write a textured JPEG that decodes cleanly through libjpeg-turbo.
 
-
-def _noisy_bgr(w: int, h: int, seed: int = 42) -> np.ndarray:
+    Uses 4:2:0 subsampling to match the capture-rig sources; without
+    that the crop_multiple MCU is 8x8 rather than 16x16 and the
+    alignment math in :mod:`lens_test_detect_core.mcu` is off.
+    """
     rng = np.random.default_rng(seed)
-    return rng.integers(0, 256, size=(h, w, 3), dtype="uint8")
+    arr = rng.integers(0, 256, size=(h, w, 3), dtype="uint8")
+    Image.fromarray(arr).save(path, "JPEG", quality=92, subsampling=2)
 
 
-# --- pure crop_to_bytes ----------------------------------------------------
-
-
-class TestCropToBytes:
-    def test_returns_jpeg_bytes(self) -> None:
-        img = _flat_bgr(1000, 1000)
-        out = crop_to_bytes(img, CropBox(0, 0, 100, 100))
-        assert out[:3] == b"\xff\xd8\xff"  # JPEG SOI marker
-
-    def test_uniform_image_compresses_small(self) -> None:
-        img = _flat_bgr(1000, 1000)
-        small = crop_to_bytes(img, CropBox(0, 0, 500, 500))
-        # libjpeg-turbo (no extra optimization pass) lands a 500×500
-        # uniform grey at ~5–6 KB; the proxy here is "trivially small
-        # vs textured content", so 8 KB is a comfortable ceiling.
-        assert len(small) < 8000
-
-    def test_textured_image_compresses_larger(self) -> None:
-        textured = _noisy_bgr(500, 500)
-        big = crop_to_bytes(textured, CropBox(0, 0, 500, 500))
-        flat = _flat_bgr(500, 500)
-        small = crop_to_bytes(flat, CropBox(0, 0, 500, 500))
-        assert len(big) > 10 * len(small)
-
-    def test_quality_changes_size(self) -> None:
-        textured = _noisy_bgr(500, 500, seed=0)
-        hi = crop_to_bytes(textured, CropBox(0, 0, 500, 500), quality=95)
-        lo = crop_to_bytes(textured, CropBox(0, 0, 500, 500), quality=40)
-        assert len(hi) > len(lo)
-
-    def test_handles_non_contiguous_slice(self) -> None:
-        # Box that lands away from origin produces a non-contiguous
-        # numpy slice; the encoder needs C-contiguous input.
-        img = _noisy_bgr(1000, 1000)
-        out = crop_to_bytes(img, CropBox(100, 200, 500, 800))
-        assert out[:3] == b"\xff\xd8\xff"
-
-
-# --- crop_image_file (one real-JPEG round-trip) -----------------------------
+# --- crop_image_file (lossless round-trip) ---------------------------------
 
 
 class TestCropImageFile:
     def test_writes_seventeen_crops_with_recorded_sizes(
         self, tmp_path: Path
     ) -> None:
-        # 1500x1500 noisy JPEG → 1000 mid-band wide, well above 500x500
-        # so DX crops fit.
-        rng = np.random.default_rng(1)
-        arr = rng.integers(0, 256, size=(1500, 1500, 3), dtype="uint8")
-        Image.fromarray(arr).save(tmp_path / "source.jpg", quality=92)
+        # The DX inner region needs to be >= crop_size. With the default
+        # 512 crop, image / 1.5 >= 512 → image >= 768. Round up to 800
+        # (also MCU-aligned).
+        src = tmp_path / "source.jpg"
+        _write_textured_jpeg(src, 800, 800)
 
         out_dir = tmp_path / "cropped"
-        result = crop_image_file(tmp_path / "source.jpg", out_dir)
+        result = crop_image_file(src, out_dir)
 
         assert isinstance(result, CropResult)
         assert set(result.sizes.keys()) == set(CROP_NAMES)
@@ -96,20 +59,76 @@ class TestCropImageFile:
             assert result.size_for(name) == target.stat().st_size
 
     def test_uses_source_filename_under_crop_subdir(self, tmp_path: Path) -> None:
-        Image.new("RGB", (1500, 1500), color=(50, 50, 50)).save(
-            tmp_path / "step_005.jpg"
-        )
+        src = tmp_path / "step_005.jpg"
+        _write_textured_jpeg(src, 800, 800, seed=2)
         out_dir = tmp_path / "out"
-        crop_image_file(tmp_path / "step_005.jpg", out_dir)
-        # Each crop subdir holds a file named after the source.
+        crop_image_file(src, out_dir)
         for name in CROP_NAMES:
             assert (out_dir / name / "step_005.jpg").is_file()
 
     def test_rejects_image_too_small(self, tmp_path: Path) -> None:
-        Image.new("RGB", (300, 300), color=(0, 0, 0)).save(tmp_path / "small.jpg")
+        src = tmp_path / "small.jpg"
+        _write_textured_jpeg(src, 400, 400)
         with pytest.raises(ValueError):
-            crop_image_file(tmp_path / "small.jpg", tmp_path / "out")
+            crop_image_file(src, tmp_path / "out")
 
     def test_size_for_returns_recorded_value(self) -> None:
         result = CropResult(source=Path("/x.jpg"), sizes={"center": 12345})
         assert result.size_for("center") == 12345
+
+    def test_crops_are_lossless_at_interior(self, tmp_path: Path) -> None:
+        """A lossless JPEG crop preserves the encoded MCU blocks exactly,
+        which means decoded interior pixels match the corresponding
+        source sub-region bit-for-bit. The first/last few rows and
+        columns may differ slightly because 4:2:0 chroma upsampling at
+        the new edges uses different neighbour MCUs than the source
+        had — that's an inherent feature of the format, not a re-encode.
+        Interior pixels (a 16-px stride away from each border) must
+        match exactly."""
+        src = tmp_path / "lossless.jpg"
+        # Z7 II-sized image so the centre crop lands at (3872, 2496) —
+        # the natural-alignment case the design targets.
+        _write_textured_jpeg(src, 8256, 5504, seed=3)
+        crop_image_file(src, tmp_path / "out")
+
+        tj = TurboJPEG()
+        source_arr = tj.decode(src.read_bytes())  # (H, W, 3) BGR
+        boxes = all_crop_boxes(8256, 5504)
+        for name, box in boxes.items():
+            crop_path = tmp_path / "out" / name / "lossless.jpg"
+            crop_arr = tj.decode(crop_path.read_bytes())
+            expected = source_arr[box.top : box.bottom, box.left : box.right]
+            assert crop_arr.shape == expected.shape, name
+            # Interior region: trim 16 px on every side. Anything
+            # losing data here would mean a real re-encode happened.
+            interior_crop = crop_arr[16:-16, 16:-16]
+            interior_expected = expected[16:-16, 16:-16]
+            assert np.array_equal(interior_crop, interior_expected), (
+                f"{name}: interior pixels differ — not a lossless crop"
+            )
+
+    def test_crop_files_smaller_than_full_source(self, tmp_path: Path) -> None:
+        """Sanity: each cropped file must be smaller than the source.
+        A re-encode at default quality would also satisfy this, so it
+        isn't a tight lossless check, but it catches outright bugs
+        (e.g. accidentally writing the whole source to every crop)."""
+        src = tmp_path / "size.jpg"
+        _write_textured_jpeg(src, 2048, 2048, seed=4)
+        result = crop_image_file(src, tmp_path / "out")
+        source_size = src.stat().st_size
+        for name, size in result.sizes.items():
+            assert size < source_size, f"{name} not smaller than source"
+
+    def test_all_origins_must_be_mcu_aligned(self, tmp_path: Path) -> None:
+        """Crop boxes the cropper feeds into ``crop_multiple`` must all
+        be MCU-aligned (otherwise libjpeg-turbo errors out). This is a
+        contract test on the upstream box generator, exercised through
+        the cropper to confirm the integration."""
+        src = tmp_path / "aligned.jpg"
+        _write_textured_jpeg(src, 8256, 5504)
+        boxes = all_crop_boxes(8256, 5504)
+        for name, box in boxes.items():
+            assert box.left % MCU_SIZE == 0, name
+            assert box.top % MCU_SIZE == 0, name
+        # And the cropper succeeds end-to-end with these origins.
+        crop_image_file(src, tmp_path / "out")

@@ -1,11 +1,17 @@
 """Geometry for the 17 crop windows.
 
-Direct port of ``analyse-lens-test/make-17-crops.sh``: nine 500×500 crops
+Direct port of ``analyse-lens-test/make-17-crops.sh``: nine 512x512 crops
 covering centre / edges / corners of the full frame, plus eight crops on
 an APS-C-equivalent inner region (``image / 1.5`` per axis, centred).
 The DX inner region's centre crop is intentionally omitted in the bash
 script — keeping that here so file-size comparisons stay backwards-
 compatible with the offline rail-coverage tool.
+
+Crop size is 512x512 px (formerly 500x500) so every crop origin lands
+on a 16-pixel MCU boundary, enabling lossless JPEG transforms in
+:mod:`sharpness.cropper`. See :mod:`lens_test_detect_core.mcu` for the
+shared alignment helpers; the constants here just re-export the
+defaults so the public API stays stable.
 
 All functions are pure: image dimensions in, crop boxes out. No PIL,
 no I/O.
@@ -15,14 +21,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Crop dimensions — must match make-17-crops.sh exactly so the live and
-# offline analyses are directly comparable.
-DEFAULT_CROP_W = 500
-DEFAULT_CROP_H = 500
+from lens_test_detect_core.mcu import (
+    DEFAULT_CROP_SIZE,
+    DX_FACTOR as _DX_FACTOR,
+    compute_crop_origins,
+    compute_dx_origins,
+)
 
-# DX (Nikon APS-C) crop factor. Used to define the inner sub-frame on
-# which the dx-* crops are anchored.
-DX_FACTOR = 1.5
+# Crop dimensions — must match make-17-crops.sh exactly so the live and
+# offline analyses are directly comparable. Both currently 512 (the
+# smallest 16-multiple at or above the legacy 500 px default).
+DEFAULT_CROP_W = DEFAULT_CROP_SIZE
+DEFAULT_CROP_H = DEFAULT_CROP_SIZE
+
+# DX (Nikon APS-C) crop factor. Re-exported from the shared module so
+# pre-existing callers of ``sharpness.crops.DX_FACTOR`` keep working.
+DX_FACTOR = _DX_FACTOR
 
 CROP_NAMES_FULL_FRAME = (
     "center",
@@ -101,22 +115,20 @@ class CropBox:
 def _full_frame_boxes(
     image_w: int, image_h: int, crop_w: int, crop_h: int
 ) -> dict[str, CropBox]:
-    """Nine 500×500 crops on the full image: centre, four edges, four corners."""
-    cx = image_w // 2 - crop_w // 2
-    cy = image_h // 2 - crop_h // 2
-    rx = image_w - crop_w  # right column
-    by = image_h - crop_h  # bottom row
-    return {
-        "center": _box(cx, cy, crop_w, crop_h),
-        "left-edge": _box(0, cy, crop_w, crop_h),
-        "right-edge": _box(rx, cy, crop_w, crop_h),
-        "top-edge": _box(cx, 0, crop_w, crop_h),
-        "bottom-edge": _box(cx, by, crop_w, crop_h),
-        "top-left": _box(0, 0, crop_w, crop_h),
-        "top-right": _box(rx, 0, crop_w, crop_h),
-        "bottom-right": _box(rx, by, crop_w, crop_h),
-        "bottom-left": _box(0, by, crop_w, crop_h),
-    }
+    """Nine 512x512 crops on the full image: centre, four edges, four corners.
+
+    Origins come from
+    :func:`lens_test_detect_core.mcu.compute_crop_origins` so they're
+    always 16-aligned for lossless JPEG cropping. Only valid when
+    ``crop_w == crop_h``; that's the case for every caller in this
+    project.
+    """
+    if crop_w != crop_h:
+        raise ValueError(
+            f"full-frame boxes require square crops; got {crop_w}x{crop_h}"
+        )
+    origins = compute_crop_origins(image_w, image_h, crop_w)
+    return {name: _box(x, y, crop_w, crop_h) for name, (x, y) in origins.items()}
 
 
 def _dx_boxes(
@@ -124,31 +136,15 @@ def _dx_boxes(
 ) -> dict[str, CropBox]:
     """Eight crops on the DX (APS-C) inner region.
 
-    Matches the integer arithmetic in the bash script: zsh evaluates
-    ``image_width / 1.5`` as integer division (truncation) when the
-    operands are integers — but 1.5 is floating-point, so zsh promotes
-    and truncates the result. We replicate that with ``int(...)``.
+    Origins come from
+    :func:`lens_test_detect_core.mcu.compute_dx_origins` so they're
+    always 16-aligned for lossless JPEG cropping. Only valid when
+    ``crop_w == crop_h``; that's the case for every caller.
     """
-    dxw = int(image_w / DX_FACTOR)
-    dxh = int(image_h / DX_FACTOR)
-    left_margin = (image_w - dxw) // 2
-    top_margin = (image_h - dxh) // 2
-
-    dx_cx = left_margin + (dxw // 2) - crop_w // 2
-    dx_cy = top_margin + (dxh // 2) - crop_h // 2
-    dx_rx = left_margin + dxw - crop_w
-    dx_by = top_margin + dxh - crop_h
-
-    return {
-        "dx-left-edge": _box(left_margin, dx_cy, crop_w, crop_h),
-        "dx-top-left": _box(left_margin, top_margin, crop_w, crop_h),
-        "dx-top-edge": _box(dx_cx, top_margin, crop_w, crop_h),
-        "dx-top-right": _box(dx_rx, top_margin, crop_w, crop_h),
-        "dx-right-edge": _box(dx_rx, dx_cy, crop_w, crop_h),
-        "dx-bottom-right": _box(dx_rx, dx_by, crop_w, crop_h),
-        "dx-bottom-edge": _box(dx_cx, dx_by, crop_w, crop_h),
-        "dx-bottom-left": _box(left_margin, dx_by, crop_w, crop_h),
-    }
+    if crop_w != crop_h:
+        raise ValueError(f"dx boxes require square crops; got {crop_w}x{crop_h}")
+    origins = compute_dx_origins(image_w, image_h, crop_w)
+    return {name: _box(x, y, crop_w, crop_h) for name, (x, y) in origins.items()}
 
 
 def _box(x: int, y: int, w: int, h: int) -> CropBox:
@@ -163,6 +159,11 @@ def all_crop_boxes(
     crop_h: int = DEFAULT_CROP_H,
 ) -> dict[str, CropBox]:
     """All 17 crop windows for an image of the given size.
+
+    Origins are MCU-aligned (every ``left`` and ``top`` is a multiple
+    of 16) so the boxes feed directly into
+    :func:`turbojpeg.TurboJPEG.crop_multiple` for lossless JPEG
+    extraction.
 
     Raises ``ValueError`` if the image is smaller than the crop size or
     smaller than the DX-inner region.
