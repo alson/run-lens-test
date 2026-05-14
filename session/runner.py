@@ -897,14 +897,7 @@ class SessionRunner:
         and session metadata are written, lens-change recovery is
         triggered.
         """
-        calibrator = Calibrator(
-            camera=self.camera,
-            measure=self._measure,
-            config=self.config,
-            shots_csv=self.shots_csv,
-            now=self.now,
-            progress=self._calibration_progress,
-        )
+        calibrator = self._make_calibrator()
         aggregate = CalibrationResult(
             baseline_median=self.baseline_median or 0.0
         )
@@ -1226,14 +1219,7 @@ class SessionRunner:
             f"Calibrating {slug}: {len(apertures)} apertures "
             f"({', '.join(apertures)})..."
         )
-        calibrator = Calibrator(
-            camera=self.camera,
-            measure=self._measure,
-            config=self.config,
-            shots_csv=self.shots_csv,
-            now=self.now,
-            progress=self._calibration_progress,
-        )
+        calibrator = self._make_calibrator()
         # Calibration retry loop. If any aperture fails to reach
         # tolerance, the user can adjust the rig and re-run
         # calibration WITHOUT re-jogging — different from the
@@ -2808,7 +2794,16 @@ class SessionRunner:
     def _make_calibrator(self) -> "Calibrator":
         """Build a Calibrator with the same wiring used during the
         initial calibration pass. Centralised so the mid-sweep
-        re-cal path stays in sync with the up-front cal pass."""
+        re-cal path stays in sync with the up-front cal pass.
+
+        ``before_capture`` hooks into the runner's shared recycle
+        accounting (``_wait_for_recycle`` + ``_last_capture_*``) so
+        cal frames fire on the same flash-charge state as sweep
+        frames. Without this, a back-to-back cal cascade can under-
+        read vs steady-state — and a subsequent sweep at the same
+        FEC will then read brighter, falsely tripping the over-
+        exposure droop criterion.
+        """
         return Calibrator(
             camera=self.camera,
             measure=self._measure,
@@ -2816,7 +2811,19 @@ class SessionRunner:
             shots_csv=self.shots_csv,
             now=self.now,
             progress=self._calibration_progress,
+            before_capture=self._before_calibration_capture,
         )
+
+    def _before_calibration_capture(self, aperture: str) -> None:
+        """Recycle-aware hook handed to :class:`Calibrator`. Waits
+        the previous shot's recycle out (if any), then records the
+        new capture's start time + aperture in the runner-shared
+        state so the *next* shot — whether sweep or cal — also
+        waits correctly.
+        """
+        self._wait_for_recycle()
+        self._last_capture_started_at = self.monotonic()
+        self._last_capture_aperture = aperture
 
     def _handle_calibration_failure(
         self,

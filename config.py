@@ -239,7 +239,18 @@ a plateau-driven ISO bump to settle."""
 
 # ---- Droop detector ---------------------------------------------------------
 
-ROLLING_WINDOW = 10
+ROLLING_WINDOW = 30
+"""Number of sweep samples kept in the droop detector's rolling
+deque. Also bounds the rewind search: a moderate criterion that
+fires after a slow drift can only rewind as far back as the oldest
+sample still in the window.
+
+At 3 replicas × 3–4 apertures per rail step, 30 ≈ 2–3 rail steps
+of history. Wide enough to catch a gradual drift that took a couple
+of steps to build past trigger, while still narrow enough that an
+isolated single-shot anomaly (e.g. one missed flash recycle two
+steps ago) doesn't keep tripping the moderate criterion after the
+rig has clearly recovered."""
 # Droop trip criteria — evaluated in order; whichever fires first
 # wins. The detector pools pushes session-wide (across every
 # aperture in the sweep), so consecutive off-target shots at
@@ -252,9 +263,9 @@ ROLLING_WINDOW = 10
 # trips trigger silent re-calibration (no battery prompt, no user
 # pause). Both then reshoot from the earliest off-tolerance frame.
 DROOP_CRIT_A = (1, -2.0)   # 1 severe shot ≤ -2 EV — fire immediately
-DROOP_CRIT_B = (2, -0.7)   # 2 of last 10 ≤ -0.7 EV — gradual drift
-DROOP_OVER_CRIT_A = (1, +2.0)   # 1 severe shot ≥ +2 EV — fire immediately
-DROOP_OVER_CRIT_B = (2, +0.7)   # 2 of last 10 ≥ +0.7 EV — gradual shift
+DROOP_CRIT_B = (2, -0.5)   # 2 of last N ≤ -0.5 EV — gradual drift
+DROOP_OVER_CRIT_A = (1, +1.0)   # 1 severe shot ≥ +1 EV — fire immediately
+DROOP_OVER_CRIT_B = (2, +0.4)   # 2 of last N ≥ +0.4 EV — gradual shift
 
 # Rewind / re-cal tolerance. When a droop event fires, the search
 # for "earliest off-target frame" uses ±this threshold rather than

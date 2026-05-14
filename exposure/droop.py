@@ -11,21 +11,22 @@ e.g. flash position bumped during a battery swap).
 Pooling across apertures is deliberate: a real flash droop tends to
 spread across consecutive captures regardless of the aperture they
 happened at. If two adjacent shots at f/5.6 and f/8 both come back
-≤ −0.7 EV, that's already enough signal to act, even though
+≤ −0.5 EV, that's already enough signal to act, even though
 neither aperture has been pushed against twice. Per-aperture
 isolation (the original design) was insensitive to that pattern.
 
-Trip criteria — whichever fires first:
+Trip criteria — whichever fires first; thresholds come from config:
 
-* Under, severe: a single shot ≤ −2 EV. Catches a flash hitting
-  its mechanical-min on one capture.
-* Under, moderate: two of the last ``ROLLING_WINDOW`` shots ≤ −0.7
-  EV. Catches gradual battery drift before catastrophic.
-* Over, severe: a single shot ≥ +2 EV. Catches gross rig-shift
-  events (e.g. flash AA sensor view fully clipped).
-* Over, moderate: two of the last ``ROLLING_WINDOW`` shots ≥ +0.7
-  EV. Catches subtler rig-shifts (e.g. flash A bumped during a
-  battery swap → AA over-fires by ~⅔ stop on subsequent frames).
+* Under, severe (``DROOP_CRIT_A``, default 1 × −2 EV): catches a
+  flash hitting its mechanical-min on one capture.
+* Under, moderate (``DROOP_CRIT_B``, default 2 × −0.5 EV): catches
+  gradual battery drift before any single shot is catastrophic.
+* Over, severe (``DROOP_OVER_CRIT_A``, default 1 × +1 EV): catches
+  gross rig-shift events (e.g. flash AA sensor view fully clipped,
+  or wrong commander setting after a swap).
+* Over, moderate (``DROOP_OVER_CRIT_B``, default 2 × +0.4 EV):
+  catches subtler rig-shifts (e.g. flash A bumped during a battery
+  swap → AA over-fires by half a stop on subsequent frames).
 
 The :class:`DroopEvent` carries a ``direction`` field ("under" or
 "over") so the caller can branch: under → prompt battery swap,

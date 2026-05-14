@@ -585,6 +585,81 @@ class TestLinearCascade:
         assert result.ec_ev == 0.0
         assert not result.iso_bumped
 
+    def test_final_median_reflects_converged_fec_not_probe(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Regression for the cascade bug where ``final_median`` was
+        # the headroom-probe's median (taken at a probe-FEC, not the
+        # converged FEC). That mismatch made the runner's downstream
+        # ev_delta(sweep_median, cal.final_median) read full-stop
+        # over-exposure on every sweep frame and runaway-trip the
+        # over-direction droop criterion.
+        #
+        # Snap-favorable branch: shot 1 dim by 1 EV → shot 2 at FEC=+1
+        # lands on baseline (med=129) → shot 3 probe at FEC+1 reads
+        # +1 EV brighter (med=~159). Bug: returned final_median was
+        # ~159. Fix: final_median must reflect shot 2's 129.
+        baseline = 129.0
+        shot2_median = baseline                           # cal target
+        probe_median = _median_from_ev(baseline, 1.0)     # +1 EV brighter
+        medians = [
+            _median_from_ev(baseline, -1.0),  # shot 1: 1 EV under
+            shot2_median,                      # shot 2: on target
+            probe_median,                      # shot 3 (probe): +1 EV
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.fec_ev == pytest.approx(1.0)
+        assert result.final_median == pytest.approx(shot2_median, abs=0.5), (
+            f"final_median={result.final_median} should match shot 2's "
+            f"median {shot2_median}, not probe shot's {probe_median}"
+        )
+
+    def test_final_median_shortcut_uses_shot1_value(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Shortcut branch: shot 1 (at carried-over FEC) already lands
+        # within ⅙ EV → shot 2 skipped → shot 3 headroom probe runs.
+        # final_median must reflect shot 1's median, not the probe's.
+        baseline = 129.0
+        shot1_median = baseline                           # on target
+        probe_median = _median_from_ev(baseline, 1.0)     # +1 EV
+        medians = [shot1_median, probe_median]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+            prev_fec=0.5,  # force carry-over so shot 1 is the "converged" shot
+        )
+        assert result.hit_tolerance
+        assert result.final_median == pytest.approx(shot1_median, abs=0.5)
+
+    def test_final_median_iso_bump_branch_uses_shot4(
+        self, camera, linear_cfg, tmp_path
+    ) -> None:
+        # Flash-maxed → ISO bump branch: shot 4 fires at higher ISO +
+        # shot 2's FEC. final_median should be shot 4's median.
+        baseline = 129.0
+        shot4_median = baseline                           # post-bump on target
+        medians = [
+            _median_from_ev(baseline, -2.0),  # shot 1: way under
+            _median_from_ev(baseline, -1.5),  # shot 2 still under (flash maxed)
+            _median_from_ev(baseline, -1.5),  # shot 3 probe — no slope → flash maxed
+            shot4_median,                      # shot 4: post ISO bump, on target
+        ]
+        calib = make_calibrator(camera, linear_cfg, medians=medians)
+        result, _ = calib._calibrate_aperture(
+            aperture="f/4", lens_slug="lens", session_id="s",
+            capture_dir=tmp_path, baseline=baseline,
+        )
+        assert result.hit_tolerance
+        assert result.iso_bumped
+        assert result.final_median == pytest.approx(shot4_median, abs=0.5)
+
     def test_three_shot_happy_path_dim_corrected(
         self, camera, linear_cfg, tmp_path
     ) -> None:

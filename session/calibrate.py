@@ -168,6 +168,7 @@ class Calibrator:
         shots_csv: ShotsCSV | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc),
         progress: Callable[..., None] | None = None,
+        before_capture: Callable[[str], None] | None = None,
     ) -> None:
         self._camera = camera
         self._measure = measure
@@ -179,11 +180,33 @@ class Calibrator:
         # SessionRunner._calibration_progress for the production
         # renderer. Default no-op so tests stay opaque to UI.
         self._progress = progress or (lambda **kw: None)
+        # Called immediately before each ``camera.capture_to`` with the
+        # aperture about to fire. Production runner uses this to wait
+        # for the previous shot's flash recycle (per RANGE_EXTENSION)
+        # and record the new shot's start time — so a cal cascade
+        # sees the same flash-charge state as a sweep frame would.
+        # Without this, back-to-back cal shots fire on a partially
+        # charged capacitor (especially when the rig is bright and
+        # FEC is pushed toward the floor), under-reading vs the
+        # steady-state sweep and causing spurious over-exposure
+        # trips on the first sweep frames after cal. Tests pass a
+        # no-op; the legacy `None` default also skips the wait so
+        # existing callers don't break.
+        self._before_capture = before_capture
         # Per-aperture context the cascade fills in for the progress
         # callback. ``Calibrator.run`` is the place that knows the
         # aperture index/count; the cascade just reads these.
         self._cal_aperture_index = 0
         self._cal_aperture_count = 1
+
+    def _capture(self, dest, aperture: str) -> None:
+        """Centralised capture helper that runs the recycle-wait hook
+        before delegating to ``camera.capture_to``. All cal paths
+        funnel their captures through here so the recycle-state
+        accounting stays in one place."""
+        if self._before_capture is not None:
+            self._before_capture(aperture)
+        self._camera.capture_to(dest)
 
     # ---- Public entry point ------------------------------------------------
 
@@ -315,7 +338,7 @@ class Calibrator:
                 context=f"coarse search step {iteration + 1}",
             )
             dest = capture_dir / _calibration_filename(aperture, shots_taken)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             median = self._measure(dest)
             last_median = median
             shots_taken += 1
@@ -545,7 +568,7 @@ class Calibrator:
         shots_taken = 0
         # First-shot sanity check.
         dest = capture_dir / _calibration_filename(aperture, shots_taken)
-        self._camera.capture_to(dest)
+        self._capture(dest, aperture)
         median = self._measure(dest)
         shots_taken += 1
         delta = ev_delta(median, baseline_median)
@@ -581,7 +604,7 @@ class Calibrator:
                     "user aborted at sanity-check re-prompt"
                 )
             dest = capture_dir / _calibration_filename(aperture, shots_taken)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             median = self._measure(dest)
             shots_taken += 1
             delta = ev_delta(median, baseline_median)
@@ -775,7 +798,7 @@ class Calibrator:
         converged_shot_index = -1
         for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
             dest = capture_dir / _calibration_filename(aperture, shot_index)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             median = self._measure(dest)
             last_median = median
 
@@ -1009,7 +1032,7 @@ class Calibrator:
         converged_shot_index = -1
         for shot_index in range(cfg.TEST_SHOT_MAX_RETRIES + 1):
             dest = capture_dir / _calibration_filename(aperture, shot_index)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             median = self._measure(dest)
             last_median = median
 
@@ -1217,7 +1240,7 @@ class Calibrator:
                 label=notes,
             )
             dest = capture_dir / _calibration_filename(aperture, shots)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             median = self._measure(dest)
             shots += 1
             last_median = median
@@ -1268,6 +1291,7 @@ class Calibrator:
         if abs(delta_0) <= sixth:
             target_bias = 0.0
             delta_1 = delta_0
+            shot2_median = last_median  # shot 1's median IS the target
             # ec_used / fec / ec already reflect carried-over state.
         else:
             # ---- Compute target & shot 2 -----------------------------
@@ -1284,7 +1308,7 @@ class Calibrator:
             self._camera.set_fec(fec)
             if hasattr(self._camera, "set_ec"):
                 self._camera.set_ec(ec)
-            _, delta_1 = shoot("linear shot 2 (target)")
+            shot2_median, delta_1 = shoot("linear shot 2 (target)")
 
         # ---- Shot 3: headroom probe ----------------------------------
         # Probe in the same sign as the original adjustment, by one
@@ -1317,6 +1341,16 @@ class Calibrator:
             slope = (delta_2 - delta_1) / actual_probe_step
 
         # ---- Classify -----------------------------------------------
+        # In each branch that "accepts" without taking a fresh capture
+        # at the converged FEC, we must restore ``last_median`` to
+        # shot 2's median (saved as ``shot2_median``). Without this,
+        # ``last_median`` retains the headroom probe's reading (taken
+        # at a probe-FEC, not the converged FEC), and the returned
+        # ``ApertureCalibration.final_median`` becomes inconsistent
+        # with ``final_ev_delta``. Downstream that mismatch makes
+        # ``ev_delta(sweep_median, cal.final_median)`` look like a
+        # full stop of over-exposure on every sweep frame, falsely
+        # tripping the over-direction droop criterion.
         slope_healthy = 0.7
         slope_maxed = 0.3
         if can_probe and slope >= slope_healthy:
@@ -1340,6 +1374,7 @@ class Calibrator:
                 fec, ec = shot2_fec, shot2_ec
                 ec_used = shot2_ec_used
                 last_delta = delta_1
+                last_median = shot2_median
                 converged = True
             else:
                 # Snap rounded the wrong way. Adjust ±⅓ stop and
@@ -1364,6 +1399,13 @@ class Calibrator:
                 # More negative bias → darker image → delta -= ⅓.
                 # The sign of ``adjustment`` matches this directly.
                 last_delta = delta_1 + adjustment
+                # Predicted median at the refined FEC: shot2_median
+                # scaled by the predicted EV adjustment (linear regime
+                # → 1 EV ≈ 2x in linear light → 2^(1/2.2) in sRGB-ish
+                # 8-bit). We use the inverse of ``ev_delta`` here:
+                # median = baseline * 2^(ev/gamma); equivalently,
+                # scale shot2_median by 2^(adjustment/gamma).
+                last_median = shot2_median * (2.0 ** (adjustment / 2.2))
                 converged = abs(last_delta) <= tolerance
         elif not can_probe or slope < slope_maxed or (slope < slope_healthy and abs(delta_1) > tolerance):
             # Flash maxed (or borderline + off-target). Bump ISO by
@@ -1382,6 +1424,7 @@ class Calibrator:
                     ec_used = shot2_ec_used
                 converged = True
                 last_delta = delta_1
+                last_median = shot2_median
             else:
                 stops_to_bump = max(1, int(round(deficit_ev / iso_step_ev)))
                 new_iso = iso
@@ -1430,6 +1473,7 @@ class Calibrator:
             # can_probe was False — accept.
             converged = abs(delta_1) <= tolerance
             last_delta = delta_1
+            last_median = shot2_median
 
         return ApertureCalibration(
             aperture=aperture,
@@ -1512,7 +1556,7 @@ class Calibrator:
             self._camera.set_ec(new_ec)
         self._camera.set_iso(new_iso)
         dest = capture_dir / _calibration_filename(aperture, shot_index)
-        self._camera.capture_to(dest)
+        self._capture(dest, aperture)
         median = self._measure(dest)
         delta = ev_delta(median, baseline)
         self._log_shot(
@@ -1624,7 +1668,7 @@ class Calibrator:
             last_delta = initial_delta
         else:
             dest = capture_dir / _calibration_filename(aperture, shots_taken)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             last_median = self._measure(dest)
             shots_taken += 1
             last_delta = ev_delta(last_median, baseline)
@@ -1650,7 +1694,7 @@ class Calibrator:
                 iso = dropped
             self._camera.set_iso(iso)
             dest = capture_dir / _calibration_filename(aperture, shots_taken)
-            self._camera.capture_to(dest)
+            self._capture(dest, aperture)
             last_median = self._measure(dest)
             shots_taken += 1
             last_delta = ev_delta(last_median, baseline)

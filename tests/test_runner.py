@@ -528,19 +528,21 @@ class TestRecycleWait:
         return sleeps
 
     def test_first_shot_does_not_wait(self, cfg, tmp_path) -> None:
-        # First sweep shot has no prior capture timestamp -> _wait_for_recycle
-        # returns immediately. Each shot consumes one monotonic() call for
-        # the ETA EWMA, one for the recycle wait (from shot 2 on), and one
-        # to stamp _last_capture_started_at. With recycle=3.0s for f/4 in
-        # cfg and a 100-second gap, no sleep should happen at all.
+        # Calibration's recycle hook stamps _last_capture_started_at,
+        # so by the time the sweep starts there IS a prior capture
+        # record. With a 100-second gap between the cal stamp and the
+        # sweep's wait-read, no sleep should be issued (elapsed >>
+        # recycle).
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
             monotonic_seq=[
-                0.0,    # shot 1 ETA record
-                0.0,    # shot 1 stamp
-                100.0,  # shot 2 ETA record
-                100.0,  # shot 2 wait read (elapsed=100 >> 3 → no sleep)
-                100.0,  # shot 2 stamp
+                0.0,    # cal stamp (recycle hook records start)
+                100.0,  # sweep shot 1 ETA record
+                100.0,  # sweep shot 1 wait read (elapsed=100 >> 3 → no sleep)
+                100.0,  # sweep shot 1 stamp
+                200.0,  # sweep shot 2 ETA record
+                200.0,  # sweep shot 2 wait read
+                200.0,  # sweep shot 2 stamp
             ],
         )
         # No sleep should have been issued by _wait_for_recycle.
@@ -549,14 +551,19 @@ class TestRecycleWait:
     def test_waits_only_remaining_recycle(self, cfg, tmp_path) -> None:
         # Recycle for f/4 is 3.0s in the test cfg. If 1.0s elapsed
         # between captures already, we should sleep 2.0s, not 3.0s.
+        # The cal recycle hook starts the clock at t=-100s so cal→
+        # sweep-shot-1 has plenty of elapsed; only the sweep-shot-1→
+        # sweep-shot-2 transition tests the partial-wait path.
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
             monotonic_seq=[
-                0.0,    # shot 1 ETA record
-                0.0,    # shot 1 stamp
-                1.0,    # shot 2 ETA record
-                1.0,    # shot 2 wait read → remaining = 3 - 1 = 2
-                1.0,    # shot 2 stamp
+                -100.0,  # cal stamp
+                0.0,     # sweep shot 1 ETA record
+                0.0,     # sweep shot 1 wait read (elapsed=100 >> 3 → no sleep)
+                0.0,     # sweep shot 1 stamp
+                1.0,     # sweep shot 2 ETA record
+                1.0,     # sweep shot 2 wait read → remaining = 3 - 1 = 2
+                1.0,     # sweep shot 2 stamp
             ],
         )
         assert sleeps == [pytest.approx(2.0)]
@@ -566,14 +573,64 @@ class TestRecycleWait:
         sleeps = self._drive_one_step_one_aperture(
             cfg, tmp_path,
             monotonic_seq=[
-                0.0,    # shot 1 ETA record
-                0.0,    # shot 1 stamp
-                5.0,    # shot 2 ETA record
-                5.0,    # shot 2 wait read
-                5.0,    # shot 2 stamp
+                -100.0,  # cal stamp
+                0.0,     # sweep shot 1 ETA record
+                0.0,     # sweep shot 1 wait read
+                0.0,     # sweep shot 1 stamp
+                5.0,     # sweep shot 2 ETA record
+                5.0,     # sweep shot 2 wait read
+                5.0,     # sweep shot 2 stamp
             ],
         )
         assert sleeps == []
+
+    def test_calibrator_invokes_before_capture_hook(self, cfg, tmp_path) -> None:
+        # Direct unit test on the Calibrator: every camera.capture_to
+        # MUST be preceded by a call into the before_capture hook with
+        # the firing aperture. The hook is what wires cal captures into
+        # the runner-shared recycle accounting so cal frames match
+        # steady-state sweep flash output.
+        from collections import deque
+        from datetime import datetime, timezone
+        from session.calibrate import Calibrator
+
+        cfg.LINEAR_CASCADE_ENABLED = True
+        cfg.ISO_STEP_EV = 1.0 / 3.0
+
+        camera = FakeCamera(apertures=["f/4"])
+        # Shot 1 = baseline; shot 2 target; shot 3 headroom. With a
+        # baseline supplied, the cascade runs the full 3 shots.
+        medians = deque([129.0, 150.0, 129.0, 100.0])
+
+        def _measure(_p):
+            return medians.popleft() if medians else 129.0
+
+        before_capture_calls: list[str] = []
+
+        def _before(ap: str) -> None:
+            before_capture_calls.append(ap)
+
+        cal = Calibrator(
+            camera=camera,
+            measure=_measure,
+            config=cfg,
+            shots_csv=None,
+            now=lambda: datetime(2026, 5, 14, 12, 0, tzinfo=timezone.utc),
+            before_capture=_before,
+        )
+        cal.run(
+            lens_dir=tmp_path,
+            lens_slug="L",
+            session_id="s",
+            apertures=["f/4"],
+            baseline_median=129.0,
+        )
+
+        capture_count = sum(1 for k, _ in camera.history if k == "capture")
+        # before_capture must fire once per capture, with the firing
+        # aperture passed through.
+        assert len(before_capture_calls) == capture_count
+        assert all(ap == "f/4" for ap in before_capture_calls)
 
 
 # ---- Droop pause + resume --------------------------------------------------
