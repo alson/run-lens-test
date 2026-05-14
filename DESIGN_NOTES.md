@@ -1995,3 +1995,208 @@ or rig state changes):
 * `test_linear_cascade.py` — isolated live-rig validation script
   for the new linear cascade. Runs one or more apertures with no
   rail movement, logs each shot to `shots.csv`.
+
+---
+
+### 6.33 Mid-reshoot session findings (2026-05-14/15)
+
+A long reshoot session surfaced several inter-related bugs and
+design gaps. Documented together because the diagnosis chain
+weaves between them.
+
+**A. Jog panel-first + s/e in panel (commit `4085f9b`).** The jog
+loop now starts in front-panel mode by default; ENTER drops to
+keyboard. `s` in panel sets START *without* reacquiring the camera
+(so the next jog stays in live view); `e` reacquires (capture
+begins). `jog_start_and_end` wraps `on_release` / `on_reacquire` as
+idempotent so the camera stays released across both jogs unless
+keyboard mode is used. Saves ~5 s of camera close/open per jog and
+makes the panel-driven workflow the default fast path instead of a
+SPACE-toggle opt-in.
+
+**B. Cascade carry-over across apertures (commit `4085f9b`).** The
+linear cascade now seeds shot 1 of aperture N+1 with the converged
+FEC/EC/ISO of aperture N (`prev_fec/prev_ec/prev_iso` threaded
+through `Calibrator.run`). A new shortcut: if shot 1 lands within
+⅙ EV of baseline (i.e. carry-over was already correct), skip the
+shot-2 target adjustment and go straight to the headroom probe.
+ISO is monotonically raised across apertures (`iso = max(prev_iso,
+baseline_iso_for_aperture)`) — a stopped-down aperture only ever
+needs more sensitivity, never less.
+
+**C. Two-sided droop + post-pause sanity + tolerance-based rewind
+(commit `4085f9b`).** `DroopDetector` is now directional: each
+`TripCriterion` has a `direction` ("under" / "over"), auto-derived
+from threshold sign. New config:
+* `DROOP_OVER_CRIT_A` / `DROOP_OVER_CRIT_B` mirror the under
+  criteria with positive thresholds.
+* `DROOP_REWIND_TOLERANCE_EV` (default 0.3) — separate from the
+  firing threshold. When droop fires, the rewind search uses this
+  tighter tolerance so frames that drifted *just* short of the
+  trigger also get reshot. Old behaviour rewound only to frames
+  past the firing threshold, leaving mildly-tainted preceding
+  frames in the dataset.
+
+`_handle_droop` branches on direction:
+* **Under** → existing battery-swap prompt, then a single sanity
+  capture at the firing aperture's cal settings. If sanity reads
+  **over** tolerance (rig shifted *during* the pause — e.g. the
+  user bumped flash A while swapping batteries), `_recalibrate_at_
+  current_position` runs before the reshoot. If sanity is still
+  under, no re-cal — the reshoot proceeds and will trip droop again
+  if batteries weren't actually swapped.
+* **Over** → no prompt, no pause; silent re-cal + reshoot.
+
+The over-direction was motivated by a real session that drifted to
++0.7 EV after a battery swap and rode the gap silently across 30+
+frames before a separate catastrophic flash failure tripped severe
+under-droop. That session's analysis showed: the under-only droop
+detector was structurally one-sided (`<=` only), and the rewind
+search reused the firing threshold rather than a tolerance.
+
+**D. Linear-cascade `final_median` bug (commit `ccf63ee`).** While
+investigating a runaway *over-trip* loop, found that the linear
+cascade's returned `ApertureCalibration.final_median` was the
+**headroom-probe's** median (taken at fec ± 1 stop from the
+converged setting), not the converged shot's median. The
+downstream effect was severe: the runner uses
+`ev_delta(sweep_median, cal.final_median)` as the droop push for
+`ev_to_cal`, and that delta read **~+1 stop over-exposure on every
+sweep frame** at the converged FEC, because `final_median` was
+~1 stop dimmer than the actual converged shot. With the new
+over-direction criterion at +0.4 EV moderate, this trip-looped
+forever: cal converges → push reads +1 EV vs broken final_median →
+over-trip → re-cal → same bug → loop.
+
+Fix: every cascade branch that "accepts" without taking a fresh
+capture at the converged FEC now restores `last_median` from a
+saved `shot2_median`:
+* shortcut (shot 1 within ⅙ EV) — shot 1 IS the converged shot
+* snap-favorable (shot 2 within ⅙ EV) — shot 2's median
+* snap-error refinement — predicted via slope-1 extrapolation
+* slope-healthy / no-probe / borderline accept — shot 2's median
+
+ISO-bump branches (shot 4 / shot 5) were already correct via the
+nonlocal `shoot()` update.
+
+Diagnostic chain that led to the fix:
+* `tools/light_test_cal.py` (per-aperture FEC=0 probe) refuted
+  the 135 W LED focusing light contribution at 1/200 s (~0.02 EV).
+* `tools/cap_state_probe.py` refuted the cap-state asymmetry
+  theory — fec=-2.0 reads consistently at -0.12 EV regardless of
+  preceding shot energy or recycle delay.
+* `tools/batched_vs_individual_fec.py` confirmed the runner's
+  batched setter and the calibrator's individual setters produce
+  identical FEC readings.
+* `tools/cal_vs_sweep_path.py` confirmed the two capture paths are
+  equivalent at the same FEC.
+* `tools/rail_position_probe.py` showed rail-position-dependent
+  rig brightness across the user's jog range — but the magnitudes
+  (~0.3 EV across 4 mm) didn't account for the observed +1 EV gap.
+
+Only after all four hypotheses were eliminated did inspection of
+the cascade's return values reveal the `final_median` mismatch.
+
+**E. Calibrator recycle hook (commit `ccf63ee`).** The calibrator
+previously fired shots back-to-back with no recycle wait. While
+not the cause of the over-trip loop (see D), it's a correctness
+issue independent: cal frames now match the sweep's
+`_wait_for_recycle` timing so calibration and sweep see the same
+flash-charge state. Implemented as `Calibrator(before_capture=...)`
+hooking into the runner-shared `_last_capture_started_at` /
+`_last_capture_aperture` state.
+
+**F. Threshold tuning.** Empirically calibrated against the
+~0.4 EV systematic offset typical at high-bellows configs:
+* `ROLLING_WINDOW = 30` (was 10) — captures ~2–3 rail steps of
+  history so a moderate trip can rewind far enough back to catch a
+  gradual drift.
+* `DROOP_CRIT_B = (2, -0.5)` (was -0.7).
+* `DROOP_OVER_CRIT_A = (1, +1.0)` (was +2.0).
+* `DROOP_OVER_CRIT_B = (2, +0.4)` (was +0.7) — close to cal
+  tolerance (⅓ EV); tight but with the rewind tolerance at 0.3 EV
+  there's still some margin before the rewind search loses anchor.
+
+**G. Droop in extension + probe (commit `92f5c18`).** Both the
+range-check probe loop and the extension-fill loops use
+`_shoot_at_position`, which captured frames and logged them but
+never pushed to the `DroopDetector`. A real session demonstrated
+the consequence: ~58 dead frames (`med=1, ev=-15 EV`) shot during
+a 16-step start-side extension after the flash batteries failed
+mid-extension; the runner silently kept firing and only the
+*next* lens config's sweep tripped the (severe) criterion.
+
+Fix: `_shoot_at_position` accepts an optional droop detector and
+mirrors the sweep's push (`ev_to_cal = ev_delta(median,
+cal.final_median or self.baseline_median or 1.0)`) with
+short-circuit + return-event-to-caller. The three call sites
+(`_run_range_check_and_extend` probe loop, extend-more loop,
+extension-fill loop) now propagate trips to `_handle_droop` the
+same way the sweep does. Phase A's existing inline push at the
+top of `_run_one_lens_config` is untouched (it doesn't use
+`_shoot_at_position`).
+
+**H. Bokeh false-sharpness vs genuine field curvature.** At low
+magnification with long lenses (100-400 + close-up diopter,
+1.07–1.27x; 70-180 at 1:1.33), the range checker repeatedly
+flags `peak_side=both` even after extensive extensions. Per-crop
+sharpness curves (JPEG file size) show this is *usually* the
+out-of-focus bokeh disks at extreme rail positions registering
+as "edges" to the wavelet metric — sharpness rises again at the
+extremes even though the actual focus peak is well inside the
+window.
+
+But not always: on the 100-400 + 500D at 1.07x, the same per-crop
+analysis showed the **top corners fall monotonically from the
+sweep start onward**, meaning their actual focus peak is at a
+*more positive* rail position than the swept range — **genuine
+field curvature**. Distinguishing requires inspecting per-crop
+curves, not just the range checker's verdict:
+* All crops bracketed in the middle of the window + extreme
+  sharpness re-rise → bokeh-driven false signal; skip extension.
+* Some crops still rising at one window edge → genuine peak
+  outside; small targeted extension warranted.
+
+**I. Magnification-swap incident in the reshoot plan.** The
+2026-01-29 dataset's 100-400 + Nikon 5T and 100-400 + Nikon 6T
+magnification labels were transposed (1.27:1 and 1:1.19
+swapped) during manual entry, contradicting diopter-strength
+order (+1.5 D 5T should give *less* magnification than +2.9 D 6T,
+not more). Verified by measuring wafer-square pixel widths
+against Sigma 150 / Sigma 105 / MC 105 1:1 reference frames. The
+500D (+2 D) entry at 1.07:1 was correct and matched the
+theoretical mid-point.
+
+Corrected end-to-end:
+* `reshoot-plan-2026-05.md` entries 27 and 29 swapped + reordered
+  for descending magnification (commit `da24a43` in
+  analyse-lens-test).
+* ~16,400 image filenames under `test-{raw,results}/2026-01-29/`
+  renamed (the magnification field inside the pipe-separated
+  basenames) plus 4 magnification directories.
+* All `*-resized` siblings under the 5T and 6T trees were
+  regenerated with the corrected source magnifications — the old
+  resize factors were derived from the swapped labels and
+  produced images at 0.66x / 1.51x instead of the claimed 1:1.
+
+**J. Multi-session merge with relative symlinks (commit
+`3769014`).** `tools/merge_sessions.py:_symlink` now produces
+relative symlinks via `os.path.relpath` instead of absolute paths,
+keeping merged folders portable across mount-point moves.
+Existing merges (`merged_24-120_2026-05-08`,
+`merged_viltrox-85_2026-05-10`) had their ~26k+26k absolute links
+rewritten in place.
+
+A 3-session merge (`merged_100-400-6T_2026-05-14`) consolidated
+the 100-400 + 6T captures into one unified coordinate frame:
+* r2 (the reshoot that recovered the original flash-dead
+  start-side extension) provides the primary middle coverage.
+* r3 (a small targeted gap-fill at the tail end) covers
+  -3.33 to -3.9 mm.
+* r1 (the original with the flash-dead start-side) contributes
+  only calibration rows; its bad start-side is fully bracketed by
+  r2 and dropped by the priority-first-wins rule.
+
+54 grid positions, 4 apertures × 3+ replicas in the centre with
+triple-overlap, f/16 at the design every-other-step density.
+
