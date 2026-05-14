@@ -119,14 +119,19 @@ def _captured_range(rows: list[dict], offset_mm: float = 0.0):
 
 
 def _symlink(target: Path, link_path: Path) -> bool:
-    """Best-effort absolute-path symlink. Skips silently if the target
-    is missing. Replaces an existing link / file."""
+    """Best-effort relative-path symlink. Skips silently if the target
+    is missing. Replaces an existing link / file. Relative paths keep
+    the merged folder portable across moves of either the source or
+    the merged tree, as long as their *relative* layout stays the
+    same."""
     if not target.exists():
         return False
     link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink() or link_path.exists():
         link_path.unlink()
-    link_path.symlink_to(target.resolve())
+    import os
+    rel_target = os.path.relpath(target.resolve(), link_path.parent.resolve())
+    link_path.symlink_to(rel_target)
     return True
 
 
