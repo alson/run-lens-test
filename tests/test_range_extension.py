@@ -814,6 +814,159 @@ class TestProbeWithSubsampling:
         assert f8_probe_steps == [6]
 
 
+# ---- Droop during probe / extension ---------------------------------------
+
+
+class TestDroopDuringExtension:
+    """Verifies that EV readings from the probe + extension capture
+    paths flow into the same DroopDetector that the main sweep uses,
+    so a flash that weakens (or the rig shifts) during the long-tail
+    extension trips the same pause+reshoot / silent-recal flow as a
+    droop during the main sweep — see ``session/runner.py``
+    ``_shoot_at_position`` (the probe / extension call path) for the
+    push site that this test exercises."""
+
+    def test_extension_under_exposure_trips_pause_and_reshoot(
+        self, cfg, tmp_path
+    ) -> None:
+        # end_mm=60, steps=7 -> step_size=10, ext_steps=3, probe=2,
+        # ext follow-up=1 (mirrors test_probe_then_extension_follow_up).
+        # Sweep + probes clean; the lone extension fill shot at step
+        # index 9 is severely under-exposed (median 25 -> ~-2 EV vs
+        # cal target). That single push trips DROOP_CRIT_A (1 shot
+        # <= -2.0 EV). The runner pauses for a battery swap, then
+        # post-pause sanity (still under) skips re-cal, then reshoots
+        # step 9 with a fresh frame.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        medians = [
+            100.0,    # cal at f/4 (baseline)
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,  # 7 sweep
+            100.0, 100.0,                                       # 2 probes
+            25.0,     # 1 extension fill at step 9 -> severe under, trip
+            25.0,     # post-pause sanity capture (still under, no recal)
+            100.0,    # reshoot step 9 (fresh batteries)
+        ]
+        confirm_calls: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 7, "end_mm": 60.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="end_side",
+                        needs_extension=True, notes="end_side"),
+            RangeResult(ok=True, peak_side="end_side",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket"),
+        ])
+        runner.confirm = lambda msg: (confirm_calls.append(msg) or True)
+        _run_one_lens_config(runner)
+
+        # 1 cal + 7 sweep + 2 probe + 1 extension (under) + 1 sanity
+        # + 1 reshoot = 13 captures.
+        capture_count = sum(
+            1 for k, _ in camera.history if k == "capture"
+        )
+        assert capture_count == 13
+
+        # Battery droop prompt fired exactly once for the extension
+        # trip (no nested trips since the reshoot frame is clean).
+        droop_prompts = [c for c in confirm_calls if "Battery droop" in c]
+        assert len(droop_prompts) == 1
+
+        # Post-pause sanity check row exists (phase=calibration).
+        rows = runner.shots_csv.read_rows()
+        sanity_rows = [
+            r for r in rows
+            if "post-droop sanity check" in r.get("notes", "")
+        ]
+        assert len(sanity_rows) == 1
+        assert sanity_rows[0]["phase"] == "calibration"
+
+        # Step 9 has a reshoot row (the fresh, clean frame).
+        reshoot_step9 = [
+            r for r in rows
+            if r["phase"] == "reshoot" and int(r["rail_step"]) == 9
+        ]
+        assert len(reshoot_step9) == 1
+        assert float(reshoot_step9[0]["median_central_luminance"]) == 100.0
+
+    def test_extension_over_exposure_triggers_silent_recal(
+        self, cfg, tmp_path
+    ) -> None:
+        # Same range shape as the under test (end_mm=60, steps=7) so
+        # exactly 1 extension fill shot at step 9 lands. The
+        # extension shot is over by ~+0.83 EV (median 130 vs cal 100).
+        # With two over-criteria configured, a single shot at +2 EV
+        # would trip CRIT_A; here we use CRIT_B (2 shots >= +0.7 EV)
+        # so the first extension shot alone wouldn't trip — we cheat
+        # by also making the prior probe slightly over so the rolling
+        # window has two over-shots at the moment the extension
+        # fires. Confirms: NO battery prompt, re-cal runs silently,
+        # then the reshoot lays down a fresh frame.
+        cfg.DROOP_OVER_CRIT_A = (1, +2.0)
+        cfg.DROOP_OVER_CRIT_B = (2, +0.7)
+        cfg.DROOP_REWIND_TOLERANCE_EV = 0.3
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        medians = [
+            100.0,    # cal at f/4 (baseline)
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,  # 7 sweep
+            100.0,    # probe at step 7 ok
+            130.0,    # probe at step 8 -> 1st over (~+0.83 EV)
+            130.0,    # extension fill at step 9 -> 2nd over => trip
+            # Over-trip path: NO sanity capture, straight to re-cal.
+            # Linear cascade with non-None baseline = 3 shots (probe,
+            # target, headroom probe) when clean.
+            100.0, 100.0, 100.0,
+            # Reshoot covers [step8, step9] — earliest >= +0.3 EV is
+            # the step-8 probe. Reshoot uses _capture_one (sweep
+            # path), so 2 reshoot frames.
+            100.0, 100.0,
+        ]
+        confirm_calls: list[str] = []
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=medians,
+            inputs={"lens": "L", "steps": 7, "end_mm": 60.0},
+        )
+        runner.range_checker = ScriptedRangeChecker([
+            RangeResult(ok=False, peak_side="end_side",
+                        needs_extension=True, notes="end_side"),
+            RangeResult(ok=True, peak_side="end_side",
+                        needs_extension=False,
+                        peak_in_range_after_probe=True,
+                        notes="bracket"),
+        ])
+        runner.confirm = lambda msg: (confirm_calls.append(msg) or True)
+        runner.config = cfg  # ensure new over criteria are visible
+        _run_one_lens_config(runner)
+
+        # NO battery droop prompt for the over-trip — over-exposure
+        # branches to silent re-calibration.
+        droop_prompts = [c for c in confirm_calls if "Battery droop" in c]
+        assert len(droop_prompts) == 0
+
+        # No post-pause sanity check on the over-direction path.
+        rows = runner.shots_csv.read_rows()
+        sanity_rows = [
+            r for r in rows
+            if "post-droop sanity check" in r.get("notes", "")
+        ]
+        assert len(sanity_rows) == 0
+
+        # Reshoot covered both the (over) probe at step 8 and the
+        # (over) extension at step 9 — the rewind tolerance band
+        # extends back to the earliest over-anomalous step in the
+        # window.
+        reshoot_steps = sorted({
+            int(r["rail_step"]) for r in rows if r["phase"] == "reshoot"
+        })
+        assert reshoot_steps == [8, 9]
+
+
 # ---- Step-index helper math -----------------------------------------------
 
 

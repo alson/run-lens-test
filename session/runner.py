@@ -1144,6 +1144,7 @@ class SessionRunner:
                     calibration=cal_one,
                     apertures=[aperture],
                     start_step_index=phase_c_start,
+                    droop=droop,
                 )
 
         # Final rail-zero return.
@@ -1365,6 +1366,7 @@ class SessionRunner:
                         calibration=cal_result,
                         apertures=apertures,
                         start_step_index=phase_c_start,
+                        droop=droop,
                     )
                 except _RejogRequested:
                     # User wants new START / END; rewind, recreate
@@ -1811,6 +1813,7 @@ class SessionRunner:
         calibration: CalibrationResult,
         apertures: list[str],
         start_step_index: int = 0,
+        droop: DroopDetector | None = None,
     ) -> int:
         """Evaluate range adequacy; probe + extend if peak is at an
         edge. Returns the absolute step index from rail-zero where the
@@ -1825,6 +1828,13 @@ class SessionRunner:
         the user-jog flow. The probe (phase-C) flow passes a non-zero
         start so far/near extensions land at absolute step indices
         beyond the phase-C window, not relative to step 0.
+
+        ``droop`` is the live detector instance from the just-
+        completed sweep. Probe + extension captures push EV into it
+        so a flash that gets weaker (or the rig shifts) during the
+        long extension phase trips the same pause/reshoot or silent
+        re-cal flow the main sweep gets. When ``None`` (legacy
+        callers / tests), captures are taken blind.
         """
         from session.log import write_json
 
@@ -1968,7 +1978,7 @@ class SessionRunner:
                 target = step_index * step_size_mm
                 self._move_to(current_pos, target)
                 current_pos = target
-                self._shoot_at_position(
+                event = self._shoot_at_position(
                     lens_dir=lens_dir,
                     slug=slug,
                     step_index=step_index,
@@ -1979,9 +1989,22 @@ class SessionRunner:
                     file_factory=lambda ap, idx=step_index:
                         self._sweep_destination(lens_dir, ap, idx),
                     progress_ctx=("probe", probe_done, probe_total),
+                    droop=droop,
                 )
                 probe_done += 1
                 probe_positions_per_side[side].append(target)
+                if event is not None and droop is not None:
+                    self._handle_droop(
+                        event,
+                        droop,
+                        lens_dir=lens_dir,
+                        slug=slug,
+                        current_step_index=step_index,
+                        current_position_mm=target,
+                        step_size_mm=step_size_mm,
+                        apertures=apertures,
+                        calibration=calibration,
+                    )
         self._progress_done()
 
         # Drain pending sharpness crops so the second evaluate() sees
@@ -2161,7 +2184,7 @@ class SessionRunner:
                     target = step_index * step_size_mm
                     self._move_to(current_pos, target)
                     current_pos = target
-                    self._shoot_at_position(
+                    event = self._shoot_at_position(
                         lens_dir=lens_dir,
                         slug=slug,
                         step_index=step_index,
@@ -2174,9 +2197,22 @@ class SessionRunner:
                         progress_ctx=(
                             f"extend r{extend_rounds + 1}", ext_done, ext_total,
                         ),
+                        droop=droop,
                     )
                     ext_done += 1
                     extension_step_count_per_side[side] += 1
+                    if event is not None and droop is not None:
+                        self._handle_droop(
+                            event,
+                            droop,
+                            lens_dir=lens_dir,
+                            slug=slug,
+                            current_step_index=step_index,
+                            current_position_mm=target,
+                            step_size_mm=step_size_mm,
+                            apertures=apertures,
+                            calibration=calibration,
+                        )
                 shot_so_far_per_side[side] += extension_steps
             self._progress_done()
             extend_rounds += 1
@@ -2206,7 +2242,7 @@ class SessionRunner:
                 target = step_index * step_size_mm
                 self._move_to(current_pos, target)
                 current_pos = target
-                self._shoot_at_position(
+                event = self._shoot_at_position(
                     lens_dir=lens_dir,
                     slug=slug,
                     step_index=step_index,
@@ -2218,10 +2254,23 @@ class SessionRunner:
                         self._sweep_destination(lens_dir, ap, idx),
                     progress_ctx=("extend fill", fill_done, fill_total)
                         if fill_total > 0 else None,
+                    droop=droop,
                 )
                 fill_done += 1
                 extension_step_count_per_side[side] += 1
                 shot_so_far_per_side[side] += 1
+                if event is not None and droop is not None:
+                    self._handle_droop(
+                        event,
+                        droop,
+                        lens_dir=lens_dir,
+                        slug=slug,
+                        current_step_index=step_index,
+                        current_position_mm=target,
+                        step_size_mm=step_size_mm,
+                        apertures=apertures,
+                        calibration=calibration,
+                    )
         if fill_total > 0:
             self._progress_done()
 
@@ -2277,7 +2326,8 @@ class SessionRunner:
         phase: Phase,
         file_factory: Callable[[str], Path],
         progress_ctx: tuple[str, int, int] | None = None,
-    ) -> None:
+        droop: DroopDetector | None = None,
+    ) -> DroopEvent | None:
         """Capture one frame per aperture at the current rail position.
 
         Used by the probe + extension shooters (single replica). The
@@ -2287,6 +2337,14 @@ class SessionRunner:
         total_steps_in_phase)`` — when provided, the runner shows a
         live progress bar matching the main-sweep one but counts
         within the probe/extension/etc. block.
+
+        ``droop``: when provided, each capture's EV-relative-to-
+        calibration is pushed into the detector exactly the way the
+        main sweep does via :meth:`_capture_one`. If a push trips a
+        criterion this method short-circuits (no more apertures at
+        this step) and returns the :class:`DroopEvent` so the caller
+        can invoke :meth:`_handle_droop` with the appropriate context
+        (rewind, pause + reshoot, or silent re-cal).
         """
         for ap_index, aperture in enumerate(apertures):
             if not self._should_capture(aperture, step_index):
@@ -2328,6 +2386,22 @@ class SessionRunner:
                 filename=str(dest.relative_to(lens_dir)),
                 phase=phase,
             )
+            if droop is not None:
+                # Push EV relative to the per-aperture cal target (not
+                # the session baseline) — mirrors _capture_one so a
+                # fractional calibration gap doesn't bias trips.
+                cal_reference = (
+                    cal.final_median or self.baseline_median or 1.0
+                )
+                ev_to_cal = ev_delta(median, cal_reference)
+                event = droop.push(
+                    aperture, ev_to_cal, step_index=step_index
+                )
+                if event is not None:
+                    # Short-circuit: skip the remaining apertures at
+                    # this step. Caller decides on reshoot / re-cal.
+                    return event
+        return None
 
     def _move_to(self, current_pos: float, target_pos: float) -> None:
         delta = target_pos - current_pos
