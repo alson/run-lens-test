@@ -103,6 +103,34 @@ battery-pull procedure.
 python -m session.runner
 ```
 
+Optional CLI flags (all skip the matching interactive prompt; useful
+for tail-extension and re-shoot scenarios):
+
+| Flag | Effect |
+| --- | --- |
+| `--no-probe` | Disables Phase-A probe for this run only (equivalent to `PROBE_ENABLED = False` in config). Use for tail-extension sessions whose user-jogged range deliberately lies outside the widest-aperture peak. |
+| `--lens TEXT` | Skip the lens-config prompt and use the supplied string. Match the verbatim text used in prior sessions so the slug stays consistent for offline analysis. |
+| `--magnification M` | Skip the magnification prompt (e.g. `1.0` for 1:1, `0.5` for 1:2). |
+| `--rail-start MM` | Signed mm offset from the rail's current hardware position to the session START. The rail moves there, and that position becomes session-zero. Usually `0` (= "use the rail's current position as START"). Required with `--rail-end`. |
+| `--rail-end MM` | Signed mm offset from session START to session END. Negative for backward sweeps (the common case). Required with `--rail-start`. |
+| `--manual-aperture` | Enable manual-aperture mode for non-CPU lenses (DESIGN_NOTES §6.31). |
+
+Typical tail-extension recipe:
+
+```bash
+# 1. Manually position the rail at the intended START with the
+#    rig's panel buttons or a previous interactive jog.
+# 2. Launch with the full setup baked in:
+python -m session.runner \
+  --no-probe \
+  --lens "Viltrox 85mm f/2 EVO + 45mm extension" \
+  --magnification 0.66 \
+  --rail-start 0 \
+  --rail-end -2.0
+```
+
+Skips all interactive prompts, runs one lens config, exits.
+
 The program will:
 
 1. Open the StackShot and camera.
@@ -431,6 +459,23 @@ All tunable constants are at the top of `config.py`. Notable ones:
   pre-2026-05 single-threshold logic falsely rejected as off-wafer;
   splitting the threshold lets soft-but-real bells be reported
   as `LOW_SIGNAL` instead.
+- `SHARPNESS_PARTIAL_FRAME_FACTOR` — absolute-size peer-compare
+  threshold for the `PARTIAL_FRAME` detector (default 0.80). A
+  crop whose peak file size is below this factor times the
+  peer-group median (4 full-frame corners vs each other, 4
+  full-frame edges vs each other) is flagged `PARTIAL_FRAME`,
+  meaning the wafer / target edge cuts through the crop window.
+  Distinct from `OFF_TARGET` (no wafer at all) because the
+  operator remedy is reframing, not re-jogging. See DESIGN_NOTES
+  §6.30.
+- `LINEAR_CASCADE_ENABLED` — enable the 3-5 shot linear AA
+  calibration cascade (default `True`). When `False`, falls back
+  to the legacy iterative 10-cap cascade preserved in
+  `_calibrate_aperture`. See DESIGN_NOTES §6.32.
+- `PROBE_ENABLED` — enable Phase-A's coarse-to-fine focus probe
+  (default `True`). Flip to `False` for tail-extension sessions
+  (or use the `--no-probe` CLI flag for per-invocation override).
+  DESIGN_NOTES §6.26 / §6.28 / §6.29.
 - `OUTPUT_ROOT` — where session directories are created.
 - `NTFY_TOPIC` / `NTFY_BASE_URL` — ntfy.sh topic + endpoint. Set the
   topic once per laptop.

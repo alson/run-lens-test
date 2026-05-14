@@ -1862,3 +1862,136 @@ commander itself shows decimal `-0.3` / `-0.7`. Switched to the
 decimal form so the operator can read the prompt and dial the
 commander without mental conversion. Same logic for the prompt
 order — A before C, matching the SB-5000's group display order.
+
+### 6.32 AA calibration cascade rewrite (2026-05-13/14)
+
+The legacy iterative AA cascade (greedy `new_fec = fec - delta`
+loop with plateau detection and FEC-saturation fallback, capped at
+10 retries) was rewritten after a Sigma 150 + 6T + 5T calibration
+hit MISS at f/5.6 — a configuration the rig should have handled
+fine. The investigation surfaced four distinct issues, fixed
+together as a coherent cascade overhaul:
+
+**1. The Z7 PTP `flashexposurecompensation` widget silently rejects
+some ⅓-stop float64 values.** The widget stores values in float32
+internally. Inputs whose nearest float32 grid point differs from
+the requested value by more than ~3e-8 are silently rejected:
+`set_config` returns without raising, the widget keeps its previous
+value, the next capture fires at the *old* FEC, and the caller's
+bookkeeping says the new one. The empirical acceptance map (probed
+in `tools/fec_acceptance_grid.py`):
+
+|  k  |  value | k/3  | 3-decimal | 4-decimal | float32 |
+|----:|-------:|:----:|:---------:|:---------:|:-------:|
+|  -9 | -3.000 |  ✓   |     ✓     |     ✓     |    ✓    |
+|  -8 | -2.667 |  ✓   |     ✓     |     ✓     |    ✓    |
+|**-7**|-2.333|  ✗   |     ✗     |     ✗     |    ✗    |
+|  -6 | -2.000 |  ✓   |     ✓     |     ✓     |    ✓    |
+|**-5**|-1.667|  ✗   |     ✓     |     ✓     |    ✗    |
+|**-4**|-1.333|  ✓   |     ✗     |     ✗     |    ✓    |
+|  -3 | -1.000 |  ✓   |     ✓     |     ✓     |    ✓    |
+|  -2 | -0.667 |  ✓   |     ✓     |     ✓     |    ✓    |
+|**-1**|-0.333|  ✓   |     ✗     |     ✗     |    ✓    |
+|   0 | +0.000 |  ✓   |     ✓     |     ✓     |    ✓    |
+
+No single rounding strategy covers every position; **k=-7 (-2.333)
+is unsendable in any common form.** Fix: `NikonZ7._set_range` tries
+4 candidate forms in sequence (3-decimal → 4-decimal → float32 →
+k/3) with a readback retry between each. First accepted form wins.
+For k=-7, `_distribute_bias` substitutes nearest whole stop (k=-6,
+−2.0) and pushes the missing ⅓ stop into EC — total bias preserved
+exactly, each individual setting on an accepted grid.
+
+**2. The "same FEC, different output" pattern in the failing
+cascade trace was the bug above — not flash hysteresis or async
+`set_fec`.** The original failing-cascade trace looked like:
+
+```
+shot 1 FEC=-1.67 → bright   (matches FEC=0 output, suggesting hysteresis)
+shot 3 FEC=-1.67 → dim      (matches FEC=-3 output)
+```
+
+Controlled sweep (`tools/fec_lag_sweep.py`) confirmed the flash
+response is monotonic and the camera doesn't have async `set_fec`
+state. Controlled big-jump tests (`fec_jump_settle_test.py`) ruled
+out settle-time effects. The actual cause: the cascade's `_snap`
+produced `-5 * (1.0/3.0) = -1.6666666666666665` (off-by-1-ULP from
+the camera's float32 grid), which the camera silently rejected —
+the flash fired at the *previous* successfully-set FEC. The
+"hysteresis" was the cascade's own greedy step rejecting at
+certain ⅓-stop targets.
+
+**3. Linear-model cascade replaces iterative.** With the FEC
+rejection fixed, the flash response is verifiably linear (slope ≈
+1.0 EV per stop, per `rig_flash_headroom` memory). A 3-5 shot
+cascade with explicit per-shot purpose is simpler and faster than
+the 10-cap iterative loop:
+
+  Shot 1 — probe at FEC=0, ISO=floor → measure delta_0.
+  Shot 2 — apply `target_bias = -delta_0` (distributed across FEC
+            then EC).
+  Shot 3 — always — headroom probe at +1 stop. Slope check
+            classifies into healthy / saturated / borderline.
+  Shot 4 — only if needed: snap-error fine-tune (if slope healthy
+            but `|delta_1| > ⅙` EV) OR post-ISO-bump retry (if slope
+            < 0.3 = flash maxed).
+  Shot 5 — only if shot 4 was ISO-bump and one more touch-up needed
+            to land within tolerance.
+
+Slope thresholds: ≥ 0.7 healthy, < 0.3 maxed, 0.3 ≤ slope < 0.7
+treated conservatively as saturated. Implementation:
+`Calibrator._calibrate_aperture_linear`. Toggle via
+`config.LINEAR_CASCADE_ENABLED` (default True). Legacy iterative
+cascade in `_calibrate_aperture` preserved as fallback.
+
+**4. ⅓-stop snap-error correction** lands within ⅙ EV of baseline
+without an extra shot. After shot 3 the cascade has confirmed
+linear-regime headroom; if shot 2's `|delta_1| > ⅙` EV, the snap
+rounded the wrong way off the ideal target. Adjusting bias by ±⅓
+stop in the direction that reduces `|delta|` picks the adjacent
+⅓-stop neighbour; predicted post-adjustment delta is `delta_1 ∓
+1/3` EV (slope=1 assumption). No fourth capture taken — the
+adjustment is one ⅓-stop snap-grid step in a known direction,
+trusted because the slope classification confirmed linear regime.
+
+Live-rig validation (Sigma 150 + 6T + 5T, baseline 129):
+
+```
+before cascade rewrite (legacy iterative):
+  f/5.6 [MISS] ev=-1.32 FEC=-0.33 ISO=200*   ← silent FEC rejection
+
+after FEC fix + linear cascade + snap correction:
+  f/5.6 [ok]   ev=-0.05 FEC=-2.00 ISO=100    ← 3 shots, within ⅙ EV
+  f/8   [ok]   ev=+0.00 FEC=-1.33 ISO=100    ← 3 shots
+  f/11  [ok]   ev=+0.05 FEC=-1.33 ISO=200    ← 3 shots
+  f/16  [ok]   ev=-0.10 FEC=-1.67 ISO=400    ← 3 shots
+```
+
+Every aperture converges in 3 shots, all within ⅙ EV.
+
+**Inline calibration progress bar.**
+`SessionRunner._calibration_progress` renders a `\r`-updated single
+line per cascade shot showing aperture (N/M), shot tag (`probe` /
+`target` / `headroom` / `fine` / `iso-bump` / `refine`), current
+FEC / EC / ISO, and last measured ev_delta. Wired via a `progress`
+callable on `Calibrator` so tests stay opaque to UI.
+
+**Diagnostic tooling under `tools/`** (re-runnable when firmware
+or rig state changes):
+
+* `fec_acceptance_grid.py` — empirical probe of which float forms
+  each ⅓-stop FEC position accepts.
+* `fec_value_probe.py` — focused probe of specific FEC float
+  representations. Used during the silent-rejection discovery.
+* `fec_lag_sweep.py` — controlled FEC sweep with N shots per step
+  and configurable settle time. Used to rule out async-`set_fec`.
+* `fec_jump_settle_test.py` — big-jump + settle-time experiment.
+  Used to rule out hysteresis.
+* `fec_repro_via_camera.py` — production-code-path FEC test.
+* `cascade_dry_run.py` — replays a recorded median sequence through
+  the cascade with camera-state snapshots between every `set_fec`
+  call. The tool that exposed the actual root cause after ~four
+  red-herring hypotheses.
+* `test_linear_cascade.py` — isolated live-rig validation script
+  for the new linear cascade. Runs one or more apertures with no
+  rail movement, logs each shot to `shots.csv`.
