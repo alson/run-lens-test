@@ -12,7 +12,10 @@ dependencies = [
     "lens-test-detect-core",
     "pyftdi>=0.57.1",
     "questionary>=2.0",
-    "PyTurboJPEG>=1.7",
+    # Pinned to 1.x for libjpeg-turbo 2.x compatibility (Ubuntu 22.04 etc.).
+    # PyTurboJPEG 2.x requires libjpeg-turbo 3.0+, which Arch ships but
+    # Ubuntu LTS does not.
+    "PyTurboJPEG>=1.7,<2",
 ]
 
 [tool.uv.sources]
