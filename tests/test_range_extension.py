@@ -893,6 +893,169 @@ class TestDroopDuringExtension:
         assert len(reshoot_step9) == 1
         assert float(reshoot_step9[0]["median_central_luminance"]) == 100.0
 
+    def test_shoot_at_position_pushes_every_capture_into_droop(
+        self, cfg, tmp_path
+    ) -> None:
+        """Direct call into ``_shoot_at_position`` with a spy detector
+        — pins the contract that every probe / extension capture flows
+        into the droop window, without depending on the trip+reshoot
+        cascade the higher-level tests rely on. A regression that drops
+        the push site would silently leave probe / extension shots
+        unmonitored; this test fails fast and points at the call site.
+        """
+        from exposure.droop import DroopDetector, DroopEvent, WindowEntry
+        from session.calibrate import ApertureCalibration, CalibrationResult
+
+        # Spy: record every push, but never trip — we want to see ALL
+        # apertures get pushed (no short-circuit), and we want raw
+        # ev_value values so we can verify they were computed against
+        # ``cal.final_median``, not the session baseline.
+        pushed: list[tuple[str, float, int]] = []
+
+        class SpyDetector(DroopDetector):
+            def __init__(self) -> None:
+                super().__init__(window=10, criteria=())
+
+            def push(self, aperture, ev_value, *, step_index=DroopDetector.UNKNOWN_STEP):
+                pushed.append((aperture, float(ev_value), int(step_index)))
+                return super().push(
+                    aperture, ev_value, step_index=step_index,
+                )
+
+        apertures = ["f/4", "f/8", "f/16"]
+        # Per-aperture cal references: f/4 = 100 (same as baseline), but
+        # f/8 = 80 and f/16 = 60. ev_to_cal must use these per-aperture
+        # references, not the session baseline — that's the whole point
+        # of the runner's per-aperture cal_reference logic, and a buggy
+        # rewrite that pushed ev_to_baseline would produce different
+        # numbers here than the assertions below.
+        cal_finals = {"f/4": 100.0, "f/8": 80.0, "f/16": 60.0}
+        all_medians = [100.0] * 8  # camera always returns 100 → known ev
+        camera = FakeCamera(apertures=apertures)
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=all_medians,
+            inputs={"lens": "L", "steps": 1, "end_mm": 1.0},
+        )
+        runner.start()
+        runner.baseline_median = 100.0
+        lens_dir = runner.session_dir / "L"
+        (lens_dir / "f_4").mkdir(parents=True, exist_ok=True)
+        (lens_dir / "f_8").mkdir(parents=True, exist_ok=True)
+        (lens_dir / "f_16").mkdir(parents=True, exist_ok=True)
+
+        calibration = CalibrationResult(
+            baseline_median=100.0,
+            per_aperture={
+                ap: ApertureCalibration(
+                    aperture=ap, fec_ev=0.0, iso=100,
+                    final_median=cal_finals[ap], final_ev_delta=0.0,
+                    hit_tolerance=True, iso_bumped=False,
+                    test_shots_taken=1,
+                )
+                for ap in apertures
+            },
+        )
+
+        spy = SpyDetector()
+        event = runner._shoot_at_position(
+            lens_dir=lens_dir, slug="L",
+            step_index=5, position_mm=5.0,
+            apertures=apertures, calibration=calibration,
+            phase=Phase.EXTENSION,
+            file_factory=lambda ap, idx=5:
+                runner._sweep_destination(lens_dir, ap, idx),
+            droop=spy,
+        )
+
+        # No trip configured → method completes through all apertures.
+        assert event is None
+        # One push per aperture, in order, all carrying the correct
+        # step_index.
+        assert [(ap, idx) for (ap, _ev, idx) in pushed] == [
+            ("f/4", 5), ("f/8", 5), ("f/16", 5),
+        ]
+        # ev_to_cal values: median=100 vs each aperture's final_median.
+        # f/4: 0 EV (same), f/8: log2((100/255)^2.2 / (80/255)^2.2) =
+        # 2.2 * log2(100/80) ≈ +0.71 EV (over by one cal-stop), f/16:
+        # +1.62 EV. Critically these are *not* the ev_to_baseline
+        # values (which would all be 0.0 since baseline = 100).
+        evs = {ap: ev for (ap, ev, _idx) in pushed}
+        assert evs["f/4"] == pytest.approx(0.0, abs=1e-6)
+        assert evs["f/8"] == pytest.approx(0.7080, abs=0.01)
+        assert evs["f/16"] == pytest.approx(1.6228, abs=0.01)
+
+    def test_shoot_at_position_short_circuits_on_droop_trip(
+        self, cfg, tmp_path
+    ) -> None:
+        """Companion to the spy test: when the detector trips on the
+        first aperture, the remaining apertures at the same step must
+        be skipped and the event returned. This is the contract the
+        caller (``_run_range_check_and_extend``) relies on to invoke
+        ``_handle_droop`` exactly once per trip."""
+        from exposure.droop import DroopDetector
+        from session.calibrate import ApertureCalibration, CalibrationResult
+
+        apertures = ["f/4", "f/8", "f/16"]
+        pushes = 0
+
+        class FirstShotTripDetector(DroopDetector):
+            def __init__(self) -> None:
+                super().__init__(window=10, criteria=((1, -2.0),))
+
+            def push(self, aperture, ev_value, *, step_index=DroopDetector.UNKNOWN_STEP):
+                nonlocal pushes
+                pushes += 1
+                # Force a trip on every push by lying about the EV —
+                # any reading <= -2.0 against this criterion fires.
+                return super().push(
+                    aperture, -3.0, step_index=step_index,
+                )
+
+        camera = FakeCamera(apertures=apertures)
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 5,
+            inputs={"lens": "L", "steps": 1, "end_mm": 1.0},
+        )
+        runner.start()
+        runner.baseline_median = 100.0
+        lens_dir = runner.session_dir / "L"
+        for ap in ["f_4", "f_8", "f_16"]:
+            (lens_dir / ap).mkdir(parents=True, exist_ok=True)
+
+        calibration = CalibrationResult(
+            baseline_median=100.0,
+            per_aperture={
+                ap: ApertureCalibration(
+                    aperture=ap, fec_ev=0.0, iso=100,
+                    final_median=100.0, final_ev_delta=0.0,
+                    hit_tolerance=True, iso_bumped=False,
+                    test_shots_taken=1,
+                )
+                for ap in apertures
+            },
+        )
+
+        event = runner._shoot_at_position(
+            lens_dir=lens_dir, slug="L",
+            step_index=5, position_mm=5.0,
+            apertures=apertures, calibration=calibration,
+            phase=Phase.EXTENSION,
+            file_factory=lambda ap, idx=5:
+                runner._sweep_destination(lens_dir, ap, idx),
+            droop=FirstShotTripDetector(),
+        )
+
+        # Exactly one push happened (on f/4); f/8 and f/16 were
+        # skipped because the trip short-circuited.
+        assert pushes == 1
+        assert event is not None
+        assert event.aperture == "f/4"
+        assert event.threshold == pytest.approx(-2.0)
+
     def test_extension_over_exposure_triggers_silent_recal(
         self, cfg, tmp_path
     ) -> None:

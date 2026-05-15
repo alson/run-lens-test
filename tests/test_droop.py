@@ -84,6 +84,62 @@ class TestSessionLevelPooling:
         assert evt.threshold == pytest.approx(-2.0)
 
 
+# ---- Severe-vs-moderate precedence ----------------------------------------
+
+
+class TestSeverePrecedence:
+    """When a single push satisfies BOTH the severe and the moderate
+    under-criteria, severe must win — the runner branches on
+    ``threshold`` to format the ntfy alert, and a misordered
+    detector would label a true commander-battery-dead event as a
+    gradual drift."""
+
+    def test_severe_wins_when_both_match_on_same_push(self) -> None:
+        # Prior shot already counts toward moderate (1 of 1 ≤ -0.7).
+        # The new -3.0 EV push makes moderate fire (2 of 2 ≤ -0.7)
+        # AND severe fire (1 of 2 ≤ -2.0). Severe is listed first in
+        # the criteria tuple → severe must win.
+        d = make_detector()
+        d.push("f/4", -0.8)
+        evt = d.push("f/4", -3.0)
+        assert evt is not None
+        assert evt.threshold == pytest.approx(-2.0)
+        assert evt.triggered_count == 1
+
+    def test_severe_fires_with_production_config_values(self) -> None:
+        # Build the detector the way runner._make_droop_detector
+        # does, with the exact tuples shipped in config.py. Guards
+        # against a future config edit that reorders or weakens the
+        # severe criterion so it no longer wins precedence.
+        import config
+
+        crits = [config.DROOP_CRIT_A, config.DROOP_CRIT_B]
+        d = DroopDetector(
+            window=config.ROLLING_WINDOW, criteria=tuple(crits),
+        )
+        d.push("f/4", -0.6)                     # 1 ≤ -0.5, not yet
+        evt = d.push("f/4", -3.0)               # severe + moderate both match
+        assert evt is not None
+        assert evt.threshold == pytest.approx(config.DROOP_CRIT_A[1])
+        assert evt.triggered_count == 1
+
+    def test_pitch_black_single_shot_trips_severe(self) -> None:
+        # Commander-battery-dead scenario: remote flashes don't fire,
+        # the crop median floors to ~1 against a baseline of ~128 →
+        # ev_delta ≈ -15 EV. One such shot must trip severe so the
+        # runner pauses immediately rather than waiting for a second
+        # bad shot under the moderate criterion.
+        from exposure.analyse import ev_delta
+
+        ev = ev_delta(1.0, 128.0)
+        assert ev < -10.0, "sanity: pitch black is far below threshold"
+        d = make_detector()
+        evt = d.push("f/16", ev)
+        assert evt is not None
+        assert evt.threshold == pytest.approx(-2.0)
+        assert evt.triggered_count == 1
+
+
 # ---- reset_all -------------------------------------------------------------
 
 
