@@ -17,11 +17,14 @@ For each lens configuration the user defines:
 3. The program then sweeps the rail through N steps. At each step, it shoots
    the wafer at every aperture from the lens's widest to a configurable max,
    downloading each JPEG to disk and measuring exposure.
-4. Throughout the sweep, a per-aperture rolling-window droop detector watches
-   for the flashes losing power as their batteries deplete. If detected, the
-   program sends a notification to the MacBook, plays a local alert sound,
-   and pauses for the user to swap batteries — without losing rail position
-   or progress.
+4. Throughout the sweep, a session-pooled rolling-window droop detector
+   watches for the flashes losing power as their batteries deplete
+   (under-direction) or for the rig drifting brighter, e.g. a flash
+   bumped during a battery swap (over-direction). Under-direction trips
+   notify the MacBook, play a local alert sound, and pause for the user
+   to swap batteries. Over-direction trips re-calibrate silently and
+   continue without a pause. Either way the rail position and progress
+   are preserved and the affected frames are reshot.
 5. When all rail steps are done for one lens config, the program prompts the
    user to change lenses (and walks them through a battery-pull camera
    recovery, since the Z7 firmware needs that to come up cleanly).
@@ -183,7 +186,7 @@ When the program prompts for a lens change:
 4. **Power on the camera, wait for live view.**
 5. Press ENTER in the program. It reconnects, verifies state, and resumes.
 
-### Battery droop pause
+### Battery droop pause (under-direction)
 
 If the program pauses with a "Battery droop detected" alert:
 
@@ -199,6 +202,13 @@ fresh power. The under-exposed JPEGs on disk are overwritten in place;
 and the original `phase=sweep` rows for those steps are dropped to keep
 the metadata clean.
 
+A post-pause sanity capture runs before the reshoot: if it reads on the
+*opposite* side of the cal target (positive EV — rig shifted *during*
+the pause, e.g. a flash bumped while swapping batteries), the runner
+re-calibrates at the current rail position before reshooting. Sanity
+still under-exposed → no re-cal; the reshoot proceeds and will trip
+droop again if the swap didn't actually fix the issue.
+
 If droop fires *during* the reshoot — i.e., a flash you didn't catch on
 the first swap is also weak — the runner pauses again, prompts again,
 and recurses into another reshoot covering the new earliest under-exposed
@@ -206,6 +216,16 @@ step through the trigger step. This nests as many times as needed.
 
 You do **not** need to re-jog the rail, the StackShot is being driven by
 the program throughout.
+
+### Rig-shift recovery (over-direction)
+
+If the rig drifts *brighter* during the sweep — e.g. you bumped a flash
+in passing, or the commander setting shifted during an earlier pause —
+the detector trips the over-direction criterion and the runner
+**silently re-calibrates at the current rail position**, then reshoots
+the over-exposed range. No prompt, no battery swap. An ntfy notification
+and an `Over-exposure on f/N: ...` console line announce what happened;
+you don't need to act unless re-calibration also fails.
 
 ### Range-adequacy prompts
 
@@ -483,14 +503,20 @@ All tunable constants are at the top of `config.py`. Notable ones:
   off-target events.
 - `JOG_FINE_MM` / `JOG_COARSE_MM` — rail jog increments.
 - `CROP_*_FRAC` — central-crop position and size on the wafer.
-- `ROLLING_WINDOW`, `DROOP_CRIT_A`, `DROOP_CRIT_B` — droop detector
-  window length + the two trip criteria
-  (default: 1 severe shot ≤ −2.0 EV OR 2-of-10 ≤ −0.7 EV).
+- `ROLLING_WINDOW`, `DROOP_CRIT_A`, `DROOP_CRIT_B`,
+  `DROOP_OVER_CRIT_A`, `DROOP_OVER_CRIT_B` — droop detector window
+  length + the four trip criteria. Defaults:
+  * under-direction: 1 severe shot ≤ −2.0 EV (`A`) OR
+    2-of-30 ≤ −0.5 EV (`B`)
+  * over-direction: 1 severe shot ≥ +1.0 EV (`A`) OR
+    2-of-30 ≥ +0.4 EV (`B`)
   The detector pools shots session-wide so consecutive
-  under-exposed shots at *different* apertures still trip the
-  moderate criterion. On any trip the runner reshoots at least
-  the current step's apertures (rewinding further when earlier
-  steps in the window are also under-exposed).
+  off-target shots at *different* apertures still trip the
+  moderate criteria. Under trips → battery-swap pause + reshoot;
+  over trips → silent re-calibration + reshoot. The rewind extent
+  uses `DROOP_REWIND_TOLERANCE_EV` (default 0.3) rather than the
+  firing criterion's threshold, so mildly off-target frames
+  preceding the trip also get reshot.
 - `RANGE_CHECK_ENABLED`, `RANGE_EXTENSION_FRACTION`,
   `RANGE_CHECK_PROBE_STEPS` — auto-extension behaviour. The
   multi-crop advisor checks all 17 crops per aperture; field
