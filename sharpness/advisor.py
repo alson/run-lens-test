@@ -374,15 +374,25 @@ def advise(
             series = [s.sizes[name] for s in samples if name in s.sizes]
             if series:
                 crop_sizes[name] = series
+        stride = max(1, int(factors.get(aperture, 1)))
+        # ``edge_steps`` is the truncation edge-zone width in sample-
+        # index units; the rail-step width is ``edge_steps * stride``.
+        # The default (2) was tuned for stride=1, where 2 samples = 2
+        # rail steps. At stride 2 those same 2 samples become 4 rail
+        # steps — wide enough that a centred peak whose worst-case
+        # corner crop legitimately sits 2 rail steps from the captured
+        # edge gets falsely flagged TRUNCATED_END. Scale the zone down
+        # so it expresses the same ~2-rail-step buffer regardless of
+        # stride; floor at 1 sample so the last sample is always edge.
+        effective_edge_steps = max(1, edge_steps // stride)
         analyses = analyze_crops_for_aperture(
             crop_sizes,
             cross_compare_factor=cross_compare_factor,
             partial_frame_factor=partial_frame_factor,
             peer_groups=peer_groups,
-            edge_steps=edge_steps,
+            edge_steps=effective_edge_steps,
             dynamic_range_min=dynamic_range_min,
             off_target_range=off_target_range,
         )
-        stride = max(1, int(factors.get(aperture, 1)))
         out[aperture] = _build_recommendation(aperture, analyses, stride=stride)
     return out

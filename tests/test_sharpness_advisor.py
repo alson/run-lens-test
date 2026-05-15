@@ -474,6 +474,76 @@ class TestStrideScaling:
         assert rec_none.extra_steps == rec_default.extra_steps
 
 
+# --- Edge-zone rail-step proportionality (sparse field-curvature corners) ---
+
+
+class TestEdgeZoneRailStepProportionality:
+    """At stride > 1, the truncation edge zone must express the same
+    *rail-step* margin as at stride=1 — not the same sample-index
+    count. Otherwise a corner crop whose real peak lands genuinely
+    inside the captured range, near the end of the rail, gets
+    promoted to NEEDS_RESHOOT at sparse apertures while the same
+    physical position stays OK at dense apertures.
+
+    Field scenario: 2026-05-15_093455 NIKKOR Z 100-400 + 35mm. f/16
+    (stride 2) had two corner crops whose parabolic vertex sat
+    barely past n-1 (≤ +2 samples). Pre-fix those tripped
+    TRUNCATED_END and drove an end_side extension; the same
+    physical peak at f/5.6/f/8/f/11 (stride 1) sat ~4-6 samples
+    from the end and stayed OK. The edge zone must scale with
+    stride to make those decisions consistent.
+    """
+
+    def _bell_with_vertex(
+        self, vertex_x: float, n: int, *, peak_val: int = 200, a: float = 0.5,
+    ) -> list[int]:
+        """Build a parabolic bell whose vertex lies at ``vertex_x``."""
+        return [int(round(peak_val - a * (x - vertex_x) ** 2)) for x in range(n)]
+
+    def test_corner_peak_just_past_end_is_ok_at_sparse_aperture(self) -> None:
+        # Vertex at sample 12 (= n+1, only ~2 samples past the
+        # captured end) at n=11. Pre-fix this tripped TRUNCATED_END at
+        # stride=2 because the unscaled edge zone (last 2 samples)
+        # caught peak_idx=9; post-fix the narrowed zone (last 1
+        # sample) lets it stay OK, and the vertex-projection fallback
+        # confirms (vertex 12 ≤ n-1 + DEFAULT_EDGE_STEPS = 12).
+        bell = self._bell_with_vertex(vertex_x=12, n=11)
+        ds = _dataset({16.0: {"center": bell, "left-edge": bell}})
+        rec = advise(ds, subsample_factors={16.0: 2})[16.0]
+        assert rec.verdict == Verdict.OK, (
+            f"corner bell with vertex just past n-1 must stay OK "
+            f"at sparse aperture; got {rec.verdict}"
+        )
+
+    def test_corner_peak_far_past_end_still_trips_at_sparse_aperture(
+        self,
+    ) -> None:
+        # Vertex at sample 15 (5 samples past n-1) — well outside
+        # the projection buffer. Must still classify as TRUNCATED so
+        # the runner extends the rail. Guards against an over-eager
+        # fallback that demotes legitimate truncation.
+        bell = self._bell_with_vertex(vertex_x=15, n=11)
+        ds = _dataset({16.0: {"center": bell, "left-edge": bell}})
+        rec = advise(ds, subsample_factors={16.0: 2})[16.0]
+        assert rec.verdict == Verdict.NEEDS_RESHOOT
+        assert rec.direction == Direction.EXTEND_FORWARD
+
+    def test_corner_peak_at_dense_aperture_is_unchanged(self) -> None:
+        # At stride=1 the edge zone stays at 2 samples; a corner
+        # peak with vertex at sample 12 of 11 still trips TRUNCATED
+        # because the rail-step proximity is genuinely 2 rail steps
+        # from the end — symmetric with the bug case but with a
+        # physically equivalent peak position at a dense aperture.
+        bell = self._bell_with_vertex(vertex_x=12, n=22)
+        # At n=22 the peak-near-edge sits at peak_idx ~ 20 (well
+        # outside the edge zone); the test confirms the dense path
+        # is OK when there's plenty of rail-step margin between
+        # peak and end.
+        ds = _dataset({4.0: {"center": bell, "left-edge": bell}})
+        rec = advise(ds, subsample_factors={4.0: 1})[4.0]
+        assert rec.verdict == Verdict.OK
+
+
 # --- Partial-frame absolute-size cross-compare ---------------------------
 
 

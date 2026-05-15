@@ -62,6 +62,14 @@ __all__ = [
 # Live-collector defaults: one shot per rail step (rail-step-outside,
 # aperture-inside architecture from DESIGN_NOTES §2.6), so an "edge
 # zone" of 2 rail steps is one rail position of buffer.
+#
+# Unit: per-aperture sample-index. At ``subsample_factor=1`` one sample
+# == one rail step, so the default of 2 expresses a 2-rail-step zone.
+# At higher subsample factors one sample == N rail steps; a stride-
+# aware caller (see :func:`sharpness.advisor.advise`) must rescale this
+# value before handing it to :func:`truncation_status` so the edge zone
+# stays at the same *rail-step* width and a sparse aperture's corner
+# peak near the captured edge isn't falsely flagged TRUNCATED.
 DEFAULT_EDGE_STEPS = 2
 DEFAULT_FLAT_RATIO = 1.15
 # Cross-compare cutoff: a crop's peak file size below
@@ -386,12 +394,49 @@ def analyze_crop(
     pk = peak_index(sizes)
     pct = pk / max(1, n - 1)
     status = truncation_status(pk, n, edge_steps=edge_steps)
+    # Vertex-projection fallback. When the caller narrowed
+    # ``edge_steps`` (sparse aperture, stride > 1), two real-world
+    # cases can still need classification past the basic peak-in-edge-
+    # zone check:
+    #
+    # (1) Monotonic series. Smoothing trims the last sample so
+    #     :func:`peak_index` always returns ``n-2`` for monotonic
+    #     data; with a narrowed edge zone the truncation check would
+    #     wrongly say OK. The parabolic fit either yields a vertex
+    #     far past the captured end (for near-linear input,
+    #     ``a`` slightly negative) or no vertex at all (for genuinely
+    #     linear input, ``a >= 0``). The raw-argmax fallback covers
+    #     the second case.
+    # (2) Genuine bell whose peak just barely lands past the captured
+    #     edge — e.g. corner field curvature with vertex within
+    #     ``DEFAULT_EDGE_STEPS`` samples of ``n-1``. The narrowed
+    #     edge zone correctly leaves this as OK; the vertex check
+    #     confirms by not promoting it.
+    #
+    # The projection buffer is unscaled ``DEFAULT_EDGE_STEPS``
+    # deliberately: vertex is in sample-index units and the
+    # comparison is about how strongly the parabola extrapolates
+    # past the captured range, independent of rail-step proximity.
+    vertex = estimate_peak_vertex(sizes)
+    if status == CropStatus.OK and n >= 2:
+        if vertex is None:
+            raw_max_idx = max(range(n), key=lambda i: sizes[i])
+            if raw_max_idx == n - 1:
+                status = CropStatus.TRUNCATED_END
+            elif raw_max_idx == 0:
+                status = CropStatus.TRUNCATED_START
+        else:
+            if vertex > (n - 1) + DEFAULT_EDGE_STEPS:
+                status = CropStatus.TRUNCATED_END
+            elif vertex < -DEFAULT_EDGE_STEPS:
+                status = CropStatus.TRUNCATED_START
     # Demote an in-range OK to LOW_SIGNAL when the dynamic range is
     # below the high-signal floor. Truncation status (start/end/empty)
     # is untouched — truncated soft bells still need rail extension.
     if status == CropStatus.OK and dr < dynamic_range_min:
         status = CropStatus.LOW_SIGNAL
-    vertex = estimate_peak_vertex(sizes) if status.is_truncated else None
+    if not status.is_truncated:
+        vertex = None
     extra = extra_steps_needed(sizes, status, n)
 
     return CropAnalysis(
