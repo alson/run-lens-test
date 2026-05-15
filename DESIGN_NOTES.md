@@ -2200,3 +2200,96 @@ the 100-400 + 6T captures into one unified coordinate frame:
 54 grid positions, 4 apertures × 3+ replicas in the centre with
 triple-overlap, f/16 at the design every-other-step density.
 
+### 6.34 Edge-zone rail-step proportionality + lens-change close ordering (2026-05-15)
+
+Two small fixes that surfaced from the 100-400 + 35mm-extension shoot
+on `2026-05-15_093455`. Documented together because they were both
+diagnosed in the same session without affecting capture correctness.
+
+**A. Stride-aware truncation edge zone (commit `7d5aa71`).**
+`sharpness.detect.DEFAULT_EDGE_STEPS = 2` is the truncation edge zone
+in *sample-index* units. At stride=1 that's 2 rail steps; at stride=2
+the same 2 samples cover 4 rail steps; at stride=4, 8 rail steps. So
+a corner crop whose real peak landed genuinely inside the captured
+range — 1 sample (= 2 rail steps) from the end at f/16 stride=2 due
+to field curvature — was promoted to `TRUNCATED_END` while the same
+*physical* peak position at f/5.6/f/8/f/11 (stride=1) stayed OK
+because it sat 4–6 samples from the end in their denser series. One
+truncated crop on one aperture flipped `peak_side="end_side"` and
+drove an unnecessary 8-step end_side extension.
+
+Reproduced offline by rebuilding the dataset from on-disk cropped
+JPEG sizes (`right-edge` peak_idx=9 of n=11, parabola vertex=12.0;
+`dx-bottom-right` peak_idx=9, vertex=13.2). Both tripped the
+unscaled edge zone; both would have stayed OK at stride=1's
+equivalent rail-step margin.
+
+Fix in `sharpness.advisor.advise`:
+
+```python
+effective_edge_steps = max(1, edge_steps // stride)
+analyses = analyze_crops_for_aperture(..., edge_steps=effective_edge_steps, ...)
+```
+
+The naive scaling alone breaks one case: monotonic-rising data at
+sparse strides. `peak_index` smooths with a width-3 window and trims
+the last raw sample, so monotonic input always produces `peak_idx =
+n-2` regardless of stride. With the narrowed edge zone, that no
+longer crosses the truncation threshold — and the rail genuinely
+never reached the peak. So `analyze_crop` gains a vertex-projection
+fallback that re-promotes to `TRUNCATED_END`:
+
+* If the parabolic fit yields `vertex > n-1 + DEFAULT_EDGE_STEPS`,
+  the curve extrapolates well past the captured range → TRUNCATED.
+* If the fit is degenerate (`a ≥ 0`, no curvature → near-linear
+  input) and the raw argmax sits at the last (first) sample →
+  TRUNCATED.
+
+The projection buffer stays at the unscaled `DEFAULT_EDGE_STEPS`
+deliberately: vertex is in sample-index units and the comparison is
+about how strongly the parabola extrapolates *as a curve*, not about
+rail-step proximity. The bug-case vertex of 12.0 at n=11 lands
+exactly at the `n-1 + DEFAULT_EDGE_STEPS` boundary with strict `>`,
+so it stays OK; a vertex of 15 (5 samples past n-1) still trips
+TRUNCATED so the runner extends.
+
+Three regression tests in `tests/test_sharpness_advisor.py
+TestEdgeZoneRailStepProportionality` pin the bug scenario plus the
+inverse (peak truly past end) and a dense-aperture control.
+
+**B. LHS-only focused reshoot pattern.** The same session exposed an
+asymmetry the range checker can't fix on its own: when all apertures
+agree the peak is `end_side`-truncated, the runner extends end_side
+only, leaving the start-side tail under-sampled even when the user
+genuinely wants symmetric tails for DoF characterisation. The
+operational fix: reshoot with `PROBE_ENABLED=False` and a short jog
+covering only the missing LHS region (start=0, end=~−5 mm in this
+case), then merge with the original via
+`tools.merge_sessions --overlap-strategy cur`. Roughly 4× cheaper
+than re-shooting the full range, and keeps both originals on disk as
+relative symlinks. The merged `merged_100-400-35mm_2026-05-15`
+covers steps 0–50 dense across the full range, peak well bracketed
+on both sides.
+
+**C. Close camera before lens-change prompt (commit `d467bf9`).**
+`_lens_change_recovery` previously prompted the user, then called
+`camera.close()` *after* the user had power-cycled. The stale
+gphoto2 handle's `exit()` then raised `GPhoto2Error -52`
+("device not on USB port"), which `NikonZ7.close()` catches and
+logs at INFO. The log appeared mid-prompt and was confusing without
+being wrong.
+
+Reordered to match the `_camera_jog` close-before-prompt pattern:
+ntfy → `camera.close()` (still on USB, clean release, no `-52`) →
+`confirm()` prompt → 3-attempt `camera.open()` after ENTER. New
+`CameraLike.is_open` protocol property; `NikonZ7.is_open` returns
+`self._camera is not None`. `SessionRunner.stop()` guards
+`camera.close()` with `if self.camera.is_open:` so the abort path
+(camera already closed by `_lens_change_recovery` then SessionAborted
+bubbles up) doesn't log a spurious `-52` either.
+
+Three test fakes gained `is_open`; a fourth `FakeCamera` in
+`tests/test_calibrate.py` was left untouched — it implements the
+narrower `session.calibrate.CameraLike` protocol (no `open`/`close`)
+so `is_open` isn't required there.
+
