@@ -130,11 +130,16 @@ class FakeCamera:
 
     def open(self) -> None:
         self.open_count += 1
+        self.closed = False
         self.history.append(("open", None))
 
     def close(self) -> None:
         self.closed = True
         self.history.append(("close", None))
+
+    @property
+    def is_open(self) -> bool:
+        return self.open_count > 0 and not self.closed
 
     def verify_healthy(self, *, min_widgets: int = 100) -> None:
         self.healthy_count += 1
@@ -1637,6 +1642,85 @@ class TestLensChange:
         assert "sample_plan" in meta["lens_configs"][0]
         assert meta["aborted"] is True
         assert meta["ended_at"] is not None
+
+    def test_lens_change_recovery_closes_camera_before_prompt(
+        self, cfg, tmp_path
+    ) -> None:
+        # Regression: _lens_change_recovery() must release the gphoto2
+        # session BEFORE prompting the user, so the user's power-cycle
+        # never strands a stale USB handle that logs GPhoto2 -52
+        # mid-prompt. We capture camera.history at the moment confirm
+        # is called for the lens-change prompt and assert ("close",
+        # None) is already in it.
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"lens": "L", "steps": 2, "end_mm": 2.0},
+        )
+
+        seen_close_at_prompt: list[bool] = []
+
+        def _confirm(msg: str) -> bool:
+            if "Power off camera" in msg:
+                seen_close_at_prompt.append(
+                    any(k == "close" for k, _ in camera.history)
+                )
+            return True
+
+        runner.confirm = _confirm
+
+        def _prompt() -> str | None:
+            if not hasattr(_prompt, "called"):
+                _prompt.called = True
+                return "L"
+            return None
+
+        runner.prompt_lens_config = _prompt
+        runner.run()
+
+        # We saw the lens-change prompt at least once, and every time
+        # we did, a close() had already been recorded.
+        assert seen_close_at_prompt
+        assert all(seen_close_at_prompt)
+
+    def test_stop_after_aborted_lens_change_does_not_double_close(
+        self, cfg, tmp_path
+    ) -> None:
+        # Regression: when the user types 'q' at the lens-change
+        # prompt, the camera is already closed; the outer stop()
+        # must not call close() again (or the user sees GPhoto2 -52
+        # logged from a stale handle).
+        from errors import SessionAborted
+
+        camera = FakeCamera(apertures=["f/4"])
+        rail = FakeRail()
+        runner = make_runner(
+            camera=camera, rail=rail, cfg=cfg, tmp_path=tmp_path,
+            medians=[100.0] * 10,
+            inputs={"lens": "test-lens", "steps": 2, "end_mm": 2.0},
+        )
+
+        def _confirm(msg: str) -> bool:
+            if "Power off camera" in msg:
+                return False
+            return True
+
+        runner.confirm = _confirm
+
+        def _prompt() -> str | None:
+            return "test-lens"
+
+        runner.prompt_lens_config = _prompt
+
+        with pytest.raises(SessionAborted):
+            runner.run()
+
+        # Exactly one close — the one inside _lens_change_recovery.
+        # The outer stop() saw is_open == False and skipped its close.
+        closes = [entry for entry in camera.history if entry[0] == "close"]
+        assert len(closes) == 1
 
 
 class TestReshootPlanMenu:

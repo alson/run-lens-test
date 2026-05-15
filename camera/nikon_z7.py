@@ -142,6 +142,14 @@ class NikonZ7:
             raise RuntimeError("NikonZ7 used before open()")
         return self._camera
 
+    @property
+    def is_open(self) -> bool:
+        """True between :meth:`open` and :meth:`close`. Lets callers
+        guard ``close()`` so a double-close (e.g. ``stop()`` after an
+        aborted lens change that already released the handle) is a
+        no-op instead of triggering the GPhoto2 -52 INFO log."""
+        return self._camera is not None
+
     # ---- Health check ----------------------------------------------------
 
     def verify_healthy(self, *, min_widgets: int = 100) -> None:
