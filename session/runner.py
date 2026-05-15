@@ -164,6 +164,9 @@ class CameraLike(Protocol):
 
     def close(self) -> None: ...
 
+    @property
+    def is_open(self) -> bool: ...
+
     def verify_healthy(self, *, min_widgets: int = 100) -> None: ...
 
     def apply_session_config(self, **kwargs) -> None: ...
@@ -526,7 +529,8 @@ class SessionRunner:
             self.metadata.aborted = aborted
             self._write_metadata()
         try:
-            self.camera.close()
+            if self.camera.is_open:
+                self.camera.close()
         finally:
             try:
                 self.rail.close()
@@ -3253,19 +3257,36 @@ class SessionRunner:
     # ---- Lens-change recovery ------------------------------------------
 
     def _lens_change_recovery(self, prev_slug: str) -> None:
+        """Hand off to the user for a lens swap, then reconnect.
+
+        We close the gphoto2 session BEFORE the prompt — while the
+        camera is still alive on USB — so ``camera.exit()`` runs
+        against a live device and never trips the GPhoto2 -52
+        ("device not found") path. By the time the user has
+        power-cycled the body and pressed ENTER, the old USB handle
+        would be stale and ``close()`` would log a confusing INFO
+        line mid-prompt. Same release-before / reacquire-after
+        pattern as :func:`_camera_jog`.
+        """
         if self.ntfy is not None:
             self.ntfy.with_body(
                 LENS_CHANGE_REQUIRED,
                 f"finished {prev_slug}; ready for next lens",
             )
+        # Release the USB handle while the camera is still powered on,
+        # so the user's power-cycle doesn't strand a stale handle that
+        # logs GPhoto2 -52 mid-prompt. Mirrors _camera_jog's
+        # close-before / open-after wrapper.
+        self.camera.close()
         text = (
             "\nPower off camera. Change lens. Remove battery >=10s. "
             "Reinsert. Power on, wait for live view. ENTER when ready, "
             "q to quit: "
         )
         if not self.confirm(text):
+            # Camera is already closed; stop()'s is_open guard keeps
+            # the subsequent shutdown from re-closing it.
             raise SessionAborted("user quit at lens change")
-        self.camera.close()
         for attempt in range(3):
             try:
                 self.camera.open()

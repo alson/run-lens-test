@@ -89,9 +89,16 @@ class FakeCamera:
         "f/4", "f/5.6", "f/8", "f/11", "f/16",
     ])
     history: list[tuple[str, object]] = field(default_factory=list)
+    _open: bool = False
 
-    def open(self) -> None: self.history.append(("open", None))
-    def close(self) -> None: self.history.append(("close", None))
+    def open(self) -> None:
+        self._open = True
+        self.history.append(("open", None))
+    def close(self) -> None:
+        self._open = False
+        self.history.append(("close", None))
+    @property
+    def is_open(self) -> bool: return self._open
     def verify_healthy(self, *, min_widgets: int = 100) -> None:
         self.history.append(("verify_healthy", min_widgets))
     def apply_session_config(self, **kw) -> None:

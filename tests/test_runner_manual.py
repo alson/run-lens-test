@@ -51,11 +51,16 @@ class FakeCamera:
 
     def open(self) -> None:
         self.open_count += 1
+        self.closed = False
         self.history.append(("open", None))
 
     def close(self) -> None:
         self.closed = True
         self.history.append(("close", None))
+
+    @property
+    def is_open(self) -> bool:
+        return self.open_count > 0 and not self.closed
 
     def verify_healthy(self, *, min_widgets: int = 100) -> None:
         self.history.append(("verify_healthy", min_widgets))
